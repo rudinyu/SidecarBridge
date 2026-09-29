@@ -1,9 +1,16 @@
 import Foundation
+
+#if canImport(UIKit)
 import UIKit
+#endif
 
 enum PadDeviceIdentity {
     private static let identifierKey = "authorizedDeviceIdentifier"
+    #if os(macOS)
+    private static let keychainAccount = "mac.viewer.identity"
+    #else
     private static let keychainAccount = "pad.identity"
+    #endif
 
     static let current: BridgePeerIdentity = {
         let defaults = UserDefaults.standard
@@ -22,21 +29,31 @@ enum PadDeviceIdentity {
             // keeps the same peer identity and trusted Mac account.
             SecureCredentialStore.set(Data(saved.utf8), account: keychainAccount)
         } else {
+            #if canImport(UIKit)
             identifier = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
+            #else
+            identifier = UUID().uuidString
+            #endif
             defaults.set(identifier, forKey: identifierKey)
             SecureCredentialStore.set(Data(identifier.utf8), account: keychainAccount)
         }
 
+        #if canImport(UIKit)
         let kind: String
         switch UIDevice.current.userInterfaceIdiom {
         case .phone: kind = "iPhone"
         case .pad: kind = "iPad"
         default: kind = "iOS device"
         }
+        let name = UIDevice.current.name
+        #else
+        let kind = "Mac Viewer"
+        let name = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+        #endif
 
         return BridgePeerIdentity(
             deviceID: identifier,
-            deviceName: UIDevice.current.name,
+            deviceName: name,
             deviceKind: kind
         )
     }()

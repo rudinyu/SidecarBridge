@@ -6,6 +6,7 @@ struct MacContentView: View {
     @ObservedObject var model: MacConnectionModel
     @Environment(\.openWindow) private var openWindow
     @State private var section = "Connect"
+    @State private var showingForgetPairingConfirmation = false
 
     private var statusColor: Color {
         if model.isStreaming { return .green }
@@ -64,6 +65,18 @@ struct MacContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.refreshPermissions()
         }
+        .confirmationDialog(
+            "Forget all trusted devices?",
+            isPresented: $showingForgetPairingConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Forget All", role: .destructive) {
+                model.forgetPairing()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("All Host-side Keychain credentials will be revoked and the pairing code will rotate. Each device must pair again with the new code.")
+        }
     }
 
     private var workspaceNavigation: some View {
@@ -100,6 +113,12 @@ struct MacContentView: View {
                     .foregroundStyle(.white.opacity(0.62))
             }
             Spacer()
+            Button {
+                openWindow(id: "viewer")
+            } label: {
+                Label("Mac Viewer", systemImage: "macwindow.on.rectangle")
+            }
+            .buttonStyle(.bordered)
             Text("MAC")
                 .font(.caption2.bold())
                 .tracking(1.6)
@@ -165,7 +184,7 @@ struct MacContentView: View {
                         .buttonStyle(.borderedProminent)
                         .tint(.cyan)
                 } else {
-                    Text("Open the iPad app to connect")
+                    Text("Open the iPad app or Mac Viewer to connect")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.42))
                 }
@@ -193,9 +212,9 @@ struct MacContentView: View {
             ) {
                 DashboardMetric(
                     icon: "network",
-                    title: "Route",
-                    value: model.hasPadPeer ? "Connected" : "Waiting",
-                    detail: model.hasPadPeer ? model.connectionTransport : "Wi-Fi / nearby P2P",
+                    title: "Inbound route",
+                    value: model.hasPadPeer ? "Connected" : (model.incomingListenerReady ? "Listening" : "Starting"),
+                    detail: model.hasPadPeer ? model.connectionTransport : model.incomingListenerDetail,
                     tint: model.hasPadPeer ? .green : .cyan
                 )
                 DashboardMetric(
@@ -204,7 +223,7 @@ struct MacContentView: View {
                     value: model.isStreaming ? "Live" : "Idle",
                     detail: model.isStreaming
                         ? "\(model.streamPreferences.resolution.title) • \(model.streamPreferences.frameRate.rawValue) FPS target"
-                        : "Start when the iPad is ready",
+                        : "Start when the viewer is ready",
                     tint: model.isStreaming ? .green : .purple
                 )
                 DashboardMetric(
@@ -216,9 +235,13 @@ struct MacContentView: View {
                 )
                 DashboardMetric(
                     icon: "waveform.path.ecg",
-                    title: "Latency",
+                    title: "Inbound link",
                     value: model.connectionLatencyMS.map { "\($0) ms" } ?? "—",
-                    detail: model.hasPadPeer ? model.connectionHealthDetail : "Waiting for encrypted link",
+                    detail: model.hasPadPeer
+                        ? model.connectionHealthDetail
+                        : (model.incomingListenerReady
+                            ? "No inbound Viewer. Outgoing Mac Viewer status appears in its own window."
+                            : model.incomingListenerDetail),
                     tint: model.connectionLatencyMS == nil ? .white.opacity(0.55) : .cyan
                 )
             }
@@ -369,7 +392,7 @@ struct MacContentView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Stream performance")
                         .font(.headline)
-                    Text("Choose the target sent by this Mac when the iPad does not provide its own profile.")
+                    Text("Choose the target sent by this Mac when the viewer does not provide its own profile.")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.56))
                 }
@@ -398,7 +421,7 @@ struct MacContentView: View {
             }
 
             if model.streamPreferences.ultraModeEnabled {
-                Label("Ultra profile received from iPad Developer options", systemImage: "bolt.fill")
+                Label("Ultra profile received from Viewer Developer options", systemImage: "bolt.fill")
                     .font(.caption.bold())
                     .foregroundStyle(.orange)
             }
@@ -491,11 +514,12 @@ struct MacContentView: View {
 
             PermissionRow(
                 icon: "waveform.path.ecg",
-                title: "Connection health",
+                title: "Incoming Viewer link",
                 detail: connectionHealthText,
                 isReady: model.hasPadPeer && model.connectionHealthDetail == "Encrypted link healthy",
-                isChecking: model.hasPadPeer && model.connectionHealthDetail != "Encrypted link healthy",
-                stateLabel: model.connectionLatencyMS.map { "\($0) MS" } ?? (model.hasPadPeer ? "VERIFYING" : "WAITING")
+                isChecking: !model.hasPadPeer || model.connectionHealthDetail != "Encrypted link healthy",
+                stateLabel: model.connectionLatencyMS.map { "\($0) MS" }
+                    ?? (model.hasPadPeer ? "VERIFYING" : (model.incomingListenerReady ? "LISTENING" : "STARTING"))
             ) { EmptyView() }
 
             Divider().overlay(.white.opacity(0.08))
@@ -544,7 +568,7 @@ struct MacContentView: View {
             if let peer = model.pairedPeer {
                 Divider().overlay(.white.opacity(0.08))
                 PermissionRow(icon: "ipad.and.iphone", title: "Authorized devices", detail: peer, isReady: true) {
-                    Button("Forget All") { model.forgetPairing() }
+                    Button("Forget All") { showingForgetPairingConfirmation = true }
                 }
             }
         }
@@ -592,7 +616,7 @@ struct MacContentView: View {
                     } else if let error = model.fileTransferError {
                         Text(error).font(.caption).foregroundStyle(.orange)
                     } else {
-                        Text("Send one or more files to the iPad, or receive into SidecarBridge's private Transfers folder.")
+                        Text("Send one or more files to the viewer, or receive into SidecarBridge's private Transfers folder.")
                             .font(.caption)
                             .foregroundStyle(.white.opacity(0.55))
                     }
@@ -747,6 +771,12 @@ struct MacContentView: View {
     }
 
     private var connectionHealthText: String {
+        guard model.hasPadPeer else {
+            if model.incomingListenerReady {
+                return "No inbound Viewer is connected. Outgoing Mac Viewer status is shown in the Mac Viewer window."
+            }
+            return model.incomingListenerDetail
+        }
         guard let latency = model.connectionLatencyMS else { return model.connectionHealthDetail }
         return "\(model.connectionHealthDetail) • round trip \(latency) ms"
     }
@@ -1000,7 +1030,7 @@ private struct SystemInformationPanel: View {
                     .font(.caption)
                 }
             } else {
-                Text("The connected iPhone or iPad will send this information after secure authentication.")
+                Text("The connected viewer will send this information after secure authentication.")
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.55))
                     .fixedSize(horizontal: false, vertical: true)

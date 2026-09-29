@@ -58,6 +58,20 @@ final class ConnectionSetupTests: XCTestCase {
         SavedMacRouteStore.removeAll(defaults: defaults)
         XCTAssertNil(SavedMacRouteStore.route(named: "Mac B", defaults: defaults))
     }
+
+    func testRemovingOneSavedRouteReturnsItsHostIdentityAndPreservesOthers() throws {
+        let suite = "SidecarBridge.ConnectionSetupTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        SavedMacRouteStore.remember(macID: "host-a", name: "Mac A", hosts: ["192.168.1.10"], defaults: defaults)
+        SavedMacRouteStore.remember(macID: "host-b", name: "Mac B", hosts: ["192.168.1.20"], defaults: defaults)
+
+        let removed = try XCTUnwrap(SavedMacRouteStore.remove(named: "Mac A", defaults: defaults))
+        XCTAssertEqual(removed.macID, "host-a")
+        XCTAssertNil(SavedMacRouteStore.route(named: "Mac A", defaults: defaults))
+        XCTAssertEqual(SavedMacRouteStore.route(named: "Mac B", defaults: defaults)?.macID, "host-b")
+    }
+
     func testStandbyLANFailureDoesNotResetActiveNearbyVideo() {
         XCTAssertFalse(ConnectionRoutePolicy.shouldApplyLANEvent(wasLANConnected: false, connected: false, nearbyConnected: true))
         XCTAssertTrue(ConnectionRoutePolicy.shouldApplyLANEvent(wasLANConnected: true, connected: false, nearbyConnected: false))

@@ -4,7 +4,7 @@
   <img src="Mac/Assets.xcassets/BrandMark.imageset/BrandMark.png" width="160" alt="SidecarBridge icon">
 </p>
 
-<p align="center">A secure remote window into your Mac, with iPhone and iPad keyboard, trackpad, and touch input.</p>
+<p align="center">A secure remote window into your Mac, with iPhone, iPad, and Mac Viewer keyboard and pointer input.</p>
 
 <p align="center">
   <a href="https://apps.apple.com/app/sidecarbridge/id6792298083">
@@ -15,7 +15,87 @@
 
 For the full architecture, protocol, permission, distribution, testing, and troubleshooting reference, see [SIDECARBRIDGE_TECHNICAL_GUIDE.md](SIDECARBRIDGE_TECHNICAL_GUIDE.md). The current accessibility support matrix is in [ACCESSIBILITY.md](ACCESSIBILITY.md).
 
-SidecarBridge is a paired macOS + iOS/iPadOS app that turns an iPhone or iPad into an encrypted local Mac display and input surface.
+SidecarBridge pairs macOS with iPhone/iPad viewers and also supports encrypted Mac-to-Mac viewing through its native Mac Viewer.
+
+### Mac-to-Mac Viewer
+
+The macOS app can also act as a Viewer for another Mac running SidecarBridge. Open **Mac Viewer** from the main window or the menu bar on the receiving Mac, select the discovered Mac, and tap **Connect**. For first-time pairing, enter the host Mac's current 16-digit code; an optional private IPv4 address can be supplied with that code when Bonjour discovery is unavailable. The encrypted session carries the host screen, Mac mouse and keyboard input, clipboard text, and verified file transfers. Both Macs need Local Network access, and the host Mac still needs Screen Recording and Accessibility permission for capture and remote input. This is an in-app remote display stream; it does not create Apple's native extended Sidecar display.
+
+Text composition uses the Viewer Mac's active macOS input method; only committed
+text is sent to the remote Mac. The Magic Keyboard 中/英 key toggles the remote
+Mac's Chinese/English input source, and Control-Space cycles its input sources.
+
+Use **Full Screen** (Control-Command-F, or the green window button) for an
+edge-to-edge viewing area. Entering full screen hides Viewer chrome; **Show
+Controls / Hide Controls** (Control-Command-H) brings back or hides the settings
+panel. The small overlay remains available when controls are hidden. Exiting
+full screen restores the previous windowed layout; the windowed visibility
+preference is saved. These two shortcuts stay local; plain Escape and other
+remote shortcuts still go to the host.
+
+Successful pairing saves the trust credential in Keychain and remembers the
+last authenticated Mac, including code-first/manual-IP connections. Temporary
+codes are cleared, not saved. Select a **Saved** Mac and press **Connect** without
+a code on later launches; discovery remains passive. A new code is needed if
+the host resets/revokes pairing or the saved credential is no longer available.
+
+#### Native Viewer tests (macOS only)
+
+`MacViewerConnectionTests`, `MacViewerInputTests`, `MacViewerVideoTests`,
+`MacViewerPresentationTests`, and `MacViewerRegressionTests` cover lifecycle/pairing, capability negotiation,
+clipboard and preference isolation, mouse/keyboard routing, frame ordering,
+bounded presentation queues, keyframe recovery, and ACKs after reconnect.
+Presentation unit tests simulate full-screen notifications and cover local shortcuts,
+saved control visibility, and hidden-window SwiftUI layout snapshots; changing
+chrome must not replace the video/input views or restart the connection.
+Run just these suites from the repository root:
+
+```sh
+xcodebuild -project SidecarBridge.xcodeproj -scheme SidecarBridgeMac \
+  -configuration Debug -destination 'platform=macOS' \
+  -derivedDataPath .build/ViewerTests CODE_SIGNING_ALLOWED=NO \
+  -only-testing:SidecarBridgeTests/MacViewerConnectionTests \
+  -only-testing:SidecarBridgeTests/MacViewerInputTests \
+  -only-testing:SidecarBridgeTests/MacViewerVideoTests \
+  -only-testing:SidecarBridgeTests/MacViewerPresentationTests \
+  -only-testing:SidecarBridgeTests/MacViewerRegressionTests test
+```
+
+Omit the five `-only-testing` options to run all macOS unit tests. These tests
+use a fake transport, isolated defaults/pasteboards/directories, hidden AppKit
+views, and synthetic video data; they do not connect to another Mac, post
+system input events, access pairing credentials, or build the iPad target.
+Video checks validate sample admission/presentation state, not decoded pixel
+accuracy or physical display latency. Real two-Mac pairing, TCC permissions,
+and end-to-end decoding/input still need manual acceptance testing.
+
+The separate `SidecarBridgeViewerUI` scheme runs `MacViewerFullScreenUITests`
+against the actual app and its secondary SwiftUI `Window`, not a hand-created
+`NSWindow`. It clicks the native green button and the Viewer button, exercises
+Control-Command-F, waits for real full-screen completion, checks screen-sized
+geometry and windowed size restoration, and saves screenshots in the xcresult.
+It does not override `toggleFullScreen` or post completion notifications.
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+xcodebuild -project SidecarBridge.xcodeproj -scheme SidecarBridgeViewerUI \
+  -configuration Debug -destination 'platform=macOS' \
+  -derivedDataPath .build/ViewerUITests -parallel-testing-enabled NO \
+  CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= test
+```
+
+This is an interactive desktop test: it requires an unlocked graphical session
+and XCTest UI automation access, launches/terminates the local test app, and
+temporarily switches Spaces. Do not run it during an active remote session.
+It never presses Connect, grants permissions, or runs the iPad target. Its local
+ad-hoc signature is for testing only, not Developer ID distribution.
+
+macOS build 111 keeps the Viewer trust credential across reconnects and adds a
+confirmed per-Mac **Forget** action. Build 110 explicitly gives the Viewer a
+principal window-manager role and enables native full screen on macOS 15+. The macOS 14 AppKit fallback also
+removes the separate auxiliary-window role; forcing only `fullScreenPrimary`
+or rebinding the green button does not address that role conflict. Full Screen
+is available before connecting as well as during a session.
 
 ### Connection usability update (1.3)
 

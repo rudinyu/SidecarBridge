@@ -139,14 +139,28 @@ enum SavedMacRouteStore {
         let addresses = Array(Set((hosts + (previous?.hosts ?? [])).filter(BridgeNetworkMetadata.isPrivateIPv4Address))).sorted()
         routes.removeAll { $0.macID == macID || $0.name == name }
         routes.insert(SavedMacRoute(macID: macID, name: name, hosts: Array(addresses.prefix(8))), at: 0)
-        if let data = try? JSONEncoder().encode(Array(routes.prefix(32))) {
-            defaults.set(data, forKey: key)
-        }
+        save(Array(routes.prefix(32)), defaults: defaults)
+    }
+
+    @discardableResult
+    static func remove(named name: String, defaults: UserDefaults = .standard) -> SavedMacRoute? {
+        lock.lock(); defer { lock.unlock() }
+        var routes = load(defaults)
+        guard let removed = routes.first(where: { $0.name == name }) else { return nil }
+        routes.removeAll { $0.name == name }
+        save(routes, defaults: defaults)
+        return removed
     }
 
     static func removeAll(defaults: UserDefaults = .standard) {
         lock.lock(); defer { lock.unlock() }
         defaults.removeObject(forKey: key)
+    }
+
+    private static func save(_ routes: [SavedMacRoute], defaults: UserDefaults) {
+        if let data = try? JSONEncoder().encode(routes) {
+            defaults.set(data, forKey: key)
+        }
     }
 
     private static func load(_ defaults: UserDefaults) -> [SavedMacRoute] {

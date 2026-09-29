@@ -8,9 +8,9 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "1.4"
-    # macOS builds must increase across marketing versions. App Store Connect
-    # rejected 1.4 (1) because previous Mac builds are higher; continue at 106.
-    CURRENT_PROJECT_VERSION: "106"
+    # macOS build 114 adds native text-input composition and remote IME
+    # switching in the Mac Viewer.
+    CURRENT_PROJECT_VERSION: "114"
     DEVELOPMENT_TEAM: LYK4LV2859
 targets:
   SidecarBridgeMac:
@@ -19,6 +19,9 @@ targets:
     sources:
       - Shared
       - Mac
+      - Pad/PadDeviceIdentity.swift
+      - Pad/PadLANService.swift
+      - Pad/PadPeerService.swift
     info:
       path: Mac/Info.plist
       properties:
@@ -30,7 +33,7 @@ targets:
         NSBonjourServices:
           - _sb-screen._tcp
           - _sb-direct._tcp
-        NSLocalNetworkUsageDescription: SidecarBridge advertises an encrypted local display service and accepts an incoming connection from the iPhone or iPad you select.
+        NSLocalNetworkUsageDescription: SidecarBridge advertises an encrypted local display service and can connect to the Mac or iPhone/iPad you select.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.sidecarbridge.mac
@@ -131,6 +134,14 @@ targets:
       - Mac/PairingQRCodeView.swift
       - Mac/MacPairingCard.swift
       - Mac/MacDeviceAuthorization.swift
+      - Mac/MacViewerConnectionModel.swift
+      - Mac/MacViewerInputSurface.swift
+      - Mac/MacViewerVideoDisplay.swift
+      - Mac/MacViewerPresentation.swift
+      - Mac/MacViewerView.swift
+      - Pad/PadDeviceIdentity.swift
+      - Pad/PadLANService.swift
+      - Pad/PadPeerService.swift
       - Pad/RemoteKeyboardToolbar.swift
     settings:
       base:
@@ -139,7 +150,29 @@ targets:
     dependencies:
       - sdk: Security.framework
 
+  SidecarBridgeUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - UITests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.sidecarbridge.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: SidecarBridgeMac
+    dependencies:
+      - target: SidecarBridgeMac
+
 schemes:
+  SidecarBridgeViewerUI:
+    build:
+      targets:
+        SidecarBridgeMac: all
+        SidecarBridgeUITests: [test]
+    test:
+      config: Debug
+      targets:
+        - SidecarBridgeUITests
   SidecarBridgeMac:
     build:
       targets:

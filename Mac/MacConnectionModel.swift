@@ -6,7 +6,7 @@ import SwiftUI
 @MainActor
 final class MacConnectionModel: ObservableObject {
     @Published var status = "Starting…"
-    @Published var detail = "Looking for your iPad."
+    @Published var detail = "Looking for a remote viewer."
     @Published var isStreaming = false
     @Published var hasPadPeer = false
     @Published var showingNativeSidecarSetup = false
@@ -71,7 +71,7 @@ final class MacConnectionModel: ObservableObject {
     }
 
     var menuBarStatusText: String {
-        if isStreaming { return "Streaming to \(pairedPeer ?? "iPad")" }
+        if isStreaming { return "Streaming to \(pairedPeer ?? "viewer")" }
         if hasPadPeer { return "Connected — ready to stream" }
         return status
     }
@@ -82,17 +82,17 @@ final class MacConnectionModel: ObservableObject {
     var sessionSummaryTitle: String {
         if isStreaming { return "Mac screen is live" }
         if hasPadPeer { return "Ready to start the Mac display" }
-        return "Waiting for your iPad"
+        return "Waiting for a remote viewer"
     }
 
     var sessionSummaryDetail: String {
         if isStreaming {
-            return "The encrypted app stream is active with iPad keyboard and trackpad input."
+            return "The encrypted app stream is active with remote keyboard and pointer input."
         }
         if hasPadPeer {
-            return "The iPad is connected. Start In-App Display when you want to share the Mac screen."
+            return "The viewer is connected. Start In-App Display when you want to share the Mac screen."
         }
-        return "Keep SidecarBridge open, then choose this Mac from My Devices on the iPad."
+        return "Keep SidecarBridge open, then choose this Mac in the iPad app or open Mac Viewer on another Mac."
     }
 
     var sessionBadge: String {
@@ -119,6 +119,9 @@ final class MacConnectionModel: ObservableObject {
     private var screenRecordingPollTask: Task<Void, Never>?
     private var streamResumeRetentionTask: Task<Void, Never>?
     private var streamPreferenceRestartTask: Task<Void, Never>?
+    private var captureRefreshRetryTask: Task<Void, Never>?
+    private var captureRefreshRetryGeneration = UUID()
+    private var captureRefreshFailureCount = 0
     private var remoteViewerIsBackgrounded = false
     private var pendingFileURLs: [URL] = []
     private var clipboardMonitorTask: Task<Void, Never>?
@@ -195,6 +198,7 @@ final class MacConnectionModel: ObservableObject {
         streamer.onCaptureRefreshCompleted = { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.cancelCaptureRefreshRetry(resetFailureCount: true)
                 // A monitor can be attached or removed while iPadOS is in the
                 // background. Keep remote input on the same display that the
                 // newly rebuilt ScreenCaptureKit stream is showing.
@@ -207,6 +211,7 @@ final class MacConnectionModel: ObservableObject {
                 guard let self else { return }
                 self.connectionHealthDetail = "Viewer returned — capture refresh delayed"
                 self.detail = "The Mac display is still recovering: \(error.localizedDescription)"
+                self.scheduleCaptureRefreshRetry()
             }
         }
         streamer.onMemoryPressureChanged = { [weak self] level in
@@ -230,8 +235,10 @@ final class MacConnectionModel: ObservableObject {
             guard let self else { return }
             self.hasPadPeer = connected
             if !connected {
+                self.cancelCaptureRefreshRetry(resetFailureCount: true)
                 self.senderVideoTelemetryDetail = "Not measured"
             } else {
+                self.cancelCaptureRefreshRetry(resetFailureCount: true)
                 self.senderVideoTelemetryDetail = "Waiting for video frames"
             }
             if connected {
@@ -252,8 +259,8 @@ final class MacConnectionModel: ObservableObject {
                 self.streamer.setTransportProfile(isDirectLAN ? .direct : .nearbyP2P)
                 self.refreshPermissions()
                 self.connectionTransport = isDirectLAN ? "Direct local link / AWDL" : "Nearby P2P fallback"
-                self.status = isDirectLAN ? "iPad connected on same Wi-Fi" : "iPad app connected nearby"
-                self.detail = "Encrypted app link ready; waiting for the iPad's stream request. Native Sidecar setup is separate."
+                self.status = isDirectLAN ? "Viewer connected on same Wi-Fi" : "Viewer connected nearby"
+                self.detail = "Encrypted app link ready; waiting for the viewer's stream request. Native Sidecar setup is separate."
                 self.pairedPeer = MacAuthorizedDeviceStore.shared.displaySummary
                 self.sendRemoteInputPermissionStatus()
                 self.exchangeSystemInformation()
@@ -280,8 +287,8 @@ final class MacConnectionModel: ObservableObject {
                 self.connectionHealthDetail = "Waiting for encrypted link"
                 self.connectionLatencyMS = nil
                 self.connectionTransport = "Searching direct P2P"
-                self.status = "Waiting for iPad"
-                self.detail = "Open SidecarBridge on the iPad."
+                self.status = "Waiting for a remote viewer"
+                self.detail = "Open SidecarBridge on an iPad/iPhone, or Mac Viewer on another Mac."
                 self.remoteInput.releaseButtons()
                 self.pendingFileURLs.removeAll(keepingCapacity: false)
                 self.queuedFileCount = 0
@@ -305,7 +312,7 @@ final class MacConnectionModel: ObservableObject {
                     ))
                 }
                 DispatchQueue.main.async { [weak self] in
-                    self?.applyRemoteInputResult(accepted)
+                    self?.refreshRemoteInputPermissionStatus()
                 }
             }
         }
@@ -329,7 +336,7 @@ final class MacConnectionModel: ObservableObject {
 
     func chooseFileToSend() {
         guard hasPadPeer else {
-            fileTransferError = "Connect the iPad before sending files."
+            fileTransferError = "Connect a viewer before sending files."
             return
         }
         let panel = NSOpenPanel()
@@ -344,7 +351,7 @@ final class MacConnectionModel: ObservableObject {
 
     func sendFiles(at urls: [URL]) {
         guard hasPadPeer else {
-            fileTransferError = "Connect the iPad before sending files."
+            fileTransferError = "Connect a viewer before sending files."
             return
         }
         let files = urls.filter { $0.isFileURL }
@@ -360,7 +367,7 @@ final class MacConnectionModel: ObservableObject {
 
     func acceptDroppedFiles(_ providers: [NSItemProvider]) -> Bool {
         guard hasPadPeer else {
-            fileTransferError = "Connect the iPad before dropping files."
+            fileTransferError = "Connect a viewer before dropping files."
             return false
         }
         var accepted = false
@@ -451,8 +458,8 @@ final class MacConnectionModel: ObservableObject {
         refreshPermissions()
         peers.start()
         startClipboardMonitoring()
-        status = "Waiting for iPad"
-        detail = "Open SidecarBridge on your iPad or iPhone and tap Connect. Apple Sidecar setup is available separately below."
+        status = "Waiting for a remote viewer"
+        detail = "Open SidecarBridge on your iPad or iPhone, or Mac Viewer on another Mac, and tap Connect. Apple Sidecar setup is separate."
     }
 
     func setShutdownProtectionEnabled(_ enabled: Bool) {
@@ -499,7 +506,7 @@ final class MacConnectionModel: ObservableObject {
                 try await self.streamer.applyStreamPreferences()
                 guard !Task.isCancelled, self.hasPadPeer else { return }
                 self.remoteInput.setTargetDisplayID(self.streamer.captureDisplayID)
-                self.status = "Streaming to iPad"
+                self.status = "Streaming to viewer"
                 self.detail = "Display profile applied without reconnecting the control session."
             } catch {
                 guard !Task.isCancelled else { return }
@@ -539,6 +546,7 @@ final class MacConnectionModel: ObservableObject {
         streamResumeRetentionTask = nil
         streamPreferenceRestartTask?.cancel()
         streamPreferenceRestartTask = nil
+        cancelCaptureRefreshRetry(resetFailureCount: true)
         clipboardMonitorTask?.cancel()
         clipboardMonitorTask = nil
         pendingFileURLs.removeAll(keepingCapacity: false)
@@ -596,7 +604,7 @@ final class MacConnectionModel: ObservableObject {
     func startFallback() {
         // Starting the encrypted app stream never launches native Sidecar.
         guard hasPadPeer else {
-            status = "Open the iPad app first"
+            status = "Open a viewer app first"
             detail = "The private stream starts after the two apps find each other."
             return
         }
@@ -612,10 +620,13 @@ final class MacConnectionModel: ObservableObject {
             // while ScreenCaptureKit keeps encoding the pre-background
             // surface. The refresh preserves the packet sequence and emits a
             // fresh IDR from the new source.
-            streamer.refreshCaptureAfterForeground()
+            // This is a new viewer presentation, so bypass the normal
+            // foreground debounce. The duplicate lifecycle signal is safe:
+            // ScreenStreamer now leaves an in-flight refresh intact.
+            streamer.refreshCaptureAfterForeground(force: true)
             refreshPermissions()
             sendRemoteInputPermissionStatus()
-            status = "Streaming to iPad"
+            status = "Streaming to viewer"
             detail = "Refreshing the Mac display for the resumed encrypted stream."
             peers.send(ControlMessage(.status, detail: "fallback-active"))
             return
@@ -627,7 +638,7 @@ final class MacConnectionModel: ObservableObject {
             enableScreenRecording()
             guard screenRecordingAuthorized else {
                 status = "Allow Screen Recording"
-                detail = "Screen Recording must pass before the Mac display can be sent to the iPad."
+                detail = "Screen Recording must pass before the Mac display can be sent to the viewer."
                 peers.send(ControlMessage(.status, detail: "fallback-error:Screen Recording permission is required on the Mac."))
                 return
             }
@@ -655,8 +666,8 @@ final class MacConnectionModel: ObservableObject {
                 isStartingFallback = false
                 isStreaming = true
                 screenRecordingAuthorized = true
-                status = "Streaming to iPad"
-                detail = "Using the encrypted app stream with iPad keyboard and trackpad input."
+                status = "Streaming to viewer"
+                detail = "Using the encrypted app stream with remote keyboard and pointer input."
                 peers.send(ControlMessage(.status, detail: "fallback-active"))
             } catch {
                 isStartingFallback = false
@@ -670,6 +681,7 @@ final class MacConnectionModel: ObservableObject {
     func stopFallback() {
         streamResumeRetentionTask?.cancel()
         streamResumeRetentionTask = nil
+        cancelCaptureRefreshRetry(resetFailureCount: true)
         remoteViewerIsBackgrounded = false
         remoteInput.releaseButtons()
         streamer.setWaitingForViewerResume(false)
@@ -679,6 +691,40 @@ final class MacConnectionModel: ObservableObject {
         streamMemoryPressure = .normal
         isStartingFallback = false
         isStreaming = false
+    }
+
+    private func scheduleCaptureRefreshRetry() {
+        guard hasPadPeer, isStreaming else { return }
+        guard captureRefreshFailureCount < 3 else { return }
+
+        captureRefreshRetryTask?.cancel()
+        captureRefreshFailureCount += 1
+        let attempt = captureRefreshFailureCount
+        let generation = UUID()
+        captureRefreshRetryGeneration = generation
+        captureRefreshRetryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(250 * attempt))
+            guard !Task.isCancelled,
+                  let self,
+                  self.captureRefreshRetryGeneration == generation,
+                  self.hasPadPeer,
+                  self.isStreaming else { return }
+            self.captureRefreshRetryTask = nil
+            // A failed refresh normally clears the old stream before invoking
+            // the callback. Force the same recovery path even when the next
+            // attempt must create a brand-new SCStream instead of rebuilding
+            // an existing one.
+            self.streamer.refreshCaptureAfterForeground(force: true)
+        }
+    }
+
+    private func cancelCaptureRefreshRetry(resetFailureCount: Bool) {
+        captureRefreshRetryGeneration = UUID()
+        captureRefreshRetryTask?.cancel()
+        captureRefreshRetryTask = nil
+        if resetFailureCount {
+            captureRefreshFailureCount = 0
+        }
     }
 
     private func retainStreamForViewerResumeIfNeeded() {
@@ -694,7 +740,7 @@ final class MacConnectionModel: ObservableObject {
         streamer.setViewerBackgrounded(true)
         streamer.setWaitingForViewerResume(true)
         connectionHealthDetail = "Viewer suspended — stream retained for fast resume"
-        status = "Waiting for iPad to return"
+        status = "Waiting for viewer to return"
         detail = "Keeping the encrypted capture session ready with a 60-FPS target for five minutes."
 
         streamResumeRetentionTask = Task { [weak self] in
@@ -704,7 +750,7 @@ final class MacConnectionModel: ObservableObject {
             guard !Task.isCancelled, let self, !self.hasPadPeer else { return }
             self.streamResumeRetentionTask = nil
             self.stopFallback()
-            self.status = "Waiting for iPad"
+            self.status = "Waiting for a remote viewer"
             self.detail = "The fast-resume window ended. Reconnecting will start a new stream."
         }
     }
@@ -796,7 +842,7 @@ final class MacConnectionModel: ObservableObject {
         localSystemInformation = SystemInformation.current()
         diagnosticActionDetail = hasPadPeer
             ? "Refreshed this Mac and requested the connected device."
-            : "Refreshed this Mac. Connect an iPhone or iPad to see both devices."
+            : "Refreshed this Mac. Connect an iPad, iPhone, or Mac Viewer to see both devices."
         exchangeSystemInformation()
     }
 
@@ -808,24 +854,24 @@ final class MacConnectionModel: ObservableObject {
 
     func requestPadClipboard() {
         guard hasPadPeer else {
-            clipboardTransferStatus = "Connect the iPad before requesting its clipboard."
+            clipboardTransferStatus = "Connect a viewer before requesting its clipboard."
             return
         }
-        clipboardTransferStatus = "Requesting the iPad clipboard…"
+        clipboardTransferStatus = "Requesting the remote viewer clipboard…"
         peers.send(ControlMessage(.requestClipboard))
     }
 
     func sendClipboardToPad() {
         guard hasPadPeer else {
-            clipboardTransferStatus = "Connect the iPad before sending the clipboard."
+            clipboardTransferStatus = "Connect a viewer before sending the clipboard."
             return
         }
         let files = clipboardFileURLs()
         if !files.isEmpty {
             sendFiles(at: files)
             clipboardTransferStatus = files.count == 1
-                ? "Sending the copied file to the iPad…"
-                : "Sending \(files.count) copied files to the iPad…"
+                ? "Sending the copied file to the viewer…"
+                : "Sending \(files.count) copied files to the viewer…"
             return
         }
         guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
@@ -835,7 +881,7 @@ final class MacConnectionModel: ObservableObject {
         let prepared = ClipboardTransfer.prepare(text)
         peers.send(.clipboardText(prepared))
         clipboardTransferStatus = prepared == text
-            ? "Mac clipboard sent to iPad."
+            ? "Mac clipboard sent to viewer."
             : "Mac clipboard sent (truncated to 48 KB)."
     }
 
@@ -1126,7 +1172,7 @@ final class MacConnectionModel: ObservableObject {
         remoteInputAuthorized = remoteInput.requestAccess()
         if remoteInputAuthorized {
             status = "Remote input enabled"
-            detail = "Keyboard, trackpad, and scroll event posting are enabled for the iPad."
+            detail = "Keyboard, pointer, and scroll event posting are enabled for the viewer."
             sendRemoteInputPermissionStatus()
         } else {
             status = "Allow Mac input access"
@@ -1154,7 +1200,7 @@ final class MacConnectionModel: ObservableObject {
                     guard let self else { return }
                     self.remoteInputAuthorized = true
                     self.status = "Remote input enabled"
-                    self.detail = "Keyboard, trackpad, and scroll event posting are enabled for the iPad."
+                    self.detail = "Keyboard, pointer, and scroll event posting are enabled for the viewer."
                     self.sendRemoteInputPermissionStatus()
                     return
                 }
@@ -1243,7 +1289,7 @@ final class MacConnectionModel: ObservableObject {
                         // iPad app was backgrounded. The existing encrypted
                         // socket and input pipeline stay alive during this
                         // short presentation-only refresh.
-                        streamer.refreshCaptureAfterForeground()
+                        streamer.refreshCaptureAfterForeground(force: true)
                     }
                 } else if detail == "video-keyframe-needed" {
                     // The iPad detected a sequence gap or a decoder queue
@@ -1267,7 +1313,7 @@ final class MacConnectionModel: ObservableObject {
                     ))
                 }
                 DispatchQueue.main.async { [weak self] in
-                    self?.applyRemoteInputResult(accepted)
+                    self?.refreshRemoteInputPermissionStatus()
                 }
             }
         case .requestSystemInformation:
@@ -1301,7 +1347,7 @@ final class MacConnectionModel: ObservableObject {
                 remoteInput.submit(.key("v", modifiers: ["command"])) { [weak self] accepted, _ in
                     guard let self else { return }
                     DispatchQueue.main.async {
-                        self.applyRemoteInputResult(accepted)
+                        self.refreshRemoteInputPermissionStatus()
                         if !accepted {
                             self.clipboardTransferStatus = "Clipboard copied; Mac input permission is required to paste."
                         }
@@ -1315,14 +1361,13 @@ final class MacConnectionModel: ObservableObject {
         }
     }
 
-    private func applyRemoteInputResult(_ accepted: Bool) {
-        if !accepted {
-            remoteInputAuthorized = false
-            sendRemoteInputPermissionStatus()
-        } else if !remoteInputAuthorized {
-            remoteInputAuthorized = true
-            sendRemoteInputPermissionStatus()
-        }
+    private func refreshRemoteInputPermissionStatus() {
+        // Event rejection (for example an unsupported key) is not revocation.
+        // Report actual event-posting permission independently of the ACK.
+        let authorized = remoteInput.isAuthorized
+        guard remoteInputAuthorized != authorized else { return }
+        remoteInputAuthorized = authorized
+        sendRemoteInputPermissionStatus()
     }
 
     private func sendRemoteInputPermissionStatus() {

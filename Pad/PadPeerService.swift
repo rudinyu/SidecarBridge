@@ -1,7 +1,10 @@
 import CryptoKit
 import Foundation
 import MultipeerConnectivity
+
+#if canImport(UIKit)
 import UIKit
+#endif
 
 final class PadPeerService: NSObject {
     var onFrame: ((Data) -> Void)?
@@ -14,7 +17,15 @@ final class PadPeerService: NSObject {
     var onPairingCodeRequired: ((String, String?) -> Void)?
     var onDiscoveredMacsChanged: (([String]) -> Void)?
 
-    private let peerID = MCPeerID(displayName: UIDevice.current.name)
+    private static var localPeerName: String {
+        #if canImport(UIKit)
+        return UIDevice.current.name
+        #else
+        return Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+        #endif
+    }
+
+    private let peerID = MCPeerID(displayName: PadPeerService.localPeerName)
     private var session: MCSession
     private var browser: MCNearbyServiceBrowser?
     private var invitedPeers = Set<String>()

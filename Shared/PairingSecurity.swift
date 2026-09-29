@@ -228,6 +228,12 @@ enum SecureCredentialStore {
     static func set(_ data: Data, account: String) -> Bool {
         let protectedSaved = setProtected(data, account: account)
         let legacySaved = setLegacy(data, account: account)
+        // If the protected item is stale or temporarily unavailable but the
+        // legacy Keychain accepts the replacement, do not leave the stale
+        // protected copy ahead of the valid legacy copy on the next read.
+        if !protectedSaved, legacySaved {
+            _ = SecItemDelete(baseQuery(account: account, dataProtection: true) as CFDictionary)
+        }
         return protectedSaved || legacySaved
     }
 

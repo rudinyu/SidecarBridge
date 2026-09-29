@@ -382,17 +382,20 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
     /// encoder keeps its packet sequence so a duplicate foreground callback
     /// cannot make the receiver reject every new frame as stale.
     func refreshCaptureAfterForeground(force: Bool = false) {
+        // The viewer sends `viewer-foreground` and `startFallback` together
+        // when a connection resumes. They can arrive while the first rebuild
+        // is still stopping ScreenCaptureKit. Do not cancel that in-flight
+        // rebuild and replace it with a second task; doing so can leave the
+        // sender with `stream == nil` and only a keyframe request.
+        guard foregroundRefreshTask == nil else { return }
+
         let now = ProcessInfo.processInfo.systemUptime
-        guard stream != nil else {
-            requestKeyFrame()
-            return
-        }
         guard force || now - lastForegroundRefreshUptime >= minimumForegroundRefreshInterval else {
             requestKeyFrame()
             return
         }
         lastForegroundRefreshUptime = now
-        foregroundRefreshTask?.cancel()
+        let rebuildExistingStream = stream != nil
         let token = UUID()
         foregroundRefreshToken = token
         foregroundRefreshTask = Task { [weak self] in
@@ -403,7 +406,15 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
                 }
             }
             do {
-                try await self.rebuildCaptureAfterForeground()
+                if rebuildExistingStream {
+                    try await self.rebuildCaptureAfterForeground()
+                } else {
+                    // `isStreaming` can survive a short transport reconnect
+                    // while ScreenCaptureKit has already lost its source.
+                    // Starting a fresh capture here is the recovery path; a
+                    // keyframe request alone cannot produce a video frame.
+                    try await self.start(resetSequence: false)
+                }
                 guard !Task.isCancelled else { return }
                 self.onCaptureRefreshCompleted?()
             } catch {

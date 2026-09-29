@@ -2,7 +2,6 @@ import CryptoKit
 import Darwin
 import Foundation
 import Network
-import UIKit
 
 final class PadLANService {
     var onFrame: ((Data) -> Void)?
