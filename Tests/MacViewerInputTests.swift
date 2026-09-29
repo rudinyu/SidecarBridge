@@ -1,6 +1,23 @@
 import AppKit
 import XCTest
 
+private final class StubMacViewerInputModeManager: MacViewerInputModeManaging {
+    var nextCycleLanguage: String?
+    var nextToggleLanguage: String?
+    private(set) var cycleCount = 0
+    private(set) var toggleCount = 0
+
+    func cycleAndReturnLanguage() -> String? {
+        cycleCount += 1
+        return nextCycleLanguage
+    }
+
+    func toggleChineseEnglishAndReturnLanguage() -> String? {
+        toggleCount += 1
+        return nextToggleLanguage
+    }
+}
+
 final class MacViewerInputTests: XCTestCase {
     @MainActor
     private func mouse(
@@ -11,6 +28,85 @@ final class MacViewerInputTests: XCTestCase {
             with: type, location: NSPoint(x: x, y: y), modifierFlags: modifiers,
             timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: clicks, pressure: 0
         ))
+    }
+
+    @MainActor
+    private func key(
+        _ keyCode: UInt16,
+        characters: String,
+        modifiers: NSEvent.ModifierFlags = []
+    ) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: modifiers,
+            timestamp: 1, windowNumber: 0, context: nil,
+            characters: characters, charactersIgnoringModifiers: characters,
+            isARepeat: false, keyCode: keyCode
+        ))
+    }
+
+    @MainActor
+    func testMagicKeyboardLanguageKeySynchronizesExplicitViewerMode() throws {
+        var events: [RemoteInputEvent] = []
+        let modeManager = StubMacViewerInputModeManager()
+        modeManager.nextToggleLanguage = "en"
+        let view = MacViewerInputView(
+            contentAspectRatio: 16 / 9,
+            isEnabled: true,
+            onInput: { events.append($0) },
+            inputModeManager: modeManager
+        )
+
+        view.keyDown(with: try key(57, characters: ""))
+
+        XCTAssertEqual(modeManager.toggleCount, 1)
+        XCTAssertEqual(events, [.inputMode(language: "en")])
+        XCTAssertFalse(events.contains { $0.kind == .toggleChineseEnglishInputMode })
+    }
+
+    @MainActor
+    func testMagicKeyboardCapsLockModifierEventSynchronizesInputMode() throws {
+        var events: [RemoteInputEvent] = []
+        let modeManager = StubMacViewerInputModeManager()
+        modeManager.nextToggleLanguage = "zh-Hant"
+        let view = MacViewerInputView(
+            contentAspectRatio: 16 / 9,
+            isEnabled: true,
+            onInput: { events.append($0) },
+            inputModeManager: modeManager
+        )
+        let quartzEvent = try XCTUnwrap(CGEvent(
+            keyboardEventSource: nil,
+            virtualKey: 57,
+            keyDown: true
+        ))
+        quartzEvent.type = .flagsChanged
+        quartzEvent.flags = .maskAlphaShift
+        let event = try XCTUnwrap(NSEvent(cgEvent: quartzEvent))
+
+        view.flagsChanged(with: event)
+
+        XCTAssertEqual(event.keyCode, 57)
+        XCTAssertEqual(modeManager.toggleCount, 1)
+        XCTAssertEqual(events, [.inputMode(language: "zh-Hant")])
+    }
+
+    @MainActor
+    func testControlSpaceCyclesViewerLocallyAndSendsSelectedLanguage() throws {
+        var events: [RemoteInputEvent] = []
+        let modeManager = StubMacViewerInputModeManager()
+        modeManager.nextCycleLanguage = "zh-Hant"
+        let view = MacViewerInputView(
+            contentAspectRatio: 16 / 9,
+            isEnabled: true,
+            onInput: { events.append($0) },
+            inputModeManager: modeManager
+        )
+
+        view.keyDown(with: try key(49, characters: " ", modifiers: .control))
+
+        XCTAssertEqual(modeManager.cycleCount, 1)
+        XCTAssertEqual(events, [.inputMode(language: "zh-Hant")])
+        XCTAssertFalse(events.contains { $0.kind == .cycleInputMode })
     }
 
     @MainActor

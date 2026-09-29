@@ -1,17 +1,29 @@
 import AppKit
 import SwiftUI
 
+protocol MacViewerInputModeManaging: AnyObject {
+    func cycleAndReturnLanguage() -> String?
+    func toggleChineseEnglishAndReturnLanguage() -> String?
+}
+
+final class NoOpMacViewerInputModeManager: MacViewerInputModeManaging {
+    func cycleAndReturnLanguage() -> String? { nil }
+    func toggleChineseEnglishAndReturnLanguage() -> String? { nil }
+}
+
 struct MacViewerInputSurface: NSViewRepresentable {
     let contentAspectRatio: CGFloat
     let isEnabled: Bool
     let onInput: (RemoteInputEvent) -> Void
+    var inputModeManager: MacViewerInputModeManaging = NoOpMacViewerInputModeManager()
     var onLocalShortcut: (NSEvent) -> Bool = { _ in false }
 
     func makeNSView(context: Context) -> MacViewerInputView {
         let view = MacViewerInputView(
             contentAspectRatio: contentAspectRatio,
             isEnabled: isEnabled,
-            onInput: onInput
+            onInput: onInput,
+            inputModeManager: inputModeManager
         )
         view.onLocalShortcut = onLocalShortcut
         return view
@@ -21,6 +33,7 @@ struct MacViewerInputSurface: NSViewRepresentable {
         nsView.contentAspectRatio = contentAspectRatio
         nsView.isEnabled = isEnabled
         nsView.onInput = onInput
+        nsView.inputModeManager = inputModeManager
         nsView.onLocalShortcut = onLocalShortcut
     }
 }
@@ -38,6 +51,7 @@ final class MacViewerInputView: NSView, NSTextInputClient {
     private var lastPointerLocation = CGPoint.zero
     private var capsLockState: Bool?
     private var lastLanguageSwitchEvent: (timestamp: TimeInterval, source: LanguageSwitchEventSource)?
+    var inputModeManager: MacViewerInputModeManaging
 
     private enum LanguageSwitchEventSource {
         case flagsChanged
@@ -55,11 +69,13 @@ final class MacViewerInputView: NSView, NSTextInputClient {
     init(
         contentAspectRatio: CGFloat,
         isEnabled: Bool,
-        onInput: @escaping (RemoteInputEvent) -> Void
+        onInput: @escaping (RemoteInputEvent) -> Void,
+        inputModeManager: MacViewerInputModeManaging = NoOpMacViewerInputModeManager()
     ) {
         self.contentAspectRatio = contentAspectRatio
         self.isEnabled = isEnabled
         self.onInput = onInput
+        self.inputModeManager = inputModeManager
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
@@ -149,7 +165,7 @@ final class MacViewerInputView: NSView, NSTextInputClient {
             return
         }
         if isRemoteInputModeSwitch(event) {
-            onInput(.cycleInputMode())
+            sendNextInputMode()
             return
         }
         if hasMarkedText() || isTextInputCandidate(event) {
@@ -181,7 +197,7 @@ final class MacViewerInputView: NSView, NSTextInputClient {
 
         capsLockState = newCapsLockState
         lastLanguageSwitchEvent = (event.timestamp, .flagsChanged)
-        onInput(.toggleChineseEnglishInputMode())
+        applyChineseEnglishToggle()
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -198,7 +214,7 @@ final class MacViewerInputView: NSView, NSTextInputClient {
             return true
         }
         if isRemoteInputModeSwitch(event) {
-            onInput(.cycleInputMode())
+            sendNextInputMode()
             return true
         }
         guard hasHardwareShortcutModifier(event) else {
@@ -247,7 +263,23 @@ final class MacViewerInputView: NSView, NSTextInputClient {
             return
         }
         lastLanguageSwitchEvent = (event.timestamp, .keyDown)
-        onInput(.toggleChineseEnglishInputMode())
+        applyChineseEnglishToggle()
+    }
+
+    private func applyChineseEnglishToggle() {
+        guard let language = inputModeManager.toggleChineseEnglishAndReturnLanguage() else {
+            NSSound.beep()
+            return
+        }
+        onInput(.inputMode(language: language))
+    }
+
+    private func sendNextInputMode() {
+        guard let language = inputModeManager.cycleAndReturnLanguage() else {
+            NSSound.beep()
+            return
+        }
+        onInput(.inputMode(language: language))
     }
 
     private func interpretRemoteTextInput(_ event: NSEvent) {

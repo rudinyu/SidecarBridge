@@ -860,12 +860,12 @@ final class RemoteInputController {
     }
 }
 
-private struct ChineseEnglishToggleExpectation {
+struct ChineseEnglishToggleExpectation {
     let previousSourceID: String?
     let wantsChinese: Bool
 }
 
-private final class RemoteInputSourceController {
+final class RemoteInputSourceController: MacViewerInputModeManaging {
     private var lastChineseSourceID: String?
     private var lastEnglishSourceID: String?
 
@@ -875,10 +875,34 @@ private final class RemoteInputSourceController {
         }
     }
 
+    func cycleAndReturnLanguage() -> String? {
+        MainQueueExecutor.sync {
+            guard cycleOnMain() else { return nil }
+            return currentLanguageOnMain()
+        }
+    }
+
     func toggleChineseEnglish() -> Bool {
         MainQueueExecutor.sync {
             toggleChineseEnglishOnMain()
         }
+    }
+
+    func toggleChineseEnglishAndReturnLanguage() -> String? {
+        MainQueueExecutor.sync {
+            guard toggleChineseEnglishOnMain() else { return nil }
+            return currentLanguageOnMain()
+        }
+    }
+
+    private func currentLanguageOnMain() -> String? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let current = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+        let languages = languagesProperty(current)
+        let selectedLanguage = languages.first(where: isChineseLanguage)
+            ?? languages.first(where: isEnglishLanguage)
+            ?? languages.first
+        return selectedLanguage.map(RemoteKeyboardInput.normalizedLanguage)
     }
 
     func chineseEnglishToggleExpectation() -> ChineseEnglishToggleExpectation {

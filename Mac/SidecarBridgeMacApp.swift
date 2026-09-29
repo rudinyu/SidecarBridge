@@ -21,6 +21,7 @@ struct SidecarBridgeMacApp: App {
     @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var appDelegate
     @StateObject private var model = MacConnectionModel()
     @StateObject private var viewerModel = MacViewerConnectionModel()
+    @State private var viewerInputModeManager = RemoteInputSourceController()
     @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
@@ -116,7 +117,10 @@ struct SidecarBridgeMacApp: App {
 
     private var viewerWindow: some Scene {
         Window("Mac Viewer", id: "viewer") {
-            MacViewerView(model: viewerModel)
+            MacViewerView(
+                model: viewerModel,
+                inputModeManager: viewerInputModeManager
+            )
         }
         .defaultSize(width: 1120, height: 820)
         .windowResizability(.contentMinSize)

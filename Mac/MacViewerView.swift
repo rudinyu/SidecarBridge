@@ -12,10 +12,16 @@ struct MacViewerView: View {
     @ObservedObject var model: MacViewerConnectionModel
     @StateObject private var presentation: MacViewerPresentation
     @State private var pendingForgetTarget: ForgetTarget?
+    private let inputModeManager: MacViewerInputModeManaging
 
-    init(model: MacViewerConnectionModel, presentation: MacViewerPresentation? = nil) {
+    init(
+        model: MacViewerConnectionModel,
+        presentation: MacViewerPresentation? = nil,
+        inputModeManager: MacViewerInputModeManaging = NoOpMacViewerInputModeManager()
+    ) {
         self.model = model
         _presentation = StateObject(wrappedValue: presentation ?? MacViewerPresentation())
+        self.inputModeManager = inputModeManager
     }
 
     private var showsChrome: Bool { !model.isConnected || presentation.controlsVisible }
@@ -276,6 +282,7 @@ struct MacViewerView: View {
                         contentAspectRatio: model.streamAspectRatio,
                         isEnabled: model.remoteInputAuthorized,
                         onInput: model.sendInput,
+                        inputModeManager: inputModeManager,
                         onLocalShortcut: presentation.handleLocalShortcut
                     )
                 } else {
