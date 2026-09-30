@@ -8,8 +8,8 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "1.4"
-    # macOS build 115 keeps the Viewer and Host input sources in sync.
-    CURRENT_PROJECT_VERSION: "115"
+    # macOS build 116 restores Viewer LAN discovery after Forget/Retry.
+    CURRENT_PROJECT_VERSION: "116"
     DEVELOPMENT_TEAM: LYK4LV2859
 targets:
   SidecarBridgeMac:

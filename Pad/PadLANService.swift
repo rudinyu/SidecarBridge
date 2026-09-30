@@ -3,6 +3,23 @@ import Darwin
 import Foundation
 import Network
 
+struct LANDiscoveryCandidateState {
+    let selectedMacName: String?
+    let codeFirstPairingRequested: Bool
+    let hasPreferredDirectRoute: Bool
+    let hasMatchingSelectedRoute: Bool
+    let hasAnyDiscoveredRoute: Bool
+
+    var hasSelectableDirectCandidate: Bool {
+        // A remembered IP is useful only while there is an explicit target.
+        // After Forget/Retry, stale route metadata must not suppress the idle
+        // Bonjour refresh that searches for Macs again.
+        guard selectedMacName != nil || codeFirstPairingRequested else { return false }
+        return hasPreferredDirectRoute || hasMatchingSelectedRoute ||
+            (codeFirstPairingRequested && hasAnyDiscoveredRoute)
+    }
+}
+
 final class PadLANService {
     var onFrame: ((Data) -> Void)?
     var onVideoFrame: ((VideoFrame) -> Void)?
@@ -81,6 +98,11 @@ final class PadLANService {
             self.connectionAttemptWorkItem?.cancel()
             self.connectionAttemptWorkItem = nil
             self.cancelSubnetProbes()
+            self.expectedMacID = nil
+            self.preferredHosts.removeAll()
+            self.rejectedEndpointKeys.removeAll()
+            self.bonjourHostsByMac.removeAll()
+            self.multipeerHostsByMac.removeAll()
             self.browser?.cancel()
             self.browser = nil
             self.connection?.cancel()
@@ -1049,23 +1071,39 @@ final class PadLANService {
     /// stale service, so checking only whether the browser result list is
     /// non-empty is not sufficient.
     private var hasSelectableDirectCandidate: Bool {
-        if let port = NWEndpoint.Port(rawValue: BridgeConstants.directPort),
-           preferredHosts.contains(where: {
+        let hasPreferredDirectRoute: Bool
+        if let port = NWEndpoint.Port(rawValue: BridgeConstants.directPort) {
+            hasPreferredDirectRoute = preferredHosts.contains {
                !rejectedEndpointKeys.contains(String(describing: NWEndpoint.hostPort(host: NWEndpoint.Host($0), port: port)))
-           }) { return true }
+            }
+        } else {
+            hasPreferredDirectRoute = false
+        }
+
+        let hasMatchingSelectedRoute: Bool
         if let selectedMacName {
             let hasService = endpoints.contains {
                 guard case let .service(name, _, _, _) = $0 else { return false }
                 return name == selectedMacName
             }
-            return hasService ||
+            hasMatchingSelectedRoute = hasService ||
                 !(bonjourHostsByMac[selectedMacName] ?? []).isEmpty ||
                 !(multipeerHostsByMac[selectedMacName] ?? []).isEmpty
+        } else {
+            hasMatchingSelectedRoute = false
         }
-        guard codeFirstPairingRequested else { return false }
-        return !endpoints.isEmpty ||
+
+        let hasAnyDiscoveredRoute = !endpoints.isEmpty ||
             multipeerHostsByMac.values.contains { !$0.isEmpty } ||
             bonjourHostsByMac.values.contains { !$0.isEmpty }
+
+        return LANDiscoveryCandidateState(
+            selectedMacName: selectedMacName,
+            codeFirstPairingRequested: codeFirstPairingRequested,
+            hasPreferredDirectRoute: hasPreferredDirectRoute,
+            hasMatchingSelectedRoute: hasMatchingSelectedRoute,
+            hasAnyDiscoveredRoute: hasAnyDiscoveredRoute
+        ).hasSelectableDirectCandidate
     }
 
     /// A Bonjour endpoint may survive while its route has gone stale. Do not

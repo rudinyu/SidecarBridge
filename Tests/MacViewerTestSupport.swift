@@ -35,7 +35,8 @@ extension XCTestCase {
             pasteboard: pasteboard,
             receiveDirectory: directory,
             defaults: defaults,
-            removeCredential: { _ in true }
+            removeCredential: { _ in true },
+            removeAllCredentials: { true }
         )
         return ViewerFixture(model: model, peer: peer, pasteboard: pasteboard, defaults: defaults,
             receiveDirectory: directory)

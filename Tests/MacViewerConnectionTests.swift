@@ -328,3 +328,66 @@ final class MacViewerConnectionTests: XCTestCase {
         }
     }
 }
+
+final class MacViewerLANDiscoveryTests: XCTestCase {
+    func testForgottenPreferredRouteDoesNotSuppressIdleDiscovery() {
+        let state = LANDiscoveryCandidateState(
+            selectedMacName: nil,
+            codeFirstPairingRequested: false,
+            hasPreferredDirectRoute: true,
+            hasMatchingSelectedRoute: false,
+            hasAnyDiscoveredRoute: false
+        )
+
+        XCTAssertFalse(state.hasSelectableDirectCandidate)
+    }
+
+    func testSelectedMacCanUseItsRememberedDirectRoute() {
+        let state = LANDiscoveryCandidateState(
+            selectedMacName: "Intel Mac",
+            codeFirstPairingRequested: false,
+            hasPreferredDirectRoute: true,
+            hasMatchingSelectedRoute: false,
+            hasAnyDiscoveredRoute: false
+        )
+
+        XCTAssertTrue(state.hasSelectableDirectCandidate)
+    }
+
+    func testCodeFirstPairingCanUseRouteBeforeMacNameIsDiscovered() {
+        let state = LANDiscoveryCandidateState(
+            selectedMacName: nil,
+            codeFirstPairingRequested: true,
+            hasPreferredDirectRoute: true,
+            hasMatchingSelectedRoute: false,
+            hasAnyDiscoveredRoute: false
+        )
+
+        XCTAssertTrue(state.hasSelectableDirectCandidate)
+    }
+
+    @MainActor
+    func testForgetAllRestartsDiscoveryAndShowsNewMacWithoutSavingIt() async throws {
+        let f = try makeViewerFixture(values: [
+            "macViewer.rememberedMacNames": ["Saved Mac"],
+            "macViewer.selectedMacName": "Saved Mac"
+        ])
+        SavedMacRouteStore.remember(
+            macID: "test-host-\(UUID().uuidString)",
+            name: "Saved Mac",
+            hosts: ["192.168.1.122"],
+            defaults: f.defaults
+        )
+
+        f.model.forgetTrustedMacs()
+
+        XCTAssertEqual(f.peer.restartCount, 1)
+        XCTAssertTrue(f.model.discoveredMacs.isEmpty)
+        XCTAssertNil(SavedMacRouteStore.route(named: "Saved Mac", defaults: f.defaults))
+        await awaitViewerChange(f.model.$discoveredMacs) {
+            f.peer.onDiscoveredMacsChanged?(["Intel Mac"])
+        }
+        XCTAssertEqual(f.model.discoveredMacs, ["Intel Mac"])
+        XCTAssertFalse(f.model.isRememberedMac("Intel Mac"))
+    }
+}

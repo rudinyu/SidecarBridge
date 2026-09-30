@@ -76,6 +76,7 @@ final class MacViewerConnectionModel: ObservableObject {
     private let receiveDirectory: URL
     private let fileTransfer: FileTransferEngine
     private let removeCredential: (String) -> Bool
+    private let removeAllCredentials: () -> Bool
     private var started = false
     private var userRequestedConnection = false
     private var inputSequence: UInt64 = 0
@@ -96,12 +97,14 @@ final class MacViewerConnectionModel: ObservableObject {
         pasteboard: NSPasteboard = .general,
         receiveDirectory: URL? = nil,
         defaults: UserDefaults = .standard,
-        removeCredential: @escaping (String) -> Bool = { SecureCredentialStore.remove(account: $0) }
+        removeCredential: @escaping (String) -> Bool = { SecureCredentialStore.remove(account: $0) },
+        removeAllCredentials: @escaping () -> Bool = { SecureCredentialStore.removeAll(accountPrefix: "pad.mac.") }
     ) {
         self.peers = peers
         self.pasteboard = pasteboard
         self.defaults = defaults
         self.removeCredential = removeCredential
+        self.removeAllCredentials = removeAllCredentials
         streamResolution = defaults.string(forKey: StreamPreferenceStore.resolutionKey)
             .flatMap(StreamResolutionPreference.init(rawValue:)) ?? .adaptive
         streamFrameRate = StreamPreferenceStore.loadFrameRate(defaults: defaults)
@@ -561,7 +564,7 @@ final class MacViewerConnectionModel: ObservableObject {
     }
 
     func forgetTrustedMacs() {
-        guard SecureCredentialStore.removeAll(accountPrefix: "pad.mac.") else {
+        guard removeAllCredentials() else {
             status = "Could not remove all saved pairings"
             detail = "Unlock this Mac and try Forget All again; saved routes were kept."
             return
