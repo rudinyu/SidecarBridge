@@ -1,6 +1,7 @@
 import XCTest
 import SwiftUI
 import Vision
+import AppKit
 
 final class MacPairingUITests: XCTestCase {
     private func invitation() -> PairingInvitation {
@@ -37,13 +38,20 @@ final class MacPairingUITests: XCTestCase {
     func testPairingCardPreviews() async throws {
         try await MainActor.run {
             for width in [704.0, 900.0] {
-                let renderer = ImageRenderer(content:
+                let content =
                     MacPairingCard(invitation: invitation(), copyCode: {}, enlarge: {})
                         .frame(width: width).padding(24)
                         .background(Color(red: 0.025, green: 0.04, blue: 0.14))
-                        .environment(\.colorScheme, .dark))
-                renderer.scale = 2
-                let image = try XCTUnwrap(renderer.nsImage)
+                        .environment(\.colorScheme, .dark)
+                let host = NSHostingView(rootView: content)
+                host.frame = CGRect(origin: .zero, size: host.fittingSize)
+                let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+                window.contentView = host
+                host.layoutSubtreeIfNeeded()
+                let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+                host.cacheDisplay(in: host.bounds, to: bitmap)
+                let image = NSImage(size: host.bounds.size)
+                image.addRepresentation(bitmap)
                 let cgImage = try XCTUnwrap(image.cgImage(forProposedRect: nil, context: nil, hints: nil))
                 let textRequest = VNRecognizeTextRequest()
                 textRequest.recognitionLevel = .accurate

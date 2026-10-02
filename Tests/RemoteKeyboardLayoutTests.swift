@@ -40,15 +40,22 @@ final class RemoteKeyboardLayoutTests: XCTestCase {
     func testBothPagesFitLandscapePanel() async throws {
         try await MainActor.run {
             for mode in SoftwareKeyboardMode.allCases {
-                let renderer = ImageRenderer(content: RemoteKeyboardToolbar(
+                let content = RemoteKeyboardToolbar(
                     mode: .constant(mode), modifiers: .constant([]), onKey: { _, _ in },
                     onShortcut: { _, _ in }, onInputMode: {}, onCycleInputMode: {},
                     onClearModifiers: {}, onHide: {})
                     .frame(width: 980).padding(10).background(Color.black)
-                    .environment(\.colorScheme, .dark))
-                renderer.scale = 2
-                let image = try XCTUnwrap(renderer.nsImage)
-                XCTAssertLessThanOrEqual(image.size.height, 540, "\(mode) must fit without cutting off bottom keys")
+                    .environment(\.colorScheme, .dark)
+                let host = NSHostingView(rootView: content)
+                host.frame = CGRect(origin: .zero, size: host.fittingSize)
+                XCTAssertLessThanOrEqual(host.frame.height, 540, "\(mode) must fit without cutting off bottom keys")
+                let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+                window.contentView = host
+                host.layoutSubtreeIfNeeded()
+                let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+                host.cacheDisplay(in: host.bounds, to: bitmap)
+                let image = NSImage(size: host.bounds.size)
+                image.addRepresentation(bitmap)
                 let attachment = XCTAttachment(image: image)
                 attachment.name = "Custom keyboard \(mode.rawValue)"
                 attachment.lifetime = .keepAlways
