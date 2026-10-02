@@ -147,7 +147,9 @@ if (( ! SKIP_VIEWER_UI_TESTS )); then
     -derivedDataPath "$VIEWER_UI_TEST_DERIVED" \
     -resultBundlePath "$VIEWER_UI_RESULT" \
     -parallel-testing-enabled NO \
-    CODE_SIGNING_ALLOWED=NO \
+    CODE_SIGNING_ALLOWED=YES \
+    CODE_SIGN_IDENTITY=- \
+    CODE_SIGNING_REQUIRED=YES \
     test
 else
   VIEWER_UI_STATUS="skipped"
