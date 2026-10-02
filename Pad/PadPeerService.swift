@@ -16,6 +16,8 @@ final class PadPeerService: NSObject {
     var onConnectionHealthChanged: ((String, Int?) -> Void)?
     var onPairingCodeRequired: ((String, String?) -> Void)?
     var onDiscoveredMacsChanged: (([String]) -> Void)?
+    var onDiscoveredDevicesChanged: (([MacDiscoveryRecord]) -> Void)?
+    var onAuthenticatedMacChanged: ((String, String) -> Void)?
 
     private static var localPeerName: String {
         #if canImport(UIKit)
@@ -62,9 +64,13 @@ final class PadPeerService: NSObject {
     private var pendingMultipeerInput = RemoteInputCoalescer()
     private var multipeerInputDrainScheduled = false
     private var lanDiscoveredMacs = Set<String>()
+    private var lanDiscoveredDevices: [String: MacDiscoveryRecord] = [:]
     private var multipeerDiscoveredMacs: [String: MCPeerID] = [:]
     private var multipeerDiscoveredHosts: [String: [String]] = [:]
+    private var multipeerDiscoveredDevices: [String: MacDiscoveryRecord] = [:]
+    private var multipeerPeersByMacID: [String: MCPeerID] = [:]
     private var selectedMacName: String?
+    private var selectedMacID: String?
     private var expectedMacID: String?
     // Finding a peer is not consent to invite it. This is enabled only by the
     // explicit Connect action in PadConnectionModel.
@@ -128,6 +134,14 @@ final class PadPeerService: NSObject {
             self.lanDiscoveredMacs = Set(names)
             self.publishDiscoveredMacs()
         }
+        lan.onDiscoveredDevicesChanged = { [weak self] devices in
+            guard let self else { return }
+            self.lanDiscoveredDevices = Dictionary(devices.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            self.publishDiscoveredDevices()
+        }
+        lan.onAuthenticatedMacChanged = { [weak self] macID, name in
+            self?.onAuthenticatedMacChanged?(macID, name)
+        }
         lan.onConnectionChanged = { [weak self] connected, value in
             guard let self else { return }
             guard !connected || self.userRequestedConnection else {
@@ -178,6 +192,10 @@ final class PadPeerService: NSObject {
         userRequestedConnection = false
         codeFirstPairingRequested = false
         selectedMacName = nil
+        selectedMacID = nil
+        lanDiscoveredMacs.removeAll()
+        lanDiscoveredDevices.removeAll()
+        clearMultipeerDiscovery()
         discardPendingVideoDelivery()
         fallbackWorkItem?.cancel()
         stopMultipeerFallback()
@@ -187,18 +205,31 @@ final class PadPeerService: NSObject {
     }
 
     func selectMac(named name: String) {
+        let savedID = SavedMacRouteStore.route(named: name)?.macID
+        let discoveredMatches = (Array(lanDiscoveredDevices.values) + Array(multipeerDiscoveredDevices.values))
+            .filter { $0.name == name && $0.macID != nil }
+        let discoveredID = Set(discoveredMatches.compactMap(\.macID)).count == 1
+            ? discoveredMatches.first?.macID
+            : nil
+        selectMac(macID: savedID ?? discoveredID, named: name)
+    }
+
+    func selectMac(macID: String?, named name: String) {
         rejectedPeers.removeAll()
         userRequestedConnection = true
         codeFirstPairingRequested = false
         selectedMacName = name
-        expectedMacID = SavedMacRouteStore.route(named: name)?.macID
+        selectedMacID = macID
+        expectedMacID = macID ?? SavedMacRouteStore.route(named: name)?.macID
         invitedPeers.removeAll()
+        let routeKey = macID ?? name
         lan.setMultipeerAdvertisedHosts(
-            multipeerDiscoveredHosts[name] ?? [],
-            forMacName: name
+            multipeerDiscoveredHosts[routeKey] ?? [],
+            forMacID: macID,
+            displayName: name
         )
-        lan.selectMac(named: name)
-        if let peer = multipeerDiscoveredMacs[name], let browser {
+        lan.selectMac(macID: macID, named: name)
+        if let peer = macID.flatMap({ multipeerPeersByMacID[$0] }) ?? multipeerDiscoveredMacs[routeKey], let browser {
             invite(peer, using: browser)
         }
     }
@@ -213,6 +244,7 @@ final class PadPeerService: NSObject {
         userRequestedConnection = true
         codeFirstPairingRequested = true
         selectedMacName = invitation?.name
+        selectedMacID = invitation?.macID
         expectedMacID = invitation?.macID
         submittedMCPairingCode = normalized
         invitedPeers.removeAll()
@@ -406,16 +438,37 @@ final class PadPeerService: NSObject {
     }
 
     private func publishDiscoveredMacs() {
-        let names = lanDiscoveredMacs.union(multipeerDiscoveredMacs.keys).sorted()
+        let nearbyNames = Set(multipeerDiscoveredDevices.values.map(\.name))
+        let names = lanDiscoveredMacs.union(nearbyNames).sorted()
         onDiscoveredMacsChanged?(names)
     }
 
+    private func clearMultipeerDiscovery() {
+        multipeerDiscoveredMacs.removeAll()
+        multipeerDiscoveredHosts.removeAll()
+        multipeerDiscoveredDevices.removeAll()
+        multipeerPeersByMacID.removeAll()
+        publishDiscoveredMacs()
+        publishDiscoveredDevices()
+    }
+
+    private func publishDiscoveredDevices() {
+        var devices = lanDiscoveredDevices
+        for (key, device) in multipeerDiscoveredDevices where devices[key] == nil {
+            devices[key] = device
+        }
+        onDiscoveredDevicesChanged?(devices.values.sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        })
+    }
+
     private func invite(_ peerID: MCPeerID, using browser: MCNearbyServiceBrowser) {
+        let peerKey = discoveryKey(for: peerID)
         guard userRequestedConnection, !lanConnected, !mcConnected,
-              !rejectedPeers.contains(peerID.displayName),
-              !invitedPeers.contains(peerID.displayName),
+              !rejectedPeers.contains(peerKey),
+              !invitedPeers.contains(peerKey),
               session.connectedPeers.isEmpty else { return }
-        invitedPeers.insert(peerID.displayName)
+        invitedPeers.insert(peerKey)
         let privateKey = Curve25519.KeyAgreement.PrivateKey()
         pendingMCPrivateKey = privateKey
         mcSecureSession = nil
@@ -426,7 +479,11 @@ final class PadPeerService: NSObject {
         )
         let encodedContext = try? JSONEncoder().encode(context)
         browser.invitePeer(peerID, to: session, withContext: encodedContext, timeout: 30)
-        armMultipeerConnectionWatchdog(for: peerID.displayName)
+        armMultipeerConnectionWatchdog(for: peerID)
+    }
+
+    private func discoveryKey(for peerID: MCPeerID) -> String {
+        multipeerDiscoveredMacs.first(where: { $0.value == peerID })?.key ?? peerID.displayName
     }
 
     func resumeAfterBackground() {
@@ -703,7 +760,7 @@ final class PadPeerService: NSObject {
     }
 
     private func armMultipeerConnectionWatchdog(
-        for peerName: String,
+        for peerID: MCPeerID,
         timeout: TimeInterval = 20
     ) {
         mcConnectionWatchdog?.cancel()
@@ -712,7 +769,7 @@ final class PadPeerService: NSObject {
             print("[SidecarBridge/P2P] Handshake timed out; resetting session")
             self.session.disconnect()
             self.rebuildMultipeerSession()
-            self.invitedPeers.remove(peerName)
+            self.invitedPeers.remove(self.discoveryKey(for: peerID))
             if self.browserRunning {
                 self.browser?.stopBrowsingForPeers()
                 self.browserRunning = false
@@ -755,7 +812,7 @@ final class PadPeerService: NSObject {
             }
             let clientPublicKey = privateKey.publicKey.rawRepresentation
             guard expectedMacID == nil || expectedMacID == macID else {
-                rejectedPeers.insert(remotePeer.displayName)
+                rejectedPeers.insert(discoveryKey(for: remotePeer))
                 session.disconnect()
                 clearPendingMultipeerAuthentication()
                 return
@@ -815,8 +872,9 @@ final class PadPeerService: NSObject {
             }
             SavedMacRouteStore.remember(
                 macID: macID, name: remotePeer.displayName,
-                hosts: multipeerDiscoveredHosts[remotePeer.displayName] ?? []
+                hosts: multipeerDiscoveredHosts[macID] ?? multipeerDiscoveredHosts[remotePeer.displayName] ?? []
             )
+            onAuthenticatedMacChanged?(macID, remotePeer.displayName)
             mcConnectionWatchdog?.cancel()
             mcConnectionWatchdog = nil
             mcConnected = true
@@ -830,7 +888,7 @@ final class PadPeerService: NSObject {
         case .rejected:
             // Keep trusted credentials until a replacement is authenticated.
             if codeFirstPairingRequested && expectedMacID == nil {
-                rejectedPeers.insert(remotePeer.displayName)
+                rejectedPeers.insert(discoveryKey(for: remotePeer))
                 session.disconnect()
                 clearPendingMultipeerAuthentication()
                 return
@@ -936,6 +994,7 @@ final class PadPeerService: NSObject {
 
     private func restartMultipeerBrowserAfterDisconnect() {
         guard started, !lanConnected else { return }
+        clearMultipeerDiscovery()
         if browserRunning {
             browser?.stopBrowsingForPeers()
             browserRunning = false
@@ -956,8 +1015,13 @@ final class PadPeerService: NSObject {
               session.connectedPeers.isEmpty else { return }
         let candidates = multipeerDiscoveredMacs
             .sorted { $0.key.localizedCaseInsensitiveCompare($1.key) == .orderedAscending }
-        guard let candidate = candidates.first(where: {
-            !invitedPeers.contains($0.key) && !rejectedPeers.contains($0.key) && (selectedMacName == nil || selectedMacName == $0.key)
+        guard let candidate = candidates.first(where: { candidate in
+            let key = candidate.key
+            let deviceName = multipeerDiscoveredDevices[key]?.name ?? key
+            let matchesSelection = selectedMacID.map { $0 == key }
+                ?? selectedMacName.map { $0 == deviceName }
+                ?? true
+            return !invitedPeers.contains(key) && !rejectedPeers.contains(key) && matchesSelection
         }) else { return }
         invite(candidate.value, using: browser)
     }
@@ -968,14 +1032,25 @@ extension PadPeerService: MCNearbyServiceBrowserDelegate {
         DispatchQueue.main.async { [weak self, weak browser] in
             guard let self, let browser, self.browser === browser else { return }
             let name = peerID.displayName
+            let macID = info?[BridgeConstants.macIDTXTKey]
+            let discoveryKey = macID ?? name
             let hosts = BridgeNetworkMetadata.decodePrivateIPv4Addresses(
                 info?[BridgeConstants.hostsTXTKey]
             )
-            self.multipeerDiscoveredHosts[name] = hosts
-            self.lan.setMultipeerAdvertisedHosts(hosts, forMacName: name)
-            self.multipeerDiscoveredMacs[name] = peerID
+            self.multipeerDiscoveredHosts[discoveryKey] = hosts
+            self.multipeerDiscoveredDevices[discoveryKey] = MacDiscoveryRecord(
+                macID: macID,
+                discoveryID: "nearby:" + (macID ?? name),
+                name: name,
+                hosts: hosts
+            )
+            if let macID { self.multipeerPeersByMacID[macID] = peerID }
+            self.lan.setMultipeerAdvertisedHosts(hosts, forMacID: macID, displayName: name)
+            self.multipeerDiscoveredMacs[discoveryKey] = peerID
             self.publishDiscoveredMacs()
-            if self.userRequestedConnection, self.selectedMacName == name {
+            self.publishDiscoveredDevices()
+            if self.userRequestedConnection,
+               (self.selectedMacID == macID && macID != nil || self.selectedMacID == nil && self.selectedMacName == name) {
                 self.invite(peerID, using: browser)
             } else if self.userRequestedConnection, self.codeFirstPairingRequested {
                 self.inviteCodeFirstPeerIfAvailable()
@@ -985,10 +1060,22 @@ extension PadPeerService: MCNearbyServiceBrowserDelegate {
 
     func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
         DispatchQueue.main.async { [weak self] in
-            self?.invitedPeers.remove(peerID.displayName)
-            self?.multipeerDiscoveredMacs.removeValue(forKey: peerID.displayName)
-            self?.multipeerDiscoveredHosts.removeValue(forKey: peerID.displayName)
-            self?.publishDiscoveredMacs()
+            guard let self else { return }
+            let keys = self.multipeerDiscoveredMacs
+                .filter { $0.value == peerID }
+                .map(\.key)
+            for key in keys {
+                self.invitedPeers.remove(key)
+                self.rejectedPeers.remove(key)
+            }
+            self.multipeerDiscoveredMacs = self.multipeerDiscoveredMacs.filter { $0.value != peerID }
+            for key in keys {
+                self.multipeerDiscoveredHosts.removeValue(forKey: key)
+                self.multipeerDiscoveredDevices.removeValue(forKey: key)
+            }
+            self.multipeerPeersByMacID = self.multipeerPeersByMacID.filter { $0.value != peerID }
+            self.publishDiscoveredMacs()
+            self.publishDiscoveredDevices()
         }
     }
 
@@ -1015,9 +1102,9 @@ extension PadPeerService: MCSessionDelegate {
                 self.mcConnected = false
                 self.mcPeerName = nil
                 self.pendingMCPeer = peerID
-                self.armMultipeerConnectionWatchdog(for: peerID.displayName, timeout: 60)
+                self.armMultipeerConnectionWatchdog(for: peerID, timeout: 60)
             } else if state == .connecting {
-                self.armMultipeerConnectionWatchdog(for: peerID.displayName)
+                self.armMultipeerConnectionWatchdog(for: peerID)
             } else {
                 self.mcConnected = false
                 self.mcPeerName = nil
@@ -1027,7 +1114,7 @@ extension PadPeerService: MCSessionDelegate {
                 self.mcConnectionWatchdog = nil
                 self.pendingMultipeerInput.removeAll()
                 self.multipeerInputDrainScheduled = false
-                self.invitedPeers.remove(peerID.displayName)
+                self.invitedPeers.remove(self.discoveryKey(for: peerID))
                 self.restartMultipeerBrowserAfterDisconnect()
             }
             if state != .connected && !self.lanConnected { self.reportConnection() }

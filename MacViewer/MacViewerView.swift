@@ -60,9 +60,9 @@ struct MacViewerView: View {
             titleVisibility: .visible
         ) {
             switch pendingForgetTarget {
-            case .mac(let name):
-                Button("Forget \(name)", role: .destructive) {
-                    model.forgetTrustedMac(named: name)
+            case .mac(let macID):
+                Button("Forget \(model.devices.first(where: { $0.macID == macID })?.name ?? "Mac")", role: .destructive) {
+                    model.forgetTrustedMac(macID: macID)
                     pendingForgetTarget = nil
                 }
             case .all:
@@ -172,9 +172,9 @@ struct MacViewerView: View {
 
             HStack(alignment: .top, spacing: 16) {
                 VStack(alignment: .leading, spacing: 9) {
-                    Text("Saved and discovered Macs")
+                    Text("Paired and discovered Macs")
                         .font(.headline)
-                    if model.discoveredMacs.isEmpty {
+                    if model.devices.isEmpty {
                         Label("Searching direct LAN and nearby P2P…", systemImage: "dot.radiowaves.left.and.right")
                             .font(.callout)
                             .foregroundStyle(.white.opacity(0.58))
@@ -185,15 +185,24 @@ struct MacViewerView: View {
                         HStack(spacing: 8) {
                             Picker("Mac", selection: selectedMacBinding) {
                                 Text("Select a Mac").tag("")
-                                ForEach(model.discoveredMacs, id: \.self) { name in
-                                    Text(model.isRememberedMac(name) ? name + " • Saved" : name).tag(name)
+                                Section("Paired") {
+                                    ForEach(model.devices.filter {
+                                        $0.availability == .pairedOnline || $0.availability == .pairedOffline
+                                    }) { device in
+                                        Text(devicePickerLabel(device)).tag(device.id)
+                                    }
+                                }
+                                Section("Currently discovered") {
+                                    ForEach(model.devices.filter { $0.availability == .discovered }) { device in
+                                        Text(devicePickerLabel(device)).tag(device.id)
+                                    }
                                 }
                             }
                             .labelsHidden()
                             .pickerStyle(.menu)
                             .frame(maxWidth: .infinity, alignment: .leading)
 
-                            if let selected = model.selectedMacName,
+                            if let selected = model.selectedMacID,
                                model.isRememberedMac(selected) {
                                 Button("Forget") {
                                     pendingForgetTarget = .mac(selected)
@@ -226,7 +235,7 @@ struct MacViewerView: View {
                         Button("Connect") { model.connect() }
                         .buttonStyle(.borderedProminent)
                         .tint(.cyan)
-                        .disabled(model.isConnecting)
+                        .disabled(model.isConnecting || model.selectedDevice?.isLocal == true)
 
                         if model.isConnecting {
                             Button("Cancel") { model.cancelConnection() }
@@ -320,10 +329,29 @@ struct MacViewerView: View {
             Text(model.streamDimensions)
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.white.opacity(0.62))
-            if model.streamFPS > 0 {
-                Text("\(model.streamFPS) FPS")
+            Text("In \(model.streamReceivedFPS) • queued \(model.streamSubmittedFPS) FPS")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.cyan)
+                .help("Received counts network frames. Queued counts frames submitted to AVFoundation.")
+            if model.supportsVisiblePixelSampling {
+                Text("Visible sample changes \(model.streamOutputChangeRate)/s")
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.cyan)
+                    .foregroundStyle(model.streamOutputChangeRate > 0 ? .green : .orange)
+                    .help("Counts changes in a 16×16 image sample. H.264 uses AVFoundation's displayed output buffer; JPEG uses the decoded image assigned to the view.")
+            } else {
+                Text("Display tracking unavailable")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .help("macOS 14.0–14.3 do not expose the displayed pixel buffer needed to verify changing output.")
+            }
+            Text(model.videoPresentationStatus)
+                .font(.caption)
+                .foregroundStyle(model.hasPresentedVideo ? .green : .orange)
+                .help("A static Host screen can produce an unchanged pixel sample. Refresh video only when you expect the screen to be changing.")
+            if model.shouldOfferVideoRecovery {
+                Button("Refresh video") { model.recoverVideo() }
+                    .buttonStyle(.bordered)
+                    .help("Request a fresh keyframe while keeping the current image visible.")
             }
             if let latency = model.connectionLatencyMS {
                 Text("\(latency) ms")
@@ -342,10 +370,10 @@ struct MacViewerView: View {
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.52))
                 Spacer()
-                if let selected = model.selectedMacName,
-                   model.isRememberedMac(selected) {
+                if let macID = model.selectedMacID,
+                   model.isRememberedMac(macID) {
                     Button("Forget Pairing") {
-                        pendingForgetTarget = .mac(selected)
+                        pendingForgetTarget = .mac(macID)
                     }
                     .buttonStyle(.bordered)
                     .tint(.red)
@@ -454,12 +482,27 @@ struct MacViewerView: View {
 
     private var selectedMacBinding: Binding<String> {
         Binding(
-            get: { model.selectedMacName ?? "" },
+            get: { model.selectedDevice?.id ?? "" },
             set: { value in
                 guard !value.isEmpty else { return }
-                model.chooseMac(value)
+                model.chooseDevice(value)
             }
         )
+    }
+
+    private func devicePickerLabel(_ device: MacViewerDevice) -> String {
+        let duplicateName = model.devices.filter { $0.name == device.name }.count > 1
+        let identity = device.macID ?? device.id
+        let identitySuffix = duplicateName
+            ? " · " + String((device.macID == nil ? identity.suffix(6) : identity.prefix(6)))
+            : ""
+        let availability: String
+        switch device.availability {
+        case .pairedOnline: availability = "Paired · Online"
+        case .pairedOffline: availability = "Paired · Offline"
+        case .discovered: availability = "Discovered"
+        }
+        return device.name + identitySuffix + " · " + availability + (device.isLocal ? " · This Mac" : "")
     }
 
     private var forgetDialogBinding: Binding<Bool> {

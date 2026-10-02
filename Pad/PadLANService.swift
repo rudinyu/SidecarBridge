@@ -29,6 +29,8 @@ final class PadLANService {
     var onLocalNetworkStateChanged: ((LocalNetworkAccessState) -> Void)?
     var onPairingCodeRequired: ((String, String?) -> Void)?
     var onDiscoveredMacsChanged: (([String]) -> Void)?
+    var onDiscoveredDevicesChanged: (([MacDiscoveryRecord]) -> Void)?
+    var onAuthenticatedMacChanged: ((String, String) -> Void)?
 
     private let queue = DispatchQueue(
         label: "SidecarBridge.PadLAN",
@@ -36,9 +38,11 @@ final class PadLANService {
     )
     private var browser: NWBrowser?
     private var endpoints: [NWEndpoint] = []
+    private var discoveryKeyByEndpoint: [String: String] = [:]
     private var bonjourHostsByMac: [String: [String]] = [:]
     private var multipeerHostsByMac: [String: [String]] = [:]
     private var selectedMacName: String?
+    private var selectedMacID: String?
     private var expectedMacID: String?
     private var preferredHosts: [String] = []
     private var candidateHost: String?
@@ -91,6 +95,7 @@ final class PadLANService {
             self.userRequestedConnection = false
             self.codeFirstPairingRequested = false
             self.selectedMacName = nil
+            self.selectedMacID = nil
             self.browserRestartWorkItem?.cancel()
             self.browserRestartWorkItem = nil
             self.idleDiscoveryRefreshWorkItem?.cancel()
@@ -103,6 +108,7 @@ final class PadLANService {
             self.rejectedEndpointKeys.removeAll()
             self.bonjourHostsByMac.removeAll()
             self.multipeerHostsByMac.removeAll()
+            self.discoveryKeyByEndpoint.removeAll()
             self.browser?.cancel()
             self.browser = nil
             self.connection?.cancel()
@@ -218,6 +224,7 @@ final class PadLANService {
             self.userRequestedConnection = true
             self.codeFirstPairingRequested = true
             self.selectedMacName = invitation?.name
+            self.selectedMacID = invitation?.macID
             self.expectedMacID = invitation?.macID
             self.preferredHosts = (invitation?.hosts ?? []) + [host].compactMap { $0 }.filter(BridgeNetworkMetadata.isPrivateIPv4Address)
             self.rejectedEndpointKeys.removeAll()
@@ -240,6 +247,10 @@ final class PadLANService {
     }
 
     func selectMac(named name: String) {
+        selectMac(macID: SavedMacRouteStore.route(named: name)?.macID, named: name)
+    }
+
+    func selectMac(macID: String?, named name: String) {
         let token = attemptToken.begin()
         queue.async { [weak self] in
             guard let self else { return }
@@ -247,8 +258,10 @@ final class PadLANService {
             self.userRequestedConnection = true
             self.codeFirstPairingRequested = false
             self.selectedMacName = name
-            let saved = SavedMacRouteStore.route(named: name)
-            self.expectedMacID = saved?.macID
+            self.selectedMacID = macID
+            let saved = macID.flatMap { SavedMacRouteStore.route(macID: $0) }
+                ?? SavedMacRouteStore.route(named: name)
+            self.expectedMacID = macID ?? saved?.macID
             self.preferredHosts = saved?.hosts ?? []
             self.rejectedEndpointKeys.removeAll()
             self.connection?.cancel()
@@ -275,6 +288,7 @@ final class PadLANService {
             self.userRequestedConnection = false
             self.codeFirstPairingRequested = false
             self.selectedMacName = nil
+            self.selectedMacID = nil
             self.expectedMacID = nil
             self.preferredHosts.removeAll()
             self.rejectedEndpointKeys.removeAll()
@@ -291,10 +305,17 @@ final class PadLANService {
     /// advertisement. This is useful when an access point filters Bonjour
     /// multicast but still permits a unicast TCP connection.
     func setMultipeerAdvertisedHosts(_ hosts: [String], forMacName name: String) {
+        setMultipeerAdvertisedHosts(hosts, forMacID: nil, displayName: name)
+    }
+
+    func setMultipeerAdvertisedHosts(_ hosts: [String], forMacID macID: String?, displayName name: String) {
         queue.async { [weak self] in
             guard let self else { return }
-            self.multipeerHostsByMac[name] = hosts
-            if (self.selectedMacName == name || self.codeFirstPairingRequested),
+            let key = macID ?? name
+            self.multipeerHostsByMac[key] = hosts
+            if (self.selectedMacID == macID && macID != nil ||
+                self.selectedMacID == nil && self.selectedMacName == name ||
+                self.codeFirstPairingRequested),
                !self.isConnected,
                self.connection == nil {
                 self.connectNextAvailable()
@@ -324,21 +345,40 @@ final class PadLANService {
             }
             self.endpoints = results.map(\.endpoint)
             var bonjourHosts: [String: [String]] = [:]
-            let names = self.endpoints.compactMap { endpoint -> String? in
-                guard case let .service(name, _, _, _) = endpoint else { return nil }
-                return name
-            }
+            var endpointKeys: [String: String] = [:]
+            var devices: [MacDiscoveryRecord] = []
             for result in results {
                 guard case let .service(name, _, _, _) = result.endpoint else { continue }
                 if case let .bonjour(txtRecord) = result.metadata {
-                    bonjourHosts[name] = BridgeNetworkMetadata.decodePrivateIPv4Addresses(
+                    let macID = txtRecord[BridgeConstants.macIDTXTKey]
+                    let hosts = BridgeNetworkMetadata.decodePrivateIPv4Addresses(
                         txtRecord[BridgeConstants.hostsTXTKey]
                     )
+                    let key = macID ?? name
+                    bonjourHosts[key] = Array(Set((bonjourHosts[key] ?? []) + hosts)).sorted()
+                    endpointKeys[String(describing: result.endpoint)] = key
+                    devices.append(MacDiscoveryRecord(
+                        macID: macID,
+                        discoveryID: "bonjour:" + String(describing: result.endpoint),
+                        name: name,
+                        hosts: hosts
+                    ))
+                } else {
+                    endpointKeys[String(describing: result.endpoint)] = name
+                    devices.append(MacDiscoveryRecord(
+                        macID: nil,
+                        discoveryID: "bonjour:" + String(describing: result.endpoint),
+                        name: name,
+                        hosts: []
+                    ))
                 }
             }
             self.bonjourHostsByMac = bonjourHosts
+            self.discoveryKeyByEndpoint = endpointKeys
+            let names = devices.map(\.name)
             DispatchQueue.main.async {
                 self.onDiscoveredMacsChanged?(Array(Set(names)).sorted())
+                self.onDiscoveredDevicesChanged?(devices)
             }
             if self.hasSelectableDirectCandidate {
                 self.cancelSubnetProbes()
@@ -398,7 +438,13 @@ final class PadLANService {
         guard userRequestedConnection, connection == nil else { return }
         let serviceEndpoints: [NWEndpoint]
         let advertisedHosts: [String]
-        if let selectedMacName {
+        if let selectedMacID {
+            serviceEndpoints = endpoints.filter {
+                discoveryKeyByEndpoint[String(describing: $0)] == selectedMacID
+            }
+            advertisedHosts = (multipeerHostsByMac[selectedMacID] ?? []) +
+                (bonjourHostsByMac[selectedMacID] ?? [])
+        } else if let selectedMacName {
             serviceEndpoints = endpoints.filter {
                 guard case let .service(name, _, _, _) = $0 else { return false }
                 return name == selectedMacName
@@ -664,6 +710,7 @@ final class PadLANService {
                 macID: macID, name: pairingMacName ?? "Mac",
                 hosts: [candidateHost].compactMap { $0 }
             )
+            onAuthenticatedMacChanged?(macID, pairingMacName ?? "Mac")
             connectionAttemptWorkItem?.cancel()
             connectionAttemptWorkItem = nil
             isConnected = true
@@ -1081,7 +1128,14 @@ final class PadLANService {
         }
 
         let hasMatchingSelectedRoute: Bool
-        if let selectedMacName {
+        if let selectedMacID {
+            let hasService = endpoints.contains {
+                discoveryKeyByEndpoint[String(describing: $0)] == selectedMacID
+            }
+            hasMatchingSelectedRoute = hasService ||
+                !(bonjourHostsByMac[selectedMacID] ?? []).isEmpty ||
+                !(multipeerHostsByMac[selectedMacID] ?? []).isEmpty
+        } else if let selectedMacName {
             let hasService = endpoints.contains {
                 guard case let .service(name, _, _, _) = $0 else { return false }
                 return name == selectedMacName
@@ -1138,6 +1192,7 @@ final class PadLANService {
             self.connection?.cancel()
             self.clearConnection(notify: false)
             self.endpoints.removeAll()
+            self.discoveryKeyByEndpoint.removeAll()
             self.nextEndpointIndex = 0
             self.startBrowser()
         }

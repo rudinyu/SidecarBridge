@@ -44,6 +44,12 @@ final class MacViewerFullScreenUITests: XCTestCase {
         XCTAssertFalse(app.buttons["Start In-App Display"].exists)
     }
 
+    func testViewerKeepsOnlyOneWindowWhenNewWindowShortcutIsPressed() {
+        XCTAssertEqual(app.windows.count, 1)
+        viewer.typeKey("n", modifierFlags: .command)
+        XCTAssertEqual(app.windows.count, 1)
+    }
+
     func testCustomButtonAndShortcutEachEnterAndExitFullScreen() {
         let original = viewer.frame
         toggle.click()

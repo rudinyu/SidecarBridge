@@ -5,15 +5,21 @@ final class MacViewerConnectionTests: XCTestCase {
     @MainActor
     func testSuccessfulCodeFirstPairingRemembersSelectionWithoutSavingCode() async throws {
         let f = try makeViewerFixture()
+        let macID = "paired-host-\(UUID().uuidString)"
         f.model.pairingCode = "1234567890123456"
         f.model.manualMacAddress = "192.168.1.122"
         f.model.connect()
+        SavedMacRouteStore.remember(macID: macID, name: "Intel Test Mac", hosts: ["192.168.1.122"], defaults: f.defaults)
+        await awaitViewerChange(f.model.$selectedMacID, matching: { $0 == macID }) {
+            f.peer.onAuthenticatedMacChanged?(macID, "Intel Test Mac")
+        }
         await awaitViewerChange(f.model.$isConnected, matching: { $0 }) {
             f.peer.onConnectionChanged?(true, "LAN: Intel Test Mac")
         }
         XCTAssertEqual(f.model.pairingCode, "")
         XCTAssertEqual(f.model.manualMacAddress, "", "Old route hints must not force a new code on reconnect")
-        XCTAssertTrue(f.model.isRememberedMac("Intel Test Mac"))
+        XCTAssertTrue(f.model.isRememberedMac(macID))
+        XCTAssertEqual(f.defaults.string(forKey: "macViewer.selectedMacID"), macID)
         XCTAssertEqual(f.defaults.string(forKey: "macViewer.selectedMacName"), "Intel Test Mac")
         XCTAssertFalse(f.defaults.dictionaryRepresentation().values.contains { ($0 as? String) == "1234567890123456" })
 
@@ -24,12 +30,14 @@ final class MacViewerConnectionTests: XCTestCase {
         XCTAssertEqual(reloaded.pairingCode, "")
         reloaded.connect()
         XCTAssertEqual(nextPeer.calls, [.select("Intel Test Mac")], "The transport uses its existing Keychain proof")
+        XCTAssertEqual(nextPeer.lastSelectedMacID, macID)
         XCTAssertNil(nextPeer.pendingCode)
     }
 
     @MainActor
     func testDiscoveryRetainsSavedMacsWithoutPromotingUnpairedDiscoveries() async throws {
         let f = try makeViewerFixture(values: ["macViewer.rememberedMacNames": ["Saved Mac"]])
+        SavedMacRouteStore.remember(macID: "saved-host", name: "Saved Mac", hosts: [], defaults: f.defaults)
         await awaitViewerChange(f.model.$discoveredMacs) {
             f.peer.onDiscoveredMacsChanged?(["New Mac", "Saved Mac", "New Mac"])
         }
@@ -41,25 +49,95 @@ final class MacViewerConnectionTests: XCTestCase {
     }
 
     @MainActor
-    func testForgettingSavedMacClearsSelectionAndPreventsReconnect() throws {
+    func testViewerListsAndSelectsSameNamedHostsByStableID() async throws {
+        let f = try makeViewerFixture()
+        SavedMacRouteStore.remember(macID: "host-a", name: "Studio Mac", hosts: ["192.168.1.10"], defaults: f.defaults)
+        SavedMacRouteStore.remember(macID: "host-b", name: "Studio Mac", hosts: ["192.168.1.20"], defaults: f.defaults)
+
+        await awaitViewerChange(f.model.$devices) {
+            f.peer.onDiscoveredDevicesChanged?([])
+        }
+        XCTAssertEqual(Set(f.model.devices.map(\.id)), Set(["host-a", "host-b"]))
+        XCTAssertTrue(f.model.devices.allSatisfy { $0.availability == .pairedOffline })
+
+        f.model.chooseDevice("host-b")
+        f.model.connect()
+        XCTAssertEqual(f.peer.lastSelectedMacID, "host-b")
+        XCTAssertEqual(f.peer.calls, [.select("Studio Mac")])
+
+        await awaitViewerChange(f.model.$devices, matching: { devices in
+            devices.first(where: { $0.id == "host-b" })?.availability == .pairedOnline
+        }) {
+            f.peer.onDiscoveredDevicesChanged?([
+                MacDiscoveryRecord(macID: "host-b", discoveryID: "bonjour:host-b",
+                    name: "Studio Mac", hosts: ["192.168.1.20"])
+            ])
+        }
+        XCTAssertEqual(f.model.devices.first(where: { $0.id == "host-a" })?.availability, .pairedOffline)
+        XCTAssertEqual(f.model.devices.first(where: { $0.id == "host-b" })?.availability, .pairedOnline)
+
+        f.model.forgetTrustedMac(macID: "host-b")
+        XCTAssertNil(SavedMacRouteStore.route(macID: "host-b", defaults: f.defaults))
+        XCTAssertNotNil(SavedMacRouteStore.route(macID: "host-a", defaults: f.defaults))
+    }
+
+    func testDeviceCatalogMarksTheCurrentlyDiscoveredLocalHost() {
+        let route = SavedMacRoute(macID: "local-host", name: "This Mac", hosts: ["192.168.1.5"])
+        let discovered = MacDiscoveryRecord(
+            macID: "local-host", discoveryID: "bonjour:local-host", name: "Renamed This Mac", hosts: ["192.168.1.5"]
+        )
+        let paired = MacViewerDeviceCatalog.make(
+            routes: [route], discoveries: [discovered], localHosts: ["192.168.1.5"]
+        )
+        XCTAssertEqual(paired.first?.availability, .pairedOnline)
+        XCTAssertEqual(paired.first?.name, "Renamed This Mac")
+        XCTAssertEqual(paired.first?.isLocal, true)
+
+        let offline = MacViewerDeviceCatalog.make(routes: [route], discoveries: [], localHosts: ["192.168.1.5"])
+        XCTAssertEqual(offline.first?.availability, .pairedOffline)
+        XCTAssertEqual(offline.first?.isLocal, false, "Stale saved addresses must not label an offline device as local")
+    }
+
+    @MainActor
+    func testAmbiguousLegacyNamesRequireAnExplicitPrivateAddress() async throws {
+        let f = try makeViewerFixture()
+        await awaitViewerChange(f.model.$devices) {
+            f.peer.onDiscoveredDevicesChanged?([
+                MacDiscoveryRecord(macID: nil, discoveryID: "bonjour:first", name: "Old Host", hosts: []),
+                MacDiscoveryRecord(macID: nil, discoveryID: "bonjour:second", name: "Old Host", hosts: [])
+            ])
+        }
+
+        f.model.chooseDevice("bonjour:first")
+        f.model.connect()
+
+        XCTAssertTrue(f.peer.calls.isEmpty)
+        XCTAssertEqual(f.model.status, "This Mac cannot be identified uniquely")
+    }
+
+    @MainActor
+    func testForgettingSavedMacClearsSelectionAndPreventsReconnect() async throws {
         let f = try makeViewerFixture(values: [
             "macViewer.rememberedMacNames": ["Saved Mac"],
             "macViewer.selectedMacName": "Saved Mac"
         ])
+        let macID = "test-host-\(UUID().uuidString)"
         SavedMacRouteStore.remember(
-            macID: "test-host-\(UUID().uuidString)",
+            macID: macID,
             name: "Saved Mac",
             hosts: ["192.168.1.122"],
             defaults: f.defaults
         )
+        await awaitViewerChange(f.model.$devices) { f.peer.onDiscoveredDevicesChanged?([]) }
+        f.model.chooseDevice(macID)
         XCTAssertEqual(f.model.selectedMacName, "Saved Mac")
 
-        f.model.forgetTrustedMac(named: "Saved Mac")
+        f.model.forgetTrustedMac(macID: macID)
 
         XCTAssertNil(f.model.selectedMacName)
         XCTAssertFalse(f.model.isRememberedMac("Saved Mac"))
         XCTAssertNil(f.defaults.string(forKey: "macViewer.selectedMacName"))
-        XCTAssertNil(SavedMacRouteStore.route(named: "Saved Mac", defaults: f.defaults))
+        XCTAssertNil(SavedMacRouteStore.route(macID: macID, defaults: f.defaults))
         XCTAssertEqual(f.peer.restartCount, 1)
     }
 
@@ -84,7 +162,7 @@ final class MacViewerConnectionTests: XCTestCase {
                 "macViewer.selectedMacName": selected
             ])
             XCTAssertEqual(f.model.discoveredMacs, ["Another Mac", "Intel Test Mac"])
-            XCTAssertEqual(f.model.selectedMacName, selected == "Intel Test Mac" ? selected : nil)
+            XCTAssertNil(f.model.selectedMacName, "A display name without a saved stable ID must not restore a connection target")
             XCTAssertFalse(f.model.isConnecting)
             XCTAssertTrue(f.peer.calls.isEmpty)
             XCTAssertEqual(f.peer.startCount, 0)
@@ -105,7 +183,7 @@ final class MacViewerConnectionTests: XCTestCase {
         XCTAssertFalse(f.model.isConnected)
         XCTAssertTrue(f.peer.calls.isEmpty)
         f.model.chooseMac("Intel Test Mac")
-        XCTAssertEqual(f.defaults.string(forKey: "macViewer.selectedMacName"), "Intel Test Mac")
+        XCTAssertNil(f.defaults.string(forKey: "macViewer.selectedMacName"), "Unpaired discovery must not become a persisted route")
         XCTAssertTrue(f.peer.calls.isEmpty, "Selecting a row is not consent to dial")
     }
 
@@ -305,6 +383,8 @@ final class MacViewerConnectionTests: XCTestCase {
     func testReconnectedStreamAcknowledgesRestartedSequence() async throws {
         for explicitDisconnect in [false, true] {
             let f = try makeViewerFixture()
+            let presentation = MacViewerVideoView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+            f.model.videoDisplay.attach(presentation)
             for connection in 0..<2 {
                 f.model.isConnected = true
                 let ack = expectation(description: "Keyframe ACK for connection \(connection)")

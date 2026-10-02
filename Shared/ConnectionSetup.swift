@@ -121,15 +121,40 @@ struct SavedMacRoute: Codable, Equatable {
     let hosts: [String]
 }
 
+/// Passive discovery metadata. `macID` is an unauthenticated routing hint
+/// until the encrypted handshake proves that identity; `discoveryID` keeps
+/// older Hosts without the hint distinct for the lifetime of a browse result.
+struct MacDiscoveryRecord: Equatable, Identifiable {
+    let macID: String?
+    let discoveryID: String
+    let name: String
+    let hosts: [String]
+
+    var id: String { macID ?? discoveryID }
+}
+
 /// Non-secret routing metadata, written only AFTER server-proof validation
 /// and credential persistence. Authentication secrets remain in Keychain.
 enum SavedMacRouteStore {
     private static let key = "authenticatedMacRoutesV1"
     private static let lock = NSLock()
 
+    static func routes(defaults: UserDefaults = .standard) -> [SavedMacRoute] {
+        lock.lock(); defer { lock.unlock() }
+        return load(defaults)
+    }
+
+    static func route(macID: String, defaults: UserDefaults = .standard) -> SavedMacRoute? {
+        lock.lock(); defer { lock.unlock() }
+        return load(defaults).first { $0.macID == macID }
+    }
+
+    /// Compatibility lookup for older clients that only know a display name.
+    /// Ambiguous names intentionally resolve to no route.
     static func route(named name: String, defaults: UserDefaults = .standard) -> SavedMacRoute? {
         lock.lock(); defer { lock.unlock() }
-        return load(defaults).first { $0.name == name }
+        let matches = load(defaults).filter { $0.name == name }
+        return matches.count == 1 ? matches[0] : nil
     }
 
     static func remember(macID: String, name: String, hosts: [String], defaults: UserDefaults = .standard) {
@@ -137,17 +162,28 @@ enum SavedMacRouteStore {
         var routes = load(defaults)
         let previous = routes.first { $0.macID == macID }
         let addresses = Array(Set((hosts + (previous?.hosts ?? [])).filter(BridgeNetworkMetadata.isPrivateIPv4Address))).sorted()
-        routes.removeAll { $0.macID == macID || $0.name == name }
+        routes.removeAll { $0.macID == macID }
         routes.insert(SavedMacRoute(macID: macID, name: name, hosts: Array(addresses.prefix(8))), at: 0)
         save(Array(routes.prefix(32)), defaults: defaults)
+    }
+
+    @discardableResult
+    static func remove(macID: String, defaults: UserDefaults = .standard) -> SavedMacRoute? {
+        lock.lock(); defer { lock.unlock() }
+        var routes = load(defaults)
+        guard let removed = routes.first(where: { $0.macID == macID }) else { return nil }
+        routes.removeAll { $0.macID == macID }
+        save(routes, defaults: defaults)
+        return removed
     }
 
     @discardableResult
     static func remove(named name: String, defaults: UserDefaults = .standard) -> SavedMacRoute? {
         lock.lock(); defer { lock.unlock() }
         var routes = load(defaults)
-        guard let removed = routes.first(where: { $0.name == name }) else { return nil }
-        routes.removeAll { $0.name == name }
+        let matches = routes.filter { $0.name == name }
+        guard matches.count == 1, let removed = matches.first else { return nil }
+        routes.removeAll { $0.macID == removed.macID }
         save(routes, defaults: defaults)
         return removed
     }

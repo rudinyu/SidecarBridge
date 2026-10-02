@@ -1,0 +1,46 @@
+name: macOS
+
+on:
+  pull_request:
+    paths:
+      - ".codex/ci.sh"
+      - ".github/workflows/macos.yml"
+      - "docs/MACOS_DUAL_MAC_ACCEPTANCE.md"
+      - "Mac/**"
+      - "MacViewer/**"
+      - "Pad/**"
+      - "Shared/**"
+      - "Tests/**"
+      - "UITests/**"
+      - "project.yml"
+      - "SidecarBridge.xcodeproj/**"
+      - "scripts/**"
+  push:
+    paths:
+      - ".codex/ci.sh"
+      - ".github/workflows/macos.yml"
+      - "docs/MACOS_DUAL_MAC_ACCEPTANCE.md"
+      - "Mac/**"
+      - "MacViewer/**"
+      - "Pad/**"
+      - "Shared/**"
+      - "Tests/**"
+      - "UITests/**"
+      - "project.yml"
+      - "SidecarBridge.xcodeproj/**"
+      - "scripts/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Run macOS tests and Release builds
+        run: bash .codex/ci.sh

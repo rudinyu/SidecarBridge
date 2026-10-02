@@ -271,6 +271,10 @@ final class MacLANService {
             txtRecord[BridgeConstants.buildTXTKey] = Bundle.main.object(
                 forInfoDictionaryKey: "CFBundleVersion"
             ) as? String ?? "unknown"
+            if let macID = UserDefaults.standard.string(forKey: "macDeviceIdentifier"),
+               !macID.isEmpty {
+                txtRecord[BridgeConstants.macIDTXTKey] = macID
+            }
             if let hosts = BridgeNetworkMetadata.encodedLocalPrivateIPv4Addresses() {
                 txtRecord[BridgeConstants.hostsTXTKey] = hosts
             }

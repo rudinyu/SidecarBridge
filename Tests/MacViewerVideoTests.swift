@@ -3,6 +3,14 @@ import XCTest
 
 final class MacViewerVideoTests: XCTestCase {
     @MainActor
+    func testJPEGRequiresAnAttachedPresentationSurface() throws {
+        let controller = MacViewerVideoController()
+
+        XCTAssertFalse(controller.enqueueJPEG(try ViewerVideoFixture.jpeg()))
+        XCTAssertFalse(controller.hasImage)
+    }
+
+    @MainActor
     func testInvalidJPEGDoesNotReplacePresentedImageAndFlushClearsIt() throws {
         let controller = MacViewerVideoController()
         let view = MacViewerVideoView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
@@ -18,6 +26,33 @@ final class MacViewerVideoTests: XCTestCase {
         controller.flush()
         XCTAssertFalse(controller.hasImage)
         XCTAssertFalse(view.displayLayer.isHidden)
+    }
+
+    @MainActor
+    func testQueuedH264IsNotReportedAsAVisibleImage() {
+        let controller = MacViewerVideoController()
+        let view = MacViewerVideoView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        controller.attach(view)
+        XCTAssertTrue(controller.enqueue(ViewerVideoFixture.frame(1)))
+        XCTAssertFalse(controller.hasImage, "Admission to the decoder queue is not proof of visible output")
+        XCTAssertFalse(view.hasPresentedImage)
+    }
+
+    @MainActor
+    func testJPEGOutputRateCountsPixelChangesInsteadOfRepeatedFrames() throws {
+        let controller = MacViewerVideoController()
+        let view = MacViewerVideoView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        controller.attach(view)
+        var changes = 0
+        view.onPresentedContentChanged = { changes += 1 }
+
+        let black = try ViewerVideoFixture.jpeg()
+        XCTAssertTrue(controller.enqueueJPEG(black))
+        XCTAssertTrue(controller.enqueueJPEG(black))
+        XCTAssertEqual(changes, 0)
+
+        XCTAssertTrue(controller.enqueueJPEG(try ViewerVideoFixture.jpeg(color: .white)))
+        XCTAssertEqual(changes, 1)
     }
 
     @MainActor

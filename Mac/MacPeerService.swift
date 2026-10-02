@@ -445,6 +445,10 @@ final class MacPeerService: NSObject {
                 // lower-bandwidth nearby transport.
                 discoveryInfo[BridgeConstants.hostsTXTKey] = hosts
             }
+            if let macID = UserDefaults.standard.string(forKey: "macDeviceIdentifier"),
+               !macID.isEmpty {
+                discoveryInfo[BridgeConstants.macIDTXTKey] = macID
+            }
             let advertiser = MCNearbyServiceAdvertiser(
                 peer: self.peerID,
                 discoveryInfo: discoveryInfo,

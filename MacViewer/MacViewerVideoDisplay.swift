@@ -1,6 +1,7 @@
 import AVFoundation
 import AppKit
 import CoreMedia
+import CoreVideo
 import SwiftUI
 
 /// Native macOS presentation for the same H.264/JPEG stream used by the iPad
@@ -9,6 +10,10 @@ import SwiftUI
 @MainActor
 final class MacViewerVideoController: NSObject {
     var onKeyFrameNeeded: (() -> Void)?
+    var onFrameSubmitted: ((UInt64, Bool) -> Void)?
+    var onPresentationChanged: ((Bool) -> Void)?
+    var onPresentedContentChanged: (() -> Void)?
+    var onRenderFailure: (() -> Void)?
 
     private weak var view: MacViewerVideoView?
     private var hasAttachedPresentationSurface = false
@@ -19,7 +24,12 @@ final class MacViewerVideoController: NSObject {
     private var needsKeyFrame = true
     private var lastSequence: UInt64?
     private var nextPresentationTimestamp = CMTime.zero
-    private var pendingSamples: [CMSampleBuffer] = []
+    private struct PendingSample {
+        let buffer: CMSampleBuffer
+        let sequence: UInt64
+        let isKeyFrame: Bool
+    }
+    private var pendingSamples: [PendingSample] = []
     private var pendingSampleHead = 0
     private var drainTask: Task<Void, Never>?
     private var lastKeyFrameRequestAt: TimeInterval = 0
@@ -31,6 +41,15 @@ final class MacViewerVideoController: NSObject {
             self.view?.displayLayer !== view.displayLayer
         self.view = view
         hasAttachedPresentationSurface = true
+        view.onPresentationChanged = { [weak self] visible in
+            self?.onPresentationChanged?(visible)
+        }
+        view.onPresentedContentChanged = { [weak self] in
+            self?.onPresentedContentChanged?()
+        }
+        view.onRenderFailure = { [weak self] in
+            self?.onRenderFailure?()
+        }
         if replacedPresentationSurface {
             // SwiftUI/AppKit may replace the representable view while keeping
             // the viewer connection alive. A new display layer has no H.264
@@ -100,17 +119,17 @@ final class MacViewerVideoController: NSObject {
             requestKeyFrame()
             return false
         }
-        pendingSamples.append(sample)
+        pendingSamples.append(PendingSample(buffer: sample, sequence: frame.sequence, isKeyFrame: frame.isKeyFrame))
         drain()
         return true
     }
 
     @discardableResult
     func enqueueJPEG(_ data: Data) -> Bool {
-        guard let image = NSImage(data: data) else { return false }
+        guard let view, let image = NSImage(data: data) else { return false }
         pendingSamples.removeAll(keepingCapacity: true)
         pendingSampleHead = 0
-        view?.showJPEG(image)
+        view.showJPEG(image)
         return true
     }
 
@@ -140,14 +159,18 @@ final class MacViewerVideoController: NSObject {
 
     private func drain() {
         guard let view else { return }
-        guard view.displayLayer.status != .failed else {
+        guard view.displayLayer.sampleBufferRenderer.status != .failed,
+              !view.displayLayer.sampleBufferRenderer.requiresFlushToResumeDecoding else {
+            onRenderFailure?()
             resetDecoderKeepingImage()
             requestKeyFrame()
             return
         }
 
-        while pendingSampleCount > 0, view.displayLayer.isReadyForMoreMediaData {
-            view.enqueue(pendingSamples[pendingSampleHead])
+        while pendingSampleCount > 0, view.canAcceptVideoSample {
+            let pending = pendingSamples[pendingSampleHead]
+            view.enqueue(pending.buffer)
+            onFrameSubmitted?(pending.sequence, pending.isKeyFrame)
             pendingSampleHead += 1
         }
         if pendingSampleHead == pendingSamples.count {
@@ -317,6 +340,13 @@ final class MacViewerVideoView: NSView {
     let displayLayer = AVSampleBufferDisplayLayer()
     private let imageView = NSImageView()
     private(set) var hasPresentedImage = false
+    var onPresentationChanged: ((Bool) -> Void)?
+    var onPresentedContentChanged: (() -> Void)?
+    var onRenderFailure: (() -> Void)?
+    private var presentationTimer: Timer?
+    private var lastPresentedPixelFingerprint: UInt64?
+    private var jpegIsVisible = false
+    private var lastFailureNotificationAt: TimeInterval = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -332,7 +362,12 @@ final class MacViewerVideoView: NSView {
         imageView.layer?.backgroundColor = NSColor.black.cgColor
         imageView.isHidden = true
         addSubview(imageView)
+        presentationTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.samplePresentedOutput() }
+        }
     }
+
+    deinit { presentationTimer?.invalidate() }
 
     required init?(coder: NSCoder) { nil }
 
@@ -343,29 +378,126 @@ final class MacViewerVideoView: NSView {
     }
 
     func enqueue(_ sampleBuffer: CMSampleBuffer) {
+        jpegIsVisible = false
         imageView.isHidden = true
         displayLayer.isHidden = false
-        displayLayer.enqueue(sampleBuffer)
-        hasPresentedImage = true
+        displayLayer.sampleBufferRenderer.enqueue(sampleBuffer)
     }
 
     func showJPEG(_ image: NSImage) {
-        displayLayer.flush()
+        displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
         displayLayer.isHidden = true
         imageView.image = image
         imageView.isHidden = false
-        hasPresentedImage = true
+        jpegIsVisible = true
+        setHasPresentedImage(true)
+        if let fingerprint = Self.pixelFingerprint(image) {
+            if let lastPresentedPixelFingerprint, lastPresentedPixelFingerprint != fingerprint {
+                onPresentedContentChanged?()
+            }
+            lastPresentedPixelFingerprint = fingerprint
+        }
     }
 
     func flush() {
-        displayLayer.flushAndRemoveImage()
+        displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
         displayLayer.isHidden = false
         imageView.image = nil
         imageView.isHidden = true
-        hasPresentedImage = false
+        jpegIsVisible = false
+        lastPresentedPixelFingerprint = nil
+        setHasPresentedImage(false)
     }
 
     func flushDecoderKeepingImage() {
-        displayLayer.flush()
+        displayLayer.sampleBufferRenderer.flush()
+    }
+
+    var canAcceptVideoSample: Bool {
+        let renderer = displayLayer.sampleBufferRenderer
+        return renderer.status != .failed && !renderer.requiresFlushToResumeDecoding &&
+            renderer.isReadyForMoreMediaData
+    }
+
+    private func samplePresentedOutput() {
+        guard !jpegIsVisible, !displayLayer.isHidden else { return }
+        let renderer = displayLayer.sampleBufferRenderer
+        if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - lastFailureNotificationAt > 0.5 {
+                lastFailureNotificationAt = now
+                onRenderFailure?()
+            }
+            return
+        }
+        guard #available(macOS 14.4, *) else { return }
+        guard let pixelBuffer = renderer.displayedPixelBuffer() else { return }
+        setHasPresentedImage(true)
+        guard let fingerprint = Self.pixelFingerprint(pixelBuffer) else { return }
+        if let lastPresentedPixelFingerprint, lastPresentedPixelFingerprint != fingerprint {
+            onPresentedContentChanged?()
+        }
+        lastPresentedPixelFingerprint = fingerprint
+    }
+
+    private func setHasPresentedImage(_ value: Bool) {
+        guard hasPresentedImage != value else { return }
+        hasPresentedImage = value
+        onPresentationChanged?(value)
+    }
+
+    private static func pixelFingerprint(_ pixelBuffer: CVPixelBuffer) -> UInt64? {
+        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        let isPlanar = CVPixelBufferIsPlanar(pixelBuffer)
+        let baseAddress = isPlanar
+            ? CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)
+            : CVPixelBufferGetBaseAddress(pixelBuffer)
+        let width = isPlanar
+            ? CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+            : CVPixelBufferGetWidth(pixelBuffer)
+        let height = isPlanar
+            ? CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+            : CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = isPlanar
+            ? CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+            : CVPixelBufferGetBytesPerRow(pixelBuffer)
+        guard let baseAddress, width > 0, height > 0, bytesPerRow > 0 else { return nil }
+        let bytes = baseAddress.assumingMemoryBound(to: UInt8.self)
+        var hash: UInt64 = 1_469_598_103_934_665_603
+        for row in 0..<16 {
+            let y = row * max(height - 1, 0) / 15
+            for column in 0..<16 {
+                let x = column * max(width - 1, 0) / 15
+                hash = (hash ^ UInt64(bytes[y * bytesPerRow + x])) &* 1_099_511_628_211
+            }
+        }
+        return hash
+    }
+
+    private static func pixelFingerprint(_ image: NSImage) -> UInt64? {
+        var proposedRect = CGRect(origin: .zero, size: image.size)
+        guard let cgImage = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
+            return nil
+        }
+        var pixels = [UInt8](repeating: 0, count: 256)
+        let rendered = pixels.withUnsafeMutableBytes { storage -> Bool in
+            guard let context = CGContext(
+                data: storage.baseAddress,
+                width: 16,
+                height: 16,
+                bitsPerComponent: 8,
+                bytesPerRow: 16,
+                space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.none.rawValue
+            ) else { return false }
+            context.interpolationQuality = .low
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: 16, height: 16))
+            return true
+        }
+        guard rendered else { return nil }
+        return pixels.reduce(UInt64(1_469_598_103_934_665_603)) {
+            ($0 ^ UInt64($1)) &* 1_099_511_628_211
+        }
     }
 }

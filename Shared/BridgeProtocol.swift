@@ -124,6 +124,9 @@ enum BridgeConstants {
     // lets the mobile UI distinguish an old Mac binary before pairing fails.
     static let protocolTXTKey = "sbp"
     static let buildTXTKey = "build"
+    // Stable host identity is only a routing hint. It is checked again by the
+    // authenticated handshake before credentials or saved routes are used.
+    static let macIDTXTKey = "mac-id"
     // A Bonjour result can be filtered or resolved through the wrong active
     // interface when a Mac has Ethernet and Wi-Fi enabled together. The Mac
     // therefore advertises its private IPv4 candidates as a small hint. They

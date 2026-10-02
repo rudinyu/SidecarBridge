@@ -72,6 +72,26 @@ final class ConnectionSetupTests: XCTestCase {
         XCTAssertEqual(SavedMacRouteStore.route(named: "Mac B", defaults: defaults)?.macID, "host-b")
     }
 
+    func testSavedRoutesUseStableIDsWhenNamesAreSharedOrChanged() throws {
+        let suite = "SidecarBridge.ConnectionSetupTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        SavedMacRouteStore.remember(macID: "host-a", name: "Studio Mac", hosts: ["192.168.1.10"], defaults: defaults)
+        SavedMacRouteStore.remember(macID: "host-b", name: "Studio Mac", hosts: ["192.168.1.20"], defaults: defaults)
+
+        XCTAssertNil(SavedMacRouteStore.route(named: "Studio Mac", defaults: defaults),
+            "A display name shared by two Macs must never choose a route implicitly")
+        XCTAssertEqual(SavedMacRouteStore.route(macID: "host-a", defaults: defaults)?.hosts, ["192.168.1.10"])
+        XCTAssertEqual(SavedMacRouteStore.route(macID: "host-b", defaults: defaults)?.hosts, ["192.168.1.20"])
+
+        SavedMacRouteStore.remember(macID: "host-a", name: "Renamed Studio Mac", hosts: ["10.0.0.4"], defaults: defaults)
+        XCTAssertEqual(SavedMacRouteStore.route(macID: "host-b", defaults: defaults)?.name, "Studio Mac")
+        XCTAssertEqual(SavedMacRouteStore.routes(defaults: defaults).count, 2)
+        XCTAssertEqual(SavedMacRouteStore.remove(macID: "host-a", defaults: defaults)?.name, "Renamed Studio Mac")
+        XCTAssertEqual(SavedMacRouteStore.route(macID: "host-b", defaults: defaults)?.name, "Studio Mac")
+    }
+
     func testStandbyLANFailureDoesNotResetActiveNearbyVideo() {
         XCTAssertFalse(ConnectionRoutePolicy.shouldApplyLANEvent(wasLANConnected: false, connected: false, nearbyConnected: true))
         XCTAssertTrue(ConnectionRoutePolicy.shouldApplyLANEvent(wasLANConnected: true, connected: false, nearbyConnected: false))

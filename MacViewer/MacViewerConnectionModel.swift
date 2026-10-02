@@ -14,9 +14,12 @@ protocol MacViewerPeerService: AnyObject {
     var onConnectionHealthChanged: ((String, Int?) -> Void)? { get set }
     var onPairingCodeRequired: ((String, String?) -> Void)? { get set }
     var onDiscoveredMacsChanged: (([String]) -> Void)? { get set }
+    var onDiscoveredDevicesChanged: (([MacDiscoveryRecord]) -> Void)? { get set }
+    var onAuthenticatedMacChanged: ((String, String) -> Void)? { get set }
     func start()
     func restart()
     func selectMac(named name: String)
+    func selectMac(macID: String?, named name: String)
     func submitPairingCode(_ code: String)
     func connectWithPairingCode(_ code: String, invitation: PairingInvitation?, host: String?)
     func send(_ message: ControlMessage)
@@ -25,6 +28,65 @@ protocol MacViewerPeerService: AnyObject {
 }
 
 extension PadPeerService: MacViewerPeerService {}
+
+enum MacViewerDeviceAvailability: Equatable {
+    case pairedOnline
+    case pairedOffline
+    case discovered
+}
+
+struct MacViewerDevice: Equatable, Identifiable {
+    let id: String
+    let macID: String?
+    let name: String
+    let availability: MacViewerDeviceAvailability
+    let isLocal: Bool
+}
+
+enum MacViewerDeviceCatalog {
+    static func make(
+        routes: [SavedMacRoute],
+        discoveries: [MacDiscoveryRecord],
+        localHosts: Set<String>
+    ) -> [MacViewerDevice] {
+        var recordsByMacID: [String: [MacDiscoveryRecord]] = [:]
+        for record in discoveries {
+            if let macID = record.macID, !macID.isEmpty {
+                recordsByMacID[macID, default: []].append(record)
+            }
+        }
+        var result = routes.map { route -> MacViewerDevice in
+            let current = recordsByMacID[route.macID] ?? []
+            let hosts = Set(current.flatMap(\.hosts))
+            return MacViewerDevice(
+                id: route.macID,
+                macID: route.macID,
+                name: current.first?.name ?? route.name,
+                availability: current.isEmpty ? .pairedOffline : .pairedOnline,
+                isLocal: !current.isEmpty && !hosts.isDisjoint(with: localHosts)
+            )
+        }
+        let pairedIDs = Set(routes.map(\.macID))
+        var seenDiscoveredIDs = Set<String>()
+        for record in discoveries {
+            let id = record.macID ?? record.discoveryID
+            guard !pairedIDs.contains(id), seenDiscoveredIDs.insert(id).inserted else { continue }
+            let sameIdentity = discoveries.filter { $0.id == record.id }
+            let hosts = Set(sameIdentity.flatMap(\.hosts))
+            result.append(MacViewerDevice(
+                id: id,
+                macID: record.macID,
+                name: record.name,
+                availability: .discovered,
+                isLocal: !hosts.isDisjoint(with: localHosts)
+            ))
+        }
+        return result.sorted {
+            let comparison = $0.name.localizedCaseInsensitiveCompare($1.name)
+            return comparison == .orderedSame ? $0.id < $1.id : comparison == .orderedAscending
+        }
+    }
+}
 
 @MainActor
 final class MacViewerConnectionModel: ObservableObject {
@@ -50,9 +112,18 @@ final class MacViewerConnectionModel: ObservableObject {
     @Published var lastInputAccepted = true
     @Published var streamAspectRatio: CGFloat = 16.0 / 9.0
     @Published var streamDimensions = "Waiting for video"
+    /// `streamFPS` remains as a compatibility alias for submitted-to-renderer FPS.
     @Published var streamFPS = 0
+    @Published private(set) var streamReceivedFPS = 0
+    @Published private(set) var streamSubmittedFPS = 0
+    @Published private(set) var streamOutputChangeRate = 0
+    @Published private(set) var hasPresentedVideo = false
+    @Published private(set) var videoPresentationStatus = "Waiting for video"
+    @Published private(set) var shouldOfferVideoRecovery = false
     @Published var discoveredMacs: [String] = []
+    @Published private(set) var devices: [MacViewerDevice] = []
     @Published var selectedMacName: String?
+    @Published private(set) var selectedMacID: String?
     @Published var pairingCode = ""
     @Published var manualMacAddress = ""
     @Published var pairingRequired = false
@@ -70,6 +141,11 @@ final class MacViewerConnectionModel: ObservableObject {
 
     let videoDisplay = MacViewerVideoController()
 
+    var supportsVisiblePixelSampling: Bool {
+        if #available(macOS 14.4, *) { return true }
+        return false
+    }
+
     private let peers: MacViewerPeerService
     private let pasteboard: NSPasteboard
     private let defaults: UserDefaults
@@ -82,12 +158,23 @@ final class MacViewerConnectionModel: ObservableObject {
     private var inputSequence: UInt64 = 0
     private var inputSentAt: [UInt64: TimeInterval] = [:]
     private var frameWindowStart = ProcessInfo.processInfo.systemUptime
-    private var frameWindowCount = 0
+    private var receivedFrameWindowCount = 0
+    private var submittedFrameWindowCount = 0
+    private var outputChangeWindowCount = 0
+    private var firstReceivedVideoAt: TimeInterval?
+    private var lastReceivedVideoAt: TimeInterval?
+    private var lastSubmittedVideoAt: TimeInterval?
+    private var lastPresentedContentAt: TimeInterval?
+    private var lastVideoWidth = 0
+    private var lastVideoHeight = 0
+    private var videoHealthTimer: Timer?
     private var lastVideoAckSequence: UInt64?
     private var videoAckBatchCount = 0
     private var pendingFileURLs: [URL] = []
     private var queuedFileCount = 0
     private var lastRemoteMacName: String?
+    private var discoveryRecords: [MacDiscoveryRecord] = []
+    private var selectedDeviceID: String?
 
     private static let rememberedMacNamesKey = "macViewer.rememberedMacNames"
     private static let transferDirectoryName = "SidecarBridge Transfers"
@@ -113,14 +200,64 @@ final class MacViewerConnectionModel: ObservableObject {
         self.receiveDirectory = directory
         fileTransfer = FileTransferEngine(receiveDirectory: { directory })
 
-        let saved = Set(defaults.stringArray(forKey: Self.rememberedMacNamesKey) ?? [])
-        selectedMacName = defaults.string(forKey: "macViewer.selectedMacName")
-            .flatMap { saved.contains($0) ? $0 : nil }
-        discoveredMacs = saved.sorted()
+        let savedRoutes = SavedMacRouteStore.routes(defaults: defaults)
+        let storedMacID = defaults.string(forKey: "macViewer.selectedMacID")
+        let legacyName = defaults.string(forKey: "macViewer.selectedMacName")
+        let selectedRoute = storedMacID.flatMap { SavedMacRouteStore.route(macID: $0, defaults: defaults) }
+            ?? legacyName.flatMap { SavedMacRouteStore.route(named: $0, defaults: defaults) }
+        selectedMacID = selectedRoute?.macID
+        selectedMacName = selectedRoute?.name
+        selectedDeviceID = selectedRoute?.macID
+        if selectedRoute == nil {
+            defaults.removeObject(forKey: "macViewer.selectedMacID")
+            defaults.removeObject(forKey: "macViewer.selectedMacName")
+        } else if let selectedRoute {
+            defaults.set(selectedRoute.macID, forKey: "macViewer.selectedMacID")
+            defaults.set(selectedRoute.name, forKey: "macViewer.selectedMacName")
+        }
+        discoveredMacs = Array(Set(savedRoutes.map(\.name))).sorted()
+        refreshDevices()
 
         videoDisplay.onKeyFrameNeeded = { [weak self] in
             guard let self, self.isConnected else { return }
             self.peers.send(ControlMessage(.status, detail: "video-keyframe-needed"))
+        }
+        videoDisplay.onFrameSubmitted = { [weak self] sequence, isKeyFrame in
+            guard let self else { return }
+            self.recordSubmittedVideoFrame()
+            if !self.supportsVisiblePixelSampling {
+                self.isStreaming = true
+                self.status = "Connected to " + (self.lastRemoteMacName ?? "Mac")
+                self.detail = "Frames are submitted to AVFoundation. This macOS version cannot report whether decoded pixels reached the display."
+                self.videoPresentationStatus = "Submitted · display tracking unavailable"
+            }
+            self.acknowledgeVideoFrame(sequence: sequence, isKeyFrame: isKeyFrame)
+        }
+        videoDisplay.onPresentationChanged = { [weak self] visible in
+            guard let self else { return }
+            self.hasPresentedVideo = visible
+            if visible {
+                self.lastPresentedContentAt = ProcessInfo.processInfo.systemUptime
+                self.videoPresentationStatus = "Image visible"
+                self.updateStreamPresentation(
+                    width: self.lastVideoWidth,
+                    height: self.lastVideoHeight,
+                    format: self.lastVideoWidth > 0 ? "H.264" : "JPEG"
+                )
+            } else {
+                self.isStreaming = false
+                self.videoPresentationStatus = "Waiting for visible image"
+            }
+            self.refreshVideoHealth()
+        }
+        videoDisplay.onPresentedContentChanged = { [weak self] in
+            self?.recordPresentedContentChange()
+        }
+        videoDisplay.onRenderFailure = { [weak self] in
+            guard let self else { return }
+            self.videoPresentationStatus = "Decoder needs recovery"
+            self.shouldOfferVideoRecovery = true
+            self.detail = "Frames may still arrive, but AVFoundation cannot continue decoding. Refresh video to request a new keyframe."
         }
 
         peers.onLocalNetworkStateChanged = { [weak self] state in
@@ -158,12 +295,38 @@ final class MacViewerConnectionModel: ObservableObject {
                 guard let self else { return }
                 // Discovery is transient; saved devices must remain selectable
                 // when Bonjour is quiet so the transport can reuse their route.
-                let saved = self.defaults.stringArray(forKey: Self.rememberedMacNamesKey) ?? []
-                self.discoveredMacs = Array(Set(saved + names)).sorted()
+                self.discoveryRecords = names.map {
+                    MacDiscoveryRecord(macID: nil, discoveryID: "legacy:" + $0, name: $0, hosts: [])
+                }
+                self.refreshDevices()
                 if !self.isConnected, !self.userRequestedConnection, !names.isEmpty {
                     self.status = "Macs found on the local network"
                     self.detail = "Select a Mac, then press Connect. Discovery never connects automatically."
                 }
+            }
+        }
+
+        peers.onDiscoveredDevicesChanged = { [weak self] devices in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.discoveryRecords = devices
+                self.refreshDevices()
+                if !self.isConnected, !self.userRequestedConnection, !devices.isEmpty {
+                    self.status = "Macs found on the local network"
+                    self.detail = "Select a Mac, then press Connect. Discovery never connects automatically."
+                }
+            }
+        }
+
+        peers.onAuthenticatedMacChanged = { [weak self] macID, name in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.selectedMacID = macID
+                self.selectedMacName = name
+                self.defaults.set(macID, forKey: "macViewer.selectedMacID")
+                self.defaults.set(name, forKey: "macViewer.selectedMacName")
+                self.rememberMacName(name)
+                self.refreshDevices()
             }
         }
 
@@ -188,23 +351,23 @@ final class MacViewerConnectionModel: ObservableObject {
         peers.onFrame = { [weak self] data in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.recordReceivedVideoFrame()
+                self.lastVideoWidth = 0
+                self.lastVideoHeight = 0
                 guard self.videoDisplay.enqueueJPEG(data) else { return }
+                self.recordSubmittedVideoFrame()
                 self.updateStreamPresentation(width: 0, height: 0, format: "JPEG")
-                self.recordVideoFrame()
             }
         }
 
         peers.onVideoFrame = { [weak self] frame in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                let displayed = self.videoDisplay.enqueue(frame)
-                self.updateStreamPresentation(
-                    width: frame.width,
-                    height: frame.height,
-                    format: "H.264"
-                )
-                self.recordVideoFrame()
-                if displayed { self.acknowledgeVideoFrame(frame) }
+                self.recordReceivedVideoFrame()
+                self.lastVideoWidth = frame.width
+                self.lastVideoHeight = frame.height
+                self.setStreamDimensions(width: frame.width, height: frame.height, format: "H.264")
+                _ = self.videoDisplay.enqueue(frame)
             }
         }
 
@@ -233,13 +396,27 @@ final class MacViewerConnectionModel: ObservableObject {
         refreshReceivedFiles()
     }
 
+    deinit { videoHealthTimer?.invalidate() }
+
     var hasReceivedFiles: Bool { !receivedFiles.isEmpty }
     var localNetworkPermissionNeeded: Bool { localNetworkAccess.needsPermission }
     var isFileTransferring: Bool { fileTransfer.isBusy }
     var hasQueuedFiles: Bool { queuedFileCount > 0 }
+    var selectedDevice: MacViewerDevice? {
+        if let selectedDeviceID, let device = devices.first(where: { $0.id == selectedDeviceID }) {
+            return device
+        }
+        if let selectedMacID, let device = devices.first(where: { $0.macID == selectedMacID }) {
+            return device
+        }
+        guard let selectedMacName else { return nil }
+        let matches = devices.filter { $0.name == selectedMacName }
+        return matches.count == 1 ? matches.first : nil
+    }
 
     func isRememberedMac(_ name: String) -> Bool {
-        (defaults.stringArray(forKey: Self.rememberedMacNamesKey) ?? []).contains(name)
+        SavedMacRouteStore.route(macID: name, defaults: defaults) != nil ||
+            SavedMacRouteStore.route(named: name, defaults: defaults) != nil
     }
 
     func start() {
@@ -251,16 +428,51 @@ final class MacViewerConnectionModel: ObservableObject {
 
     func chooseMac(_ name: String) {
         guard !isConnected else { return }
-        selectedMacName = name
-        defaults.set(name, forKey: "macViewer.selectedMacName")
+        let matches = devices.filter { $0.name == name }
+        guard matches.count == 1, let device = matches.first else {
+            if matches.count > 1 {
+                status = "Choose a device by its identity"
+                detail = "More than one Mac has this name. Select the row with the matching ID in the device list."
+            }
+            return
+        }
+        chooseDevice(device.id)
+    }
+
+    func chooseDevice(_ id: String) {
+        guard !isConnected, let device = devices.first(where: { $0.id == id }) else { return }
+        selectedDeviceID = id
+        selectedMacID = device.macID
+        selectedMacName = device.name
+        if let macID = device.macID {
+            defaults.set(macID, forKey: "macViewer.selectedMacID")
+            defaults.set(device.name, forKey: "macViewer.selectedMacName")
+        } else {
+            defaults.removeObject(forKey: "macViewer.selectedMacID")
+            defaults.removeObject(forKey: "macViewer.selectedMacName")
+        }
         pairingRequired = false
         pairingError = nil
         status = "Ready to connect"
-        detail = "Press Connect to authenticate " + name + " over the encrypted local link."
+        detail = device.isLocal
+            ? "This Mac is running the Host. Choose a different Mac to connect."
+            : "Press Connect to authenticate " + device.name + " over the encrypted local link."
     }
 
     func connect() {
         guard !isConnected, !isConnecting else { return }
+        if selectedDevice?.isLocal == true {
+            status = "This is the local Mac"
+            detail = "Choose a different Mac before connecting."
+            return
+        }
+        if manualMacAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let selectedDevice, selectedDevice.macID == nil,
+           devices.filter({ $0.name == selectedDevice.name }).count > 1 {
+            status = "This Mac cannot be identified uniquely"
+            detail = "These older Hosts share a display name but do not advertise stable IDs. Update them or enter the chosen Mac's private IP address with its pairing code."
+            return
+        }
         let normalizedCode = PairingCode.normalize(pairingCode)
 
         // A Host may ask for the code after the first Connect starts the
@@ -311,7 +523,7 @@ final class MacViewerConnectionModel: ObservableObject {
         } else if let selectedMacName, !selectedMacName.isEmpty {
             // Selecting the route clears the previous LAN handshake and code.
             // Submit afterward so that reset cannot discard this attempt's code.
-            peers.selectMac(named: selectedMacName)
+            peers.selectMac(macID: selectedMacID, named: selectedMacName)
             if normalizedCode.count == PairingCode.characterCount {
                 peers.submitPairingCode(normalizedCode)
             }
@@ -354,12 +566,21 @@ final class MacViewerConnectionModel: ObservableObject {
         isConnected = false
         isStreaming = false
         pairingRequired = false
+        resetVideoMetrics()
         videoDisplay.flush()
         lastVideoAckSequence = nil
         videoAckBatchCount = 0
         fileTransfer.cancelAll(reason: "Connection ended.")
         status = "Disconnected"
         detail = "Choose another Mac or press Connect to reconnect."
+    }
+
+    func recoverVideo() {
+        guard isConnected else { return }
+        shouldOfferVideoRecovery = false
+        videoPresentationStatus = "Requesting a fresh keyframe"
+        detail = "The Viewer is keeping the current image while it asks the Host for a fresh keyframe."
+        videoDisplay.prepareForForegroundResume()
     }
 
     func retry() {
@@ -524,31 +745,43 @@ final class MacViewerConnectionModel: ObservableObject {
     }
 
     func forgetTrustedMac(named name: String) {
-        guard !name.isEmpty else { return }
-        guard let route = SavedMacRouteStore.route(named: name, defaults: defaults) else {
+        guard !name.isEmpty,
+              let route = SavedMacRouteStore.route(named: name, defaults: defaults) else { return }
+        forgetTrustedMac(macID: route.macID)
+    }
+
+    func forgetTrustedMac(macID: String) {
+        guard !macID.isEmpty else { return }
+        guard let route = SavedMacRouteStore.route(macID: macID, defaults: defaults) else {
             status = "Saved pairing metadata is incomplete"
             detail = "Use Forget All Saved Macs to remove any orphaned Viewer credentials."
             return
         }
-        if !removeCredential("pad.mac.\(route.macID)") {
+        let name = route.name
+        if !removeCredential("pad.mac.\(macID)") {
             status = "Could not remove saved pairing"
             detail = "Unlock this Mac and try Forget again; the saved route was kept."
             return
         }
-        _ = SavedMacRouteStore.remove(named: name, defaults: defaults)
+        _ = SavedMacRouteStore.remove(macID: macID, defaults: defaults)
 
         var names = Set(defaults.stringArray(forKey: Self.rememberedMacNamesKey) ?? [])
-        names.remove(name)
+        if !SavedMacRouteStore.routes(defaults: defaults).contains(where: { $0.name == name }) {
+            names.remove(name)
+        }
         if names.isEmpty {
             defaults.removeObject(forKey: Self.rememberedMacNamesKey)
         } else {
             defaults.set(names.sorted(), forKey: Self.rememberedMacNamesKey)
         }
-        if selectedMacName == name {
+        if selectedMacID == macID {
             selectedMacName = nil
+            selectedMacID = nil
+            selectedDeviceID = nil
+            defaults.removeObject(forKey: "macViewer.selectedMacID")
             defaults.removeObject(forKey: "macViewer.selectedMacName")
         }
-        discoveredMacs.removeAll { $0 == name }
+        refreshDevices()
         if lastRemoteMacName == name { lastRemoteMacName = nil }
 
         if isConnected || isConnecting {
@@ -572,8 +805,12 @@ final class MacViewerConnectionModel: ObservableObject {
         SavedMacRouteStore.removeAll(defaults: defaults)
         defaults.removeObject(forKey: Self.rememberedMacNamesKey)
         defaults.removeObject(forKey: "macViewer.selectedMacName")
+        defaults.removeObject(forKey: "macViewer.selectedMacID")
         selectedMacName = nil
-        discoveredMacs.removeAll()
+        selectedMacID = nil
+        selectedDeviceID = nil
+        discoveryRecords.removeAll()
+        refreshDevices()
         pairingCode = ""
         lastRemoteMacName = nil
         if isConnected || isConnecting {
@@ -620,7 +857,7 @@ final class MacViewerConnectionModel: ObservableObject {
             connectionLatencyMS = nil
             connectionHealthDetail = "Waiting for encrypted link"
             streamDimensions = "Waiting for video"
-            streamFPS = 0
+            resetVideoMetrics()
             videoDisplay.flush()
             lastVideoAckSequence = nil
             videoAckBatchCount = 0
@@ -718,41 +955,131 @@ final class MacViewerConnectionModel: ObservableObject {
     }
 
     private func updateStreamPresentation(width: Int, height: Int, format: String) {
+        setStreamDimensions(width: width, height: height, format: format)
+        if !isStreaming {
+            isStreaming = true
+            status = "Connected to " + (lastRemoteMacName ?? "Mac")
+            self.detail = remoteInputAuthorized
+                ? "Mac screen is visible. Mouse, keyboard, and scroll events are forwarded."
+                : "Video is visible; the other Mac has not enabled remote input."
+        }
+    }
+
+    private func setStreamDimensions(width: Int, height: Int, format: String) {
         let safeWidth = width > 0 ? width : 16
         let safeHeight = height > 0 ? height : 9
         let ratio = CGFloat(safeWidth) / CGFloat(safeHeight)
         if abs(streamAspectRatio - ratio) > 0.0001 { streamAspectRatio = ratio }
         let dimensions = width > 0 && height > 0
             ? String(width) + " × " + String(height) + " " + format
-            : "Live " + format + " stream"
+            : format == "JPEG" ? "Live JPEG stream" : "Live video stream"
         if streamDimensions != dimensions { streamDimensions = dimensions }
-        if !isStreaming {
-            isStreaming = true
-            status = "Connected to " + (lastRemoteMacName ?? "Mac")
-            self.detail = remoteInputAuthorized
-                ? "Mac screen is live. Mouse, keyboard, and scroll events are forwarded."
-                : "Video is live; the other Mac has not enabled remote input."
-        }
     }
 
-    private func recordVideoFrame() {
-        frameWindowCount += 1
+    private func recordReceivedVideoFrame() {
+        receivedFrameWindowCount += 1
         let now = ProcessInfo.processInfo.systemUptime
+        firstReceivedVideoAt = firstReceivedVideoAt ?? now
+        lastReceivedVideoAt = now
+        startVideoHealthTimer()
+        publishVideoMetricsIfNeeded(now: now)
+    }
+
+    private func recordSubmittedVideoFrame() {
+        submittedFrameWindowCount += 1
+        let now = ProcessInfo.processInfo.systemUptime
+        lastSubmittedVideoAt = now
+        publishVideoMetricsIfNeeded(now: now)
+    }
+
+    private func recordPresentedContentChange() {
+        outputChangeWindowCount += 1
+        lastPresentedContentAt = ProcessInfo.processInfo.systemUptime
+        publishVideoMetricsIfNeeded(now: lastPresentedContentAt ?? ProcessInfo.processInfo.systemUptime)
+        refreshVideoHealth()
+    }
+
+    private func publishVideoMetricsIfNeeded(now: TimeInterval) {
         let duration = now - frameWindowStart
         guard duration >= 0.5 else { return }
-        streamFPS = max(0, Int((Double(frameWindowCount) / duration).rounded()))
-        frameWindowCount = 0
+        streamReceivedFPS = max(0, Int((Double(receivedFrameWindowCount) / duration).rounded()))
+        streamSubmittedFPS = max(0, Int((Double(submittedFrameWindowCount) / duration).rounded()))
+        streamOutputChangeRate = max(0, Int((Double(outputChangeWindowCount) / duration).rounded()))
+        streamFPS = streamSubmittedFPS
+        receivedFrameWindowCount = 0
+        submittedFrameWindowCount = 0
+        outputChangeWindowCount = 0
         frameWindowStart = now
     }
 
-    private func acknowledgeVideoFrame(_ frame: VideoFrame) {
-        guard lastVideoAckSequence != frame.sequence else { return }
-        lastVideoAckSequence = frame.sequence
+    private func acknowledgeVideoFrame(sequence: UInt64, isKeyFrame: Bool) {
+        guard lastVideoAckSequence != sequence else { return }
+        lastVideoAckSequence = sequence
         videoAckBatchCount += 1
-        if frame.isKeyFrame || videoAckBatchCount >= 12 {
+        if isKeyFrame || videoAckBatchCount >= 12 {
             videoAckBatchCount = 0
-            peers.send(ControlMessage(.status, detail: "video-ack:\(frame.sequence)"))
+            peers.send(ControlMessage(.status, detail: "video-ack:\(sequence)"))
         }
+    }
+
+    private func startVideoHealthTimer() {
+        guard videoHealthTimer == nil else { return }
+        videoHealthTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshVideoHealth() }
+        }
+    }
+
+    private func refreshVideoHealth() {
+        publishVideoMetricsIfNeeded(now: ProcessInfo.processInfo.systemUptime)
+        guard isConnected, let lastReceivedVideoAt,
+              ProcessInfo.processInfo.systemUptime - lastReceivedVideoAt <= 1.5 else {
+            shouldOfferVideoRecovery = false
+            if hasPresentedVideo { videoPresentationStatus = "Image visible · waiting for frames" }
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        if !supportsVisiblePixelSampling {
+            let progressAt = lastSubmittedVideoAt ?? firstReceivedVideoAt ?? lastReceivedVideoAt
+            let submissionStalled = now - progressAt >= 2
+            videoPresentationStatus = submissionStalled
+                ? "Frames arriving · AVFoundation submission stalled"
+                : "Submitted · display tracking unavailable"
+            shouldOfferVideoRecovery = submissionStalled
+            return
+        }
+        if !hasPresentedVideo {
+            let waitingFor = now - (firstReceivedVideoAt ?? lastReceivedVideoAt)
+            videoPresentationStatus = waitingFor >= 2 ? "Frames arriving · no visible image" : "Waiting for visible image"
+            shouldOfferVideoRecovery = waitingFor >= 2
+        } else if let lastPresentedContentAt, now - lastPresentedContentAt >= 2 {
+            videoPresentationStatus = "No pixel changes detected"
+            shouldOfferVideoRecovery = true
+        } else {
+            videoPresentationStatus = "Image changing"
+            shouldOfferVideoRecovery = false
+        }
+    }
+
+    private func resetVideoMetrics() {
+        videoHealthTimer?.invalidate()
+        videoHealthTimer = nil
+        frameWindowStart = ProcessInfo.processInfo.systemUptime
+        receivedFrameWindowCount = 0
+        submittedFrameWindowCount = 0
+        outputChangeWindowCount = 0
+        firstReceivedVideoAt = nil
+        lastReceivedVideoAt = nil
+        lastSubmittedVideoAt = nil
+        lastPresentedContentAt = nil
+        lastVideoWidth = 0
+        lastVideoHeight = 0
+        streamReceivedFPS = 0
+        streamSubmittedFPS = 0
+        streamOutputChangeRate = 0
+        streamFPS = 0
+        hasPresentedVideo = false
+        shouldOfferVideoRecovery = false
+        videoPresentationStatus = "Waiting for video"
     }
 
     private func startNextQueuedFileIfNeeded() {
@@ -772,6 +1099,18 @@ final class MacViewerConnectionModel: ObservableObject {
         defaults.set(names.sorted(), forKey: Self.rememberedMacNamesKey)
         defaults.set(name, forKey: "macViewer.selectedMacName")
         if !discoveredMacs.contains(name) { discoveredMacs.insert(name, at: 0) }
+    }
+
+    private func refreshDevices() {
+        let routes = SavedMacRouteStore.routes(defaults: defaults)
+        let localHosts = Set(BridgeNetworkMetadata.localPrivateIPv4Addresses())
+        devices = MacViewerDeviceCatalog.make(routes: routes, discoveries: discoveryRecords, localHosts: localHosts)
+        if let selectedDeviceID, let selected = devices.first(where: { $0.id == selectedDeviceID }) {
+            selectedMacID = selected.macID
+            selectedMacName = selected.name
+        }
+        let legacyNames = defaults.stringArray(forKey: Self.rememberedMacNamesKey) ?? []
+        discoveredMacs = Array(Set(routes.map(\.name) + discoveryRecords.map(\.name) + legacyNames)).sorted()
     }
 
     private static func peerName(from value: String?) -> String? {

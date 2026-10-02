@@ -74,18 +74,27 @@ final class ViewerPeerStub: MacViewerPeerService {
     var onConnectionHealthChanged: ((String, Int?) -> Void)?
     var onPairingCodeRequired: ((String, String?) -> Void)?
     var onDiscoveredMacsChanged: (([String]) -> Void)?
+    var onDiscoveredDevicesChanged: (([MacDiscoveryRecord]) -> Void)?
+    var onAuthenticatedMacChanged: ((String, String) -> Void)?
     var calls: [Call] = []
     var pendingCode: String?
     var messages: [ControlMessage] = []
     var inputs: [RemoteInputEvent] = []
     var startCount = 0
     var restartCount = 0
+    private(set) var lastSelectedMacID: String?
     var onSend: (() -> Void)?
     func start() { startCount += 1 }
     func restart() { restartCount += 1; pendingCode = nil }
     func selectMac(named name: String) {
         calls.append(.select(name))
+        lastSelectedMacID = nil
         pendingCode = nil // Same reset performed by PadLANService.selectMac.
+    }
+    func selectMac(macID: String?, named name: String) {
+        calls.append(.select(name))
+        lastSelectedMacID = macID
+        pendingCode = nil
     }
     func submitPairingCode(_ code: String) { calls.append(.submit(code)); pendingCode = code }
     func connectWithPairingCode(_ code: String, invitation: PairingInvitation?, host: String?) {
@@ -115,14 +124,24 @@ enum ViewerVideoFixture {
     }
 
     @MainActor
-    static func jpeg() throws -> Data {
+    static func jpeg(color: NSColor = .black) throws -> Data {
         let bitmap = try XCTUnwrap(NSBitmapImageRep(
             bitmapDataPlanes: nil, pixelsWide: 16, pixelsHigh: 16,
             bitsPerSample: 8, samplesPerPixel: 3, hasAlpha: false,
             isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 48, bitsPerPixel: 24
         ))
+        let rgb = try XCTUnwrap(color.usingColorSpace(.deviceRGB))
+        let components = [rgb.redComponent, rgb.greenComponent, rgb.blueComponent]
+            .map { UInt8((min(max($0, 0), 1) * 255).rounded()) }
         let bytes = try XCTUnwrap(bitmap.bitmapData)
-        bytes.update(repeating: 0, count: bitmap.bytesPerRow * bitmap.pixelsHigh)
+        for y in 0..<bitmap.pixelsHigh {
+            for x in 0..<bitmap.pixelsWide {
+                let offset = y * bitmap.bytesPerRow + x * 3
+                bytes[offset] = components[0]
+                bytes[offset + 1] = components[1]
+                bytes[offset + 2] = components[2]
+            }
+        }
         return try XCTUnwrap(bitmap.representation(using: .jpeg, properties: [:]))
     }
 
