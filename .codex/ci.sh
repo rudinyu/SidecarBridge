@@ -38,7 +38,7 @@ VIEWER_UI_RESULT="$BUILD_ROOT/SidecarBridgeViewerUITests.xcresult"
 mkdir -p "$BUILD_ROOT"
 rm -rf -- "$HOST_TEST_RESULT" "$VIEWER_UI_RESULT"
 
-xcodebuild -quiet \
+if ! xcodebuild -quiet \
   -project SidecarBridge.xcodeproj \
   -scheme SidecarBridgeMac \
   -configuration Debug \
@@ -47,10 +47,14 @@ xcodebuild -quiet \
   -resultBundlePath "$HOST_TEST_RESULT" \
   -parallel-testing-enabled NO \
   CODE_SIGNING_ALLOWED=NO \
-  test
+  test; then
+  echo "Host XCTest failed; result summary follows:" >&2
+  xcrun xcresulttool get test-results summary --path "$HOST_TEST_RESULT" || true
+  exit 1
+fi
 
 if (( ! SKIP_VIEWER_UI_TESTS )); then
-  xcodebuild -quiet \
+  if ! xcodebuild -quiet \
     -project SidecarBridge.xcodeproj \
     -scheme SidecarBridgeViewerUI \
     -configuration Debug \
@@ -59,7 +63,11 @@ if (( ! SKIP_VIEWER_UI_TESTS )); then
     -resultBundlePath "$VIEWER_UI_RESULT" \
     -parallel-testing-enabled NO \
     CODE_SIGNING_ALLOWED=NO \
-    test
+    test; then
+    echo "Viewer UI XCTest failed; result summary follows:" >&2
+    xcrun xcresulttool get test-results summary --path "$VIEWER_UI_RESULT" || true
+    exit 1
+  fi
 else
   echo "Viewer UI tests skipped by explicit request."
 fi
