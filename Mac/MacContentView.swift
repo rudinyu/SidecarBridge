@@ -113,12 +113,6 @@ struct MacContentView: View {
                     .foregroundStyle(.white.opacity(0.62))
             }
             Spacer()
-            Button {
-                openWindow(id: "viewer")
-            } label: {
-                Label("Mac Viewer", systemImage: "macwindow.on.rectangle")
-            }
-            .buttonStyle(.bordered)
             Text("MAC")
                 .font(.caption2.bold())
                 .tracking(1.6)
@@ -184,7 +178,7 @@ struct MacContentView: View {
                         .buttonStyle(.borderedProminent)
                         .tint(.cyan)
                 } else {
-                    Text("Open the iPad app or Mac Viewer to connect")
+                    Text("Connect from an iPad or iPhone app, or from SidecarBridge Viewer on another Mac")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.42))
                 }
@@ -240,7 +234,7 @@ struct MacContentView: View {
                     detail: model.hasPadPeer
                         ? model.connectionHealthDetail
                         : (model.incomingListenerReady
-                            ? "No inbound Viewer. Outgoing Mac Viewer status appears in its own window."
+                            ? "No Viewer is connected. Keep this Host app open to accept a Viewer connection."
                             : model.incomingListenerDetail),
                     tint: model.connectionLatencyMS == nil ? .white.opacity(0.55) : .cyan
                 )
@@ -773,7 +767,7 @@ struct MacContentView: View {
     private var connectionHealthText: String {
         guard model.hasPadPeer else {
             if model.incomingListenerReady {
-                return "No inbound Viewer is connected. Outgoing Mac Viewer status is shown in the Mac Viewer window."
+                return "No Viewer is connected. Keep this Host app open to accept a Viewer connection."
             }
             return model.incomingListenerDetail
         }

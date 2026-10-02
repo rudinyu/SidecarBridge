@@ -20,8 +20,6 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
 struct SidecarBridgeMacApp: App {
     @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var appDelegate
     @StateObject private var model = MacConnectionModel()
-    @StateObject private var viewerModel = MacViewerConnectionModel()
-    @State private var viewerInputModeManager = RemoteInputSourceController()
     @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
@@ -46,8 +44,6 @@ struct SidecarBridgeMacApp: App {
         .defaultSize(width: 960, height: 580)
         .windowResizability(.contentMinSize)
 
-        viewerWindow.withViewerWindowRole()
-
         MenuBarExtra {
             Text("SidecarBridge")
                 .font(.headline)
@@ -67,12 +63,6 @@ struct SidecarBridgeMacApp: App {
             }
             .keyboardShortcut("p", modifiers: [.command, .shift])
             Button("Copy Pairing Code", action: model.copyPairingCode)
-
-            Button("Open Mac Viewer") {
-                openWindow(id: "viewer")
-                NSApplication.shared.activate(ignoringOtherApps: true)
-            }
-            .keyboardShortcut("v", modifiers: [.command, .shift])
 
             Divider()
 
@@ -115,28 +105,4 @@ struct SidecarBridgeMacApp: App {
         .menuBarExtraStyle(.menu)
     }
 
-    private var viewerWindow: some Scene {
-        Window("Mac Viewer", id: "viewer") {
-            MacViewerView(
-                model: viewerModel,
-                inputModeManager: viewerInputModeManager
-            )
-        }
-        .defaultSize(width: 1120, height: 820)
-        .windowResizability(.contentMinSize)
-    }
-}
-
-private extension Scene {
-    func withViewerWindowRole() -> some Scene {
-        // SceneBuilder has no if/else support. Its availability erasure keeps
-        // one Window (and one id) on both macOS 14 and macOS 15+.
-        if #available(macOS 15.0, *) {
-            return SceneBuilder.buildOptional(SceneBuilder.buildLimitedAvailability(
-                windowManagerRole(.principal)
-            ))
-        } else {
-            return SceneBuilder.buildOptional(SceneBuilder.buildLimitedAvailability(self))
-        }
-    }
 }

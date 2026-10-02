@@ -161,6 +161,9 @@
 		B99999999999999999999999 /* MacViewerVideoTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A99999999999999999999999 /* MacViewerVideoTests.swift */; };
 		BAAAAAAAAAAAAAAAAAAAAAAA /* MacViewerPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAAAAAAAAAAAAAAAAAAAAAA /* MacViewerPresentation.swift */; };
 		BBBBBBBBBBBBBBBBBBBBBBBB /* MacViewerPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABBBBBBBBBBBBBBBBBBBBBBB /* MacViewerPresentationTests.swift */; };
+		6A163A1A14EA45BFB4287BB5 /* SidecarBridgeViewerMacApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = D9457348453C43F1974B116A /* SidecarBridgeViewerMacApp.swift */; };
+		F7CF636F21E14C75BF1706CB /* MacViewerInputModeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E54BC003EBBE4C2E9EF368BE /* MacViewerInputModeManager.swift */; };
+		565EF8967E064DB28F2C0D7B /* RemoteInputSourceController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A56D4F9EECA49F89C9EE6FE /* RemoteInputSourceController.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -168,8 +171,8 @@
 			isa = PBXContainerItemProxy;
 			containerPortal = 947B8000995B50AB3A54588A /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = AA42C4F067082A54E6D97C29;
-			remoteInfo = SidecarBridgeMac;
+			remoteGlobalIDString = C80ACE2A889644298166D6EB;
+			remoteInfo = SidecarBridgeViewerMac;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -278,6 +281,12 @@
 		F3E2A19AD0FE529BC023FD81 /* LocalAuthentication.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = LocalAuthentication.framework; path = System/Library/Frameworks/LocalAuthentication.framework; sourceTree = SDKROOT; };
 		F56B763694D517FFB925EA1F /* ShutdownProtectionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShutdownProtectionPolicy.swift; sourceTree = "<group>"; };
 		FFB37684A758A8231391515D /* NativeSidecarSetup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeSidecarSetup.swift; sourceTree = "<group>"; };
+		CEBFBA86B93B4552912AF623 /* SidecarBridge Viewer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "SidecarBridge Viewer.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		D9457348453C43F1974B116A /* SidecarBridgeViewerMacApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidecarBridgeViewerMacApp.swift; sourceTree = "<group>"; };
+		E54BC003EBBE4C2E9EF368BE /* MacViewerInputModeManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacViewerInputModeManager.swift; sourceTree = "<group>"; };
+		1A56D4F9EECA49F89C9EE6FE /* RemoteInputSourceController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteInputSourceController.swift; sourceTree = "<group>"; };
+		BCBA527F274245EDAEEE6E16 /* ViewerInfo.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = ViewerInfo.plist; sourceTree = "<group>"; };
+		BC4E398B1E4F4BBC86D742DC /* SidecarBridgeViewer.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = SidecarBridgeViewer.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -327,6 +336,19 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		9012ED56F8EF4D98B41C5707 /* Viewer Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				8D467B67CF7786EEA5045A38 /* AVFoundation.framework in Frameworks */,
+				4F20AB25974ACF595AB7A02F /* Carbon.framework in Frameworks */,
+				A11C3D60796289052EEE84A5 /* MultipeerConnectivity.framework in Frameworks */,
+				6F1F78888D0A2E48006FFAAF /* Network.framework in Frameworks */,
+				2DE9DD403F558013C9EFB8F1 /* Security.framework in Frameworks */,
+				BB94E33810371F48190B51FF /* VideoToolbox.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -344,11 +366,6 @@
 				34875BE7BD3F9883AEFE56C5 /* Info.plist */,
 				A605DAB3B8F6C917ABABB46F /* MacConnectionModel.swift */,
 				4316F908EA1732F27087B925 /* MacContentView.swift */,
-				A11111111111111111111111 /* MacViewerConnectionModel.swift */,
-				A22222222222222222222222 /* MacViewerInputSurface.swift */,
-				A33333333333333333333333 /* MacViewerVideoDisplay.swift */,
-				A44444444444444444444444 /* MacViewerView.swift */,
-				AAAAAAAAAAAAAAAAAAAAAAAA /* MacViewerPresentation.swift */,
 				5DC5BF383941F9C156E7F434 /* MacDeviceAuthorization.swift */,
 				74E92BAEB461529898894895 /* MacLANService.swift */,
 				24C3F2C06962F3FC95B1BFF2 /* MacPairingCard.swift */,
@@ -358,12 +375,29 @@
 				536356574331C1E229ABB10F /* PairingQRCodeView.swift */,
 				2244FD217DF03045706FB4DD /* PrivacyInfo.xcprivacy */,
 				0DD3847ACDC7DFFDCCBAC490 /* RemoteInputController.swift */,
+				1A56D4F9EECA49F89C9EE6FE /* RemoteInputSourceController.swift */,
 				AE9882163FE972554DFD22C5 /* ScreenStreamer.swift */,
 				93CB5164889E245469D18E50 /* SidecarBridgeMac.entitlements */,
 				8A47529E9BB2E0E36EC5D5C4 /* SidecarBridgeMacApp.swift */,
 				875676002A874A36BB721BDD /* SidecarConnector.swift */,
 			);
 			path = Mac;
+			sourceTree = "<group>";
+		};
+		DDA40BA508574E488B49F299 /* MacViewer */ = {
+			isa = PBXGroup;
+			children = (
+				A11111111111111111111111 /* MacViewerConnectionModel.swift */,
+				A22222222222222222222222 /* MacViewerInputSurface.swift */,
+				A33333333333333333333333 /* MacViewerVideoDisplay.swift */,
+				A44444444444444444444444 /* MacViewerView.swift */,
+				E54BC003EBBE4C2E9EF368BE /* MacViewerInputModeManager.swift */,
+				AAAAAAAAAAAAAAAAAAAAAAAA /* MacViewerPresentation.swift */,
+				D9457348453C43F1974B116A /* SidecarBridgeViewerMacApp.swift */,
+				BCBA527F274245EDAEEE6E16 /* ViewerInfo.plist */,
+				BC4E398B1E4F4BBC86D742DC /* SidecarBridgeViewer.entitlements */,
+			);
+			path = MacViewer;
 			sourceTree = "<group>";
 		};
 		1BFFF2B5957C119E772679CF /* Tests */ = {
@@ -474,6 +508,7 @@
 			isa = PBXGroup;
 			children = (
 				17A41FFB4B4E0CC562D370CA /* Mac */,
+				DDA40BA508574E488B49F299 /* MacViewer */,
 				9725C8E6FE4B194423068989 /* Pad */,
 				4C996E142DD155C07BFC7535 /* Shared */,
 				1BFFF2B5957C119E772679CF /* Tests */,
@@ -487,6 +522,7 @@
 			isa = PBXGroup;
 			children = (
 				796A25DB4ABDCDB1108CC28F /* SidecarBridgeMac.app */,
+				CEBFBA86B93B4552912AF623 /* SidecarBridge Viewer.app */,
 				1D42BDECCE5EF18BD39F0173 /* SidecarBridgePad.app */,
 				83E1072643E5526D82D2EFE9 /* SidecarBridgeTests.xctest */,
 				F11000000000000000000005 /* SidecarBridgeUITests.xctest */,
@@ -549,6 +585,21 @@
 			productReference = 796A25DB4ABDCDB1108CC28F /* SidecarBridgeMac.app */;
 			productType = "com.apple.product-type.application";
 		};
+		C80ACE2A889644298166D6EB /* SidecarBridgeViewerMac */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 765BF9E71AC04D4ABA3D5CA5 /* Build configuration list for PBXNativeTarget "SidecarBridgeViewerMac" */;
+			buildPhases = (
+				443183282F2D451185128F87 /* Viewer Sources */,
+				21CDFF903307453597F9D85C /* Viewer Resources */,
+				9012ED56F8EF4D98B41C5707 /* Viewer Frameworks */,
+			);
+			buildRules = ();
+			dependencies = ();
+			name = SidecarBridgeViewerMac;
+			productName = "SidecarBridge Viewer";
+			productReference = CEBFBA86B93B4552912AF623 /* SidecarBridge Viewer.app */;
+			productType = "com.apple.product-type.application";
+		};
 		AC888CE8BE4AF79DBFE5116F /* SidecarBridgeTests */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 970A21E03E42CA5E188712C4 /* Build configuration list for PBXNativeTarget "SidecarBridgeTests" */;
@@ -577,13 +628,17 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					F11000000000000000000001 = {
-						TestTargetID = AA42C4F067082A54E6D97C29;
+						TestTargetID = C80ACE2A889644298166D6EB;
 					};
 					13D5AEC0CBFE55D643E7DAEA = {
 						DevelopmentTeam = LYK4LV2859;
 						ProvisioningStyle = Automatic;
 					};
 					AA42C4F067082A54E6D97C29 = {
+						DevelopmentTeam = LYK4LV2859;
+						ProvisioningStyle = Automatic;
+					};
+					C80ACE2A889644298166D6EB = {
 						DevelopmentTeam = LYK4LV2859;
 						ProvisioningStyle = Automatic;
 					};
@@ -607,6 +662,7 @@
 			projectRoot = "";
 			targets = (
 				AA42C4F067082A54E6D97C29 /* SidecarBridgeMac */,
+				C80ACE2A889644298166D6EB /* SidecarBridgeViewerMac */,
 				13D5AEC0CBFE55D643E7DAEA /* SidecarBridgePad */,
 				AC888CE8BE4AF79DBFE5116F /* SidecarBridgeTests */,
 				F11000000000000000000001 /* SidecarBridgeUITests */,
@@ -630,6 +686,15 @@
 			files = (
 				92B2D5720EB7A79457B2308D /* Assets.xcassets in Resources */,
 				605E1E80BBA2869CC7BD4D80 /* PrivacyInfo.xcprivacy in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		21CDFF903307453597F9D85C /* Viewer Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				35BF87461BAD13C706604E5A /* Assets.xcassets in Resources */,
+				6AAB9BD6EC5C4CDD49C29543 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -722,12 +787,7 @@
 				28409B33478CD0C30D1765CC /* LANProtocol.swift in Sources */,
 				6611C2566550F8C25E509AC5 /* MacConnectionModel.swift in Sources */,
 				80FA3B6C5CA37DA293EDEE78 /* MacContentView.swift in Sources */,
-				B11111111111111111111111 /* MacViewerConnectionModel.swift in Sources */,
-				B22222222222222222222222 /* MacViewerInputSurface.swift in Sources */,
-				B33333333333333333333333 /* MacViewerVideoDisplay.swift in Sources */,
-				B44444444444444444444444 /* MacViewerView.swift in Sources */,
 				FEF077EFBA61BCD06B63DB8C /* PadDeviceIdentity.swift in Sources */,
-				BAAAAAAAAAAAAAAAAAAAAAAA /* MacViewerPresentation.swift in Sources */,
 				44778D308D034459FF6C8C19 /* PadLANService.swift in Sources */,
 				4785F5679556954F23F87DBB /* PadPeerService.swift in Sources */,
 				E277CF7C68908D7AB4FA2DC6 /* MacDeviceAuthorization.swift in Sources */,
@@ -744,6 +804,7 @@
 				85B8E7EA95CC54B7DBA3E4FA /* RFBInput.swift in Sources */,
 				754E9E0184AC702C52D03698 /* RFBProtocol.swift in Sources */,
 				DBFF6D618AFB812BC3F5EDC0 /* RemoteInputController.swift in Sources */,
+				565EF8967E064DB28F2C0D7B /* RemoteInputSourceController.swift in Sources */,
 				CB7978D1153825FA574A33F2 /* RemoteInputLanguageState.swift in Sources */,
 				0B337B768F061F2FD7CB58D1 /* RemoteTextDelta.swift in Sources */,
 				136F9FBF23D970658AD94CAD /* ScreenStreamer.swift in Sources */,
@@ -804,12 +865,53 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		443183282F2D451185128F87 /* Viewer Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3207A727196FEBE19B39C792 /* AuthorizationGeneration.swift in Sources */,
+				3B3347A2045CD1A250163F3B /* BridgeProtocol.swift in Sources */,
+				C51A07774587B3FD2356F744 /* ConnectionSetup.swift in Sources */,
+				68521A21B5C96F2D3EC95AEC /* DisplayUpscalingPolicy.swift in Sources */,
+				06591D17688848D21AA3142A /* EncodedVideoStorage.swift in Sources */,
+				4145B17A8C27484CAE6FA820 /* FileTransferEngine.swift in Sources */,
+				04ADF9F911AEE1857DCA0295 /* FrameInterpolationPolicy.swift in Sources */,
+				A2957308FA0E7D8BD0E22721 /* KeyboardCursorFollow.swift in Sources */,
+				28409B33478CD0C30D1765CC /* LANProtocol.swift in Sources */,
+				5B34959ED24406173D9A3F1A /* MainQueueExecutor.swift in Sources */,
+				C4928A7686F5F751B37E16A7 /* NativeSidecarGuide.swift in Sources */,
+				874332875D767C3F44929763 /* NativeSidecarSetup.swift in Sources */,
+				1A2A594605AD0CDD16288BD7 /* PairingSecurity.swift in Sources */,
+				CB7978D1153825FA574A33F2 /* RemoteInputLanguageState.swift in Sources */,
+				0B337B768F061F2FD7CB58D1 /* RemoteTextDelta.swift in Sources */,
+				85B8E7EA95CC54B7DBA3E4FA /* RFBInput.swift in Sources */,
+				754E9E0184AC702C52D03698 /* RFBProtocol.swift in Sources */,
+				F21D85957D037CD13A0BD638 /* ShutdownProtectionPolicy.swift in Sources */,
+				BED19F2650731BC9CB5CF533 /* SoftwareKeyboardLayout.swift in Sources */,
+				6324505FFF4FE32370FADEDE /* StreamPreferences.swift in Sources */,
+				232FDC51073F12217DB62B0C /* StreamQualityPolicy.swift in Sources */,
+				81ED97DD9B5D381D636F49E4 /* SystemInformation.swift in Sources */,
+				784EEB6E15EA73040348FC3F /* TouchPointerAccumulator.swift in Sources */,
+				B11111111111111111111111 /* MacViewerConnectionModel.swift in Sources */,
+				B22222222222222222222222 /* MacViewerInputSurface.swift in Sources */,
+				B33333333333333333333333 /* MacViewerVideoDisplay.swift in Sources */,
+				BAAAAAAAAAAAAAAAAAAAAAAA /* MacViewerPresentation.swift in Sources */,
+				B44444444444444444444444 /* MacViewerView.swift in Sources */,
+				FEF077EFBA61BCD06B63DB8C /* PadDeviceIdentity.swift in Sources */,
+				44778D308D034459FF6C8C19 /* PadLANService.swift in Sources */,
+				4785F5679556954F23F87DBB /* PadPeerService.swift in Sources */,
+				565EF8967E064DB28F2C0D7B /* RemoteInputSourceController.swift in Sources */,
+				F7CF636F21E14C75BF1706CB /* MacViewerInputModeManager.swift in Sources */,
+				6A163A1A14EA45BFB4287BB5 /* SidecarBridgeViewerMacApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
 		F1100000000000000000000A /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = AA42C4F067082A54E6D97C29 /* SidecarBridgeMac */;
+			target = C80ACE2A889644298166D6EB /* SidecarBridgeViewerMac */;
 			targetProxy = F1100000000000000000000B /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
@@ -823,7 +925,7 @@
 				LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks", "@loader_path/../Frameworks");
 				PRODUCT_BUNDLE_IDENTIFIER = io.sidecarbridge.uitests;
 				SDKROOT = macosx;
-				TEST_TARGET_NAME = SidecarBridgeMac;
+				TEST_TARGET_NAME = SidecarBridgeViewerMac;
 			};
 			name = Debug;
 		};
@@ -835,7 +937,7 @@
 				LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../Frameworks", "@loader_path/../Frameworks");
 				PRODUCT_BUNDLE_IDENTIFIER = io.sidecarbridge.uitests;
 				SDKROOT = macosx;
-				TEST_TARGET_NAME = SidecarBridgeMac;
+				TEST_TARGET_NAME = SidecarBridgeViewerMac;
 			};
 			name = Release;
 		};
@@ -873,7 +975,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 116;
+				CURRENT_PROJECT_VERSION = 117;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = LYK4LV2859;
 				ENABLE_NS_ASSERTIONS = NO;
@@ -1018,6 +1120,52 @@
 			};
 			name = Debug;
 		};
+		8B9E6F4E8ECA43DB9F77FE35 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = MacViewer/SidecarBridgeViewer.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				COPY_PHASE_STRIP = YES;
+				DEAD_CODE_STRIPPING = YES;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_DEBUG_DYLIB = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				INFOPLIST_FILE = MacViewer/ViewerInfo.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = io.sidecarbridge.viewer.mac;
+				PRODUCT_NAME = "SidecarBridge Viewer";
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		228EE69DAFF54400BBFA669E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = MacViewer/SidecarBridgeViewer.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				COPY_PHASE_STRIP = YES;
+				DEAD_CODE_STRIPPING = YES;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_DEBUG_DYLIB = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				INFOPLIST_FILE = MacViewer/ViewerInfo.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = io.sidecarbridge.viewer.mac;
+				PRODUCT_NAME = "SidecarBridge Viewer";
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
 		F7BA2F229FABFCD02A4E2017 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -1052,7 +1200,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 116;
+				CURRENT_PROJECT_VERSION = 117;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = LYK4LV2859;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -1116,6 +1264,15 @@
 			buildConfigurations = (
 				DFF35C928A034BDF3777BDF8 /* Debug */,
 				18D2BC1A97E173B0105FD2A8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		765BF9E71AC04D4ABA3D5CA5 /* Build configuration list for PBXNativeTarget "SidecarBridgeViewerMac" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				8B9E6F4E8ECA43DB9F77FE35 /* Debug */,
+				228EE69DAFF54400BBFA669E /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;

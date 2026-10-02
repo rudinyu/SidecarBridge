@@ -129,7 +129,7 @@ final class MacViewerConnectionModel: ObservableObject {
                 self.localNetworkAccess = state
                 if state.needsPermission, !self.isConnected {
                     self.status = "Allow Local Network access"
-                    self.detail = "Enable SidecarBridge in System Settings → Privacy & Security → Local Network."
+                    self.detail = "Enable SidecarBridge Viewer in System Settings → Privacy & Security → Local Network."
                 }
             }
         }

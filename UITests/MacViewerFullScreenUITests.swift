@@ -1,7 +1,7 @@
 import AppKit
 import XCTest
 
-/// Runs the real app and its secondary SwiftUI Window scene. No NSWindow
+/// Runs the standalone Viewer app and its primary SwiftUI Window scene. No NSWindow
 /// subclass, synthetic notifications, remote connection, or permission grants.
 final class MacViewerFullScreenUITests: XCTestCase {
     private var app: XCUIApplication!
@@ -13,9 +13,6 @@ final class MacViewerFullScreenUITests: XCTestCase {
         app = XCUIApplication()
         app.launchArguments = ["-ApplePersistenceIgnoreState", "YES"]
         app.launch()
-        let openViewer = app.buttons["Mac Viewer"].firstMatch
-        XCTAssertTrue(openViewer.waitForExistence(timeout: 10))
-        openViewer.click()
         XCTAssertTrue(viewer.waitForExistence(timeout: 10))
         XCTAssertTrue(toggle.waitForExistence(timeout: 10))
         waitForFullScreen(false)
@@ -30,7 +27,7 @@ final class MacViewerFullScreenUITests: XCTestCase {
         let original = viewer.frame
         let green = viewer.buttons[XCUIIdentifierFullScreenWindow]
         XCTAssertTrue(green.waitForExistence(timeout: 5),
-            "The secondary Viewer must expose a native full-screen button, not only Zoom")
+            "The Viewer must expose a native full-screen button, not only Zoom")
         green.click()
         waitForFullScreen(true)
         assertScreenSizedWindow()
@@ -39,6 +36,12 @@ final class MacViewerFullScreenUITests: XCTestCase {
         viewer.typeKey("f", modifierFlags: [.control, .command])
         waitForFullScreen(false)
         waitForWindowSize(original.size)
+    }
+
+    func testStandaloneViewerDoesNotExposeHostPairingControls() {
+        XCTAssertTrue(app.staticTexts["Mac Viewer"].exists)
+        XCTAssertFalse(app.buttons["Show Pairing QR and Code"].exists)
+        XCTAssertFalse(app.buttons["Start In-App Display"].exists)
     }
 
     func testCustomButtonAndShortcutEachEnterAndExitFullScreen() {

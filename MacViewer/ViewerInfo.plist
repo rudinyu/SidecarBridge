@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>SidecarBridge</string>
+	<string>SidecarBridge Viewer</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -30,6 +30,6 @@
 		<string>_sb-direct._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>SidecarBridge advertises an encrypted local display service and accepts connections from the Viewer app you choose.</string>
+	<string>SidecarBridge Viewer discovers selected Macs on your local network and connects to them over an encrypted link.</string>
 </dict>
 </plist>

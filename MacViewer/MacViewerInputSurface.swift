@@ -239,6 +239,8 @@ final class MacViewerInputView: NSView, NSTextInputClient {
         let flags = event.modifierFlags
         return !flags.contains(.command)
             && !flags.contains(.control)
+            && !flags.contains(.option)
+            && !flags.contains(.shift)
             && !keyIsSpecial(event)
     }
 

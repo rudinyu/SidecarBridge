@@ -34,7 +34,7 @@ struct MacPairingCard: View {
             Divider().overlay(.white.opacity(0.08))
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: "checkmark.shield").foregroundStyle(.cyan)
-                Text("Pair once. Your trusted device is remembered. Scan from an iPad or iPhone, or enter this code in Mac Viewer on another Mac.")
+                Text("Pair once. Your trusted device is remembered. Scan from an iPad or iPhone, or enter this code in SidecarBridge Viewer on another Mac.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             DisclosureGroup("Can't scan? Connection help") {
@@ -62,7 +62,7 @@ struct MacPairingCard: View {
         VStack(alignment: .leading, spacing: 16) {
             Label("Scan from SidecarBridge", systemImage: "qrcode.viewfinder")
                 .font(.headline)
-            Text("On your iPad or iPhone, tap Scan Mac Code and point the camera here. On another Mac, open Mac Viewer and enter this code.")
+            Text("On your iPad or iPhone, tap Scan Mac Code and point the camera here. On another Mac, open SidecarBridge Viewer and enter this code.")
                 .font(.callout).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Text("OR ENTER THE 16-DIGIT CODE")

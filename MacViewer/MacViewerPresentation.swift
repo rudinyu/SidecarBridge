@@ -29,8 +29,8 @@ final class MacViewerPresentation: NSObject, ObservableObject {
         setFullScreen(window?.styleMask.contains(.fullScreen) == true)
         guard let window else { return }
         // .auxiliary and .fullScreenAuxiliary are different flags. The former
-        // also prevents a secondary SwiftUI Window from owning a Space. Keep
-        // this AppKit fallback for macOS 14; the scene declares .principal on 15+.
+        // also prevents a SwiftUI Window from owning a Space. Keep this AppKit
+        // fallback for macOS 14; the scene declares .principal on 15+.
         window.collectionBehavior.remove([.auxiliary, .canJoinAllApplications,
             .fullScreenAuxiliary, .fullScreenNone])
         window.collectionBehavior.insert([.primary, .fullScreenPrimary])
