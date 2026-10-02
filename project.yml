@@ -8,8 +8,8 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "1.4"
-    # macOS build 118 hardens Viewer identity, stream reporting, and release validation.
-    CURRENT_PROJECT_VERSION: "118"
+    # macOS build 119 fixes Viewer output sampling and signs UI test bundles.
+    CURRENT_PROJECT_VERSION: "119"
     DEVELOPMENT_TEAM: LYK4LV2859
 targets:
   SidecarBridgeMac:
@@ -99,6 +99,9 @@ targets:
         COPY_PHASE_STRIP: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_DEBUG_DYLIB: NO
+      configs:
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: io.sidecarbridge.viewer.mac.debug
     dependencies:
       - sdk: AVFoundation.framework
       - sdk: Carbon.framework

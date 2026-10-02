@@ -62,7 +62,9 @@ if (( ! SKIP_VIEWER_UI_TESTS )); then
     -derivedDataPath "$BUILD_ROOT/ViewerUITestDerivedData" \
     -resultBundlePath "$VIEWER_UI_RESULT" \
     -parallel-testing-enabled NO \
-    CODE_SIGNING_ALLOWED=NO \
+    CODE_SIGNING_ALLOWED=YES \
+    CODE_SIGN_IDENTITY=- \
+    CODE_SIGNING_REQUIRED=YES \
     test; then
     echo "Viewer UI XCTest failed; result summary follows:" >&2
     xcrun xcresulttool get test-results summary --path "$VIEWER_UI_RESULT" || true

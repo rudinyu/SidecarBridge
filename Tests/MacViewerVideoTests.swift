@@ -1,4 +1,5 @@
 import AppKit
+import CoreVideo
 import XCTest
 
 final class MacViewerVideoTests: XCTestCase {
@@ -53,6 +54,60 @@ final class MacViewerVideoTests: XCTestCase {
 
         XCTAssertTrue(controller.enqueueJPEG(try ViewerVideoFixture.jpeg(color: .white)))
         XCTAssertEqual(changes, 1)
+    }
+
+    @MainActor
+    func testDecodedPixelBufferFingerprintTracksVisibleContent() throws {
+        let dark = try makeNV12Frame(luma: 16)
+        let bright = try makeNV12Frame(luma: 235)
+
+        let darkFingerprint = try XCTUnwrap(MacViewerVideoView.pixelFingerprint(dark))
+        XCTAssertEqual(MacViewerVideoView.pixelFingerprint(dark), darkFingerprint)
+        XCTAssertNotEqual(MacViewerVideoView.pixelFingerprint(bright), darkFingerprint)
+    }
+
+    private func makeNV12Frame(luma: UInt8) throws -> CVPixelBuffer {
+        var pixelBuffer: CVPixelBuffer?
+        let attributes: [String: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ]
+        let createStatus = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            64,
+            64,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            attributes as CFDictionary,
+            &pixelBuffer
+        )
+        guard createStatus == kCVReturnSuccess, let pixelBuffer else {
+            throw NSError(domain: "MacViewerVideoTests", code: Int(createStatus))
+        }
+        let lockStatus = CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        guard lockStatus == kCVReturnSuccess else {
+            throw NSError(domain: "MacViewerVideoTests", code: Int(lockStatus))
+        }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+
+        guard CVPixelBufferIsPlanar(pixelBuffer), CVPixelBufferGetPlaneCount(pixelBuffer) == 2 else {
+            throw NSError(domain: "MacViewerVideoTests", code: 1)
+        }
+        for plane in 0..<2 {
+            guard let baseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane) else {
+                throw NSError(domain: "MacViewerVideoTests", code: 2)
+            }
+            let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane)
+            let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, plane)
+            let bytes = baseAddress.assumingMemoryBound(to: UInt8.self)
+            let value = plane == 0 ? luma : 128
+            for row in 0..<height {
+                let rowStart = row * bytesPerRow
+                for column in 0..<bytesPerRow {
+                    bytes[rowStart + column] = value
+                }
+            }
+        }
+        return pixelBuffer
     }
 
     @MainActor

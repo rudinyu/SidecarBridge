@@ -1,5 +1,6 @@
 import AVFoundation
 import AppKit
+import CoreImage
 import CoreMedia
 import CoreVideo
 import SwiftUI
@@ -337,6 +338,10 @@ struct MacViewerVideoSurface: NSViewRepresentable {
 }
 
 final class MacViewerVideoView: NSView {
+    private static let pixelFingerprintSize = 16
+    private static let pixelFingerprintContext = CIContext(options: [.cacheIntermediates: false])
+    private static let pixelFingerprintColorSpace = CGColorSpaceCreateDeviceRGB()
+
     let displayLayer = AVSampleBufferDisplayLayer()
     private let imageView = NSImageView()
     private(set) var hasPresentedImage = false
@@ -446,33 +451,44 @@ final class MacViewerVideoView: NSView {
         onPresentationChanged?(value)
     }
 
-    private static func pixelFingerprint(_ pixelBuffer: CVPixelBuffer) -> UInt64? {
-        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else { return nil }
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-        let isPlanar = CVPixelBufferIsPlanar(pixelBuffer)
-        let baseAddress = isPlanar
-            ? CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)
-            : CVPixelBufferGetBaseAddress(pixelBuffer)
-        let width = isPlanar
-            ? CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
-            : CVPixelBufferGetWidth(pixelBuffer)
-        let height = isPlanar
-            ? CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
-            : CVPixelBufferGetHeight(pixelBuffer)
-        let bytesPerRow = isPlanar
-            ? CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
-            : CVPixelBufferGetBytesPerRow(pixelBuffer)
-        guard let baseAddress, width > 0, height > 0, bytesPerRow > 0 else { return nil }
-        let bytes = baseAddress.assumingMemoryBound(to: UInt8.self)
-        var hash: UInt64 = 1_469_598_103_934_665_603
-        for row in 0..<16 {
-            let y = row * max(height - 1, 0) / 15
-            for column in 0..<16 {
-                let x = column * max(width - 1, 0) / 15
-                hash = (hash ^ UInt64(bytes[y * bytesPerRow + x])) &* 1_099_511_628_211
-            }
+    // Render into owned storage instead of indexing decoder-owned buffer memory.
+    static func pixelFingerprint(_ pixelBuffer: CVPixelBuffer) -> UInt64? {
+        let image = CIImage(cvPixelBuffer: pixelBuffer)
+        let extent = image.extent
+        guard extent.width.isFinite, extent.height.isFinite,
+              extent.width > 0, extent.height > 0 else { return nil }
+
+        let sampleSize = CGFloat(pixelFingerprintSize)
+        let sampleBounds = CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize)
+        let normalized = image.transformed(by: CGAffineTransform(
+            translationX: -extent.minX,
+            y: -extent.minY
+        ))
+        let sampledImage = normalized
+            .transformed(by: CGAffineTransform(
+                scaleX: sampleSize / extent.width,
+                y: sampleSize / extent.height
+            ))
+            .cropped(to: sampleBounds)
+
+        let bytesPerRow = pixelFingerprintSize * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * pixelFingerprintSize)
+        let rendered = pixels.withUnsafeMutableBytes { storage -> Bool in
+            guard let destination = storage.baseAddress else { return false }
+            pixelFingerprintContext.render(
+                sampledImage,
+                toBitmap: destination,
+                rowBytes: bytesPerRow,
+                bounds: sampleBounds,
+                format: .RGBA8,
+                colorSpace: pixelFingerprintColorSpace
+            )
+            return true
         }
-        return hash
+        guard rendered else { return nil }
+        return pixels.reduce(UInt64(1_469_598_103_934_665_603)) {
+            ($0 ^ UInt64($1)) &* 1_099_511_628_211
+        }
     }
 
     private static func pixelFingerprint(_ image: NSImage) -> UInt64? {
