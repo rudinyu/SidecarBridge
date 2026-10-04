@@ -1,5 +1,6 @@
 .DS_Store
 .build/
+/SidecarBridgeFork.xcodeproj/
 .derived*/
 .signed-*/
 DerivedData/

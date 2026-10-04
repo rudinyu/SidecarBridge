@@ -30,6 +30,6 @@
 		<string>_sb-direct._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>SidecarBridge advertises an encrypted local display service and accepts connections from the Viewer app you choose.</string>
+	<string>SidecarBridge advertises an encrypted local display service and accepts an incoming connection from the iPhone or iPad you select.</string>
 </dict>
 </plist>

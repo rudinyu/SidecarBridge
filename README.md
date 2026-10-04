@@ -23,6 +23,20 @@ The new standalone **SidecarBridge Viewer** app connects to a Mac running the ex
 
 The existing SidecarBridge macOS and iPad apps remain the original product and targets. The repository root now has a separate `MacViewer/` folder for the standalone Viewer app, built by the additional `SidecarBridgeViewerMac` target; it does not replace or rename the existing apps. The Viewer has its own bundle identifier and local app data, so saved Viewer pairings may need to be created once in the new app. Build it with the `SidecarBridgeViewerMac` scheme; the existing `SidecarBridgeMac` and `SidecarBridgePad` schemes continue to build the original apps.
 
+The author-owned `project.yml` and `SidecarBridge.xcodeproj` stay at their
+upstream baseline. Fork builds use the additive `project.fork.yml` overlay and
+the generated `SidecarBridgeFork.xcodeproj`; regenerate it before opening or
+building the fork project:
+
+```sh
+./scripts/generate-fork-project.sh
+open SidecarBridgeFork.xcodeproj
+```
+
+The macOS Host and Viewer schemes preserve the current app names and bundle
+identifiers. CI and release builds generate this fork project first and build
+only the macOS apps.
+
 Text composition uses the Viewer Mac's active macOS input method; only committed
 text is sent to the remote Mac. The Magic Keyboard 中/英 key toggles the remote
 Mac's Chinese/English input source, and Control-Space cycles its input sources.
@@ -53,7 +67,8 @@ chrome must not replace the video/input views or restart the connection.
 Run just these suites from the repository root:
 
 ```sh
-xcodebuild -project SidecarBridge.xcodeproj -scheme SidecarBridgeMac \
+./scripts/generate-fork-project.sh
+xcodebuild -project SidecarBridgeFork.xcodeproj -scheme SidecarBridgeMac \
   -configuration Debug -destination 'platform=macOS' \
   -derivedDataPath .build/ViewerTests CODE_SIGNING_ALLOWED=NO \
   -only-testing:SidecarBridgeTests/MacViewerConnectionTests \
@@ -79,16 +94,19 @@ geometry and windowed size restoration, and saves screenshots in the xcresult.
 It does not override `toggleFullScreen` or post completion notifications.
 
 ```sh
+./scripts/generate-fork-project.sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-xcodebuild -project SidecarBridge.xcodeproj -scheme SidecarBridgeViewerUI \
+xcodebuild -project SidecarBridgeFork.xcodeproj -scheme SidecarBridgeViewerUI \
   -configuration Debug -destination 'platform=macOS' \
   -derivedDataPath .build/ViewerUITests -parallel-testing-enabled NO \
   CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= test
 ```
 
-This is an interactive desktop test: it requires an unlocked graphical session
-and XCTest UI automation access, launches/terminates the local test app, and
-temporarily switches Spaces. Do not run it during an active remote session.
+Before a local run, complete the `macos-ui-test-preflight` check and continue
+only when it reports ready. This is an interactive desktop test: it requires an
+unlocked graphical session and XCTest UI automation access, launches/terminates
+the local test app, and temporarily switches Spaces. Do not run it during an
+active remote session.
 It never presses Connect, grants permissions, or runs the iPad target. Its local
 ad-hoc signature is for testing only, not Developer ID distribution.
 
@@ -160,12 +178,11 @@ Both endpoints must support the same secure protocol; matching build numbers are
 
 ## Build and install
 
-Requirements: Xcode 16 or newer, XcodeGen, macOS 14+, and iOS/iPadOS 17+.
+Requirements: Xcode 16 or newer, XcodeGen 2.46.0, macOS 14+, and iOS/iPadOS 17+.
 
 ```sh
-./scripts/build.sh
-/Volumes/D/Xcode.app/Contents/MacOS/Xcode \
-  /Volumes/D/github/sidecarbridge/SidecarBridge.xcodeproj
+./scripts/generate-fork-project.sh
+open SidecarBridgeFork.xcodeproj
 ```
 
 In Xcode:

@@ -111,15 +111,6 @@ PY
   NOTARY_AUTH_MODE="api-key"
 fi
 
-BUILD_NUMBER=$(awk -F '"' '/^[[:space:]]*CURRENT_PROJECT_VERSION:/ { print $2; exit }' project.yml)
-MARKETING_VERSION=$(awk -F '"' '/^[[:space:]]*MARKETING_VERSION:/ { print $2; exit }' project.yml)
-if [[ ! "$BUILD_NUMBER" =~ ^[0-9]+$ || -z "$MARKETING_VERSION" ]]; then
-  echo "Could not read MARKETING_VERSION/CURRENT_PROJECT_VERSION from project.yml" >&2
-  exit 2
-fi
-
-RELEASE_ROOT="$ROOT/.build/Release$BUILD_NUMBER"
-
 DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 if [[ ! -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]]; then
   DEVELOPER_DIR=$(xcode-select -p 2>/dev/null || true)
@@ -129,6 +120,71 @@ if [[ -z "$DEVELOPER_DIR" || ! -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]]; then
   exit 2
 fi
 export DEVELOPER_DIR
+
+"$ROOT/scripts/generate-fork-project.sh"
+PROJECT_FILE="$ROOT/SidecarBridgeFork.xcodeproj"
+
+build_settings_for_target() {
+  local target_name="$1"
+  local scheme_name="$2"
+  local scheme_settings
+  scheme_settings=$(xcodebuild \
+    -project "$PROJECT_FILE" \
+    -scheme "$scheme_name" \
+    -configuration Release \
+    -destination 'generic/platform=macOS' \
+    -derivedDataPath "$ROOT/.build/ReleaseMetadata" \
+    -showBuildSettings \
+    -json)
+  python3 -c '
+import json, sys
+target = sys.argv[1]
+settings = json.loads(sys.stdin.read())
+matches = [entry["buildSettings"] for entry in settings if entry.get("target") == target]
+if len(matches) != 1:
+    raise SystemExit(f"Expected exactly one {target} target in xcodebuild settings, found {len(matches)}")
+print(json.dumps(matches[0]))
+' "$target_name" <<< "$scheme_settings"
+}
+
+read_build_setting() {
+  python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get(sys.argv[2], ""))' "$1" "$2"
+}
+
+resolve_project_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$ROOT" "$1" ;;
+  esac
+}
+
+HOST_SETTINGS=$(build_settings_for_target SidecarBridgeMac SidecarBridgeMac)
+VIEWER_SETTINGS=$(build_settings_for_target SidecarBridgeViewerMac SidecarBridgeViewerMac)
+MARKETING_VERSION=$(read_build_setting "$HOST_SETTINGS" MARKETING_VERSION)
+BUILD_NUMBER=$(read_build_setting "$HOST_SETTINGS" CURRENT_PROJECT_VERSION)
+HOST_PRODUCT_NAME=$(read_build_setting "$HOST_SETTINGS" PRODUCT_NAME)
+HOST_BUNDLE_ID=$(read_build_setting "$HOST_SETTINGS" PRODUCT_BUNDLE_IDENTIFIER)
+HOST_ENTITLEMENTS=$(resolve_project_path "$(read_build_setting "$HOST_SETTINGS" CODE_SIGN_ENTITLEMENTS)")
+VIEWER_PRODUCT_NAME=$(read_build_setting "$VIEWER_SETTINGS" PRODUCT_NAME)
+VIEWER_BUNDLE_ID=$(read_build_setting "$VIEWER_SETTINGS" PRODUCT_BUNDLE_IDENTIFIER)
+VIEWER_ENTITLEMENTS=$(resolve_project_path "$(read_build_setting "$VIEWER_SETTINGS" CODE_SIGN_ENTITLEMENTS)")
+VIEWER_MARKETING_VERSION=$(read_build_setting "$VIEWER_SETTINGS" MARKETING_VERSION)
+VIEWER_BUILD_NUMBER=$(read_build_setting "$VIEWER_SETTINGS" CURRENT_PROJECT_VERSION)
+if [[ ! "$BUILD_NUMBER" =~ ^[0-9]+$ || -z "$MARKETING_VERSION" || \
+      -z "$HOST_PRODUCT_NAME" || -z "$HOST_BUNDLE_ID" || \
+      -z "$VIEWER_PRODUCT_NAME" || -z "$VIEWER_BUNDLE_ID" || \
+      "$VIEWER_MARKETING_VERSION" != "$MARKETING_VERSION" || \
+      "$VIEWER_BUILD_NUMBER" != "$BUILD_NUMBER" || \
+      ! -f "$HOST_ENTITLEMENTS" || ! -f "$VIEWER_ENTITLEMENTS" ]]; then
+  echo "Could not read matching app metadata and entitlements from the generated fork project." >&2
+  exit 2
+fi
+
+HOST_APP_NAME="$HOST_PRODUCT_NAME.app"
+VIEWER_APP_NAME="$VIEWER_PRODUCT_NAME.app"
+HOST_ARTIFACT_STEM="${HOST_PRODUCT_NAME// /-}-$MARKETING_VERSION-$BUILD_NUMBER-macOS"
+VIEWER_ARTIFACT_STEM="${VIEWER_PRODUCT_NAME// /-}-$MARKETING_VERSION-$BUILD_NUMBER-macOS"
+RELEASE_ROOT="$ROOT/.build/Release$BUILD_NUMBER"
 
 SIGNING_IDENTITY="${SIDECARBRIDGE_SIGNING_IDENTITY:-}"
 if [[ -z "$SIGNING_IDENTITY" ]]; then
@@ -157,24 +213,19 @@ HOST_DERIVED="$RELEASE_ROOT/HostDerivedData"
 VIEWER_DERIVED="$RELEASE_ROOT/ViewerDerivedData"
 TEST_DERIVED="$RELEASE_ROOT/TestDerivedData"
 VIEWER_UI_TEST_DERIVED="$RELEASE_ROOT/ViewerUITestDerivedData"
-HOST_APP="$HOST_DERIVED/Build/Products/Release/SidecarBridge.app"
-VIEWER_APP="$VIEWER_DERIVED/Build/Products/Release/SidecarBridge Viewer.app"
+HOST_APP="$HOST_DERIVED/Build/Products/Release/$HOST_APP_NAME"
+VIEWER_APP="$VIEWER_DERIVED/Build/Products/Release/$VIEWER_APP_NAME"
 HOST_TEST_RESULT="$RELEASE_ROOT/SidecarBridgeHostTests.xcresult"
 VIEWER_UI_RESULT="$RELEASE_ROOT/SidecarBridgeViewerUITests.xcresult"
 UPLOAD_DIR="$RELEASE_ROOT/notary-upload"
 SIGNED_DIR="$RELEASE_ROOT/signed"
 FINAL_DIR="$RELEASE_ROOT/notarized"
-if command -v xcodegen >/dev/null 2>&1; then
-  xcodegen generate
-else
-  echo "xcodegen is unavailable; building the checked-in SidecarBridge.xcodeproj"
-fi
 
 mkdir -p "$UPLOAD_DIR"
 
 rm -rf -- "$HOST_TEST_RESULT" "$VIEWER_UI_RESULT"
 xcodebuild -quiet \
-  -project SidecarBridge.xcodeproj \
+  -project "$PROJECT_FILE" \
   -scheme SidecarBridgeMac \
   -configuration Debug \
   -destination 'platform=macOS' \
@@ -188,7 +239,7 @@ VIEWER_UI_STATUS="passed"
 VIEWER_UI_SKIP_REASON=""
 if (( ! SKIP_VIEWER_UI_TESTS )); then
   xcodebuild -quiet \
-    -project SidecarBridge.xcodeproj \
+    -project "$PROJECT_FILE" \
     -scheme SidecarBridgeViewerUI \
     -configuration Debug \
     -destination 'platform=macOS' \
@@ -208,7 +259,7 @@ fi
 TEST_STATUS="passed"
 
 xcodebuild -quiet \
-  -project SidecarBridge.xcodeproj \
+  -project "$PROJECT_FILE" \
   -scheme SidecarBridgeMac \
   -configuration Release \
   -destination 'generic/platform=macOS' \
@@ -217,7 +268,7 @@ xcodebuild -quiet \
   build
 
 xcodebuild -quiet \
-  -project SidecarBridge.xcodeproj \
+  -project "$PROJECT_FILE" \
   -scheme SidecarBridgeViewerMac \
   -configuration Release \
   -destination 'generic/platform=macOS' \
@@ -226,18 +277,18 @@ xcodebuild -quiet \
   build
 
 codesign --force --timestamp --options runtime --generate-entitlement-der \
-  --entitlements Mac/SidecarBridgeMac.entitlements \
+  --entitlements "$HOST_ENTITLEMENTS" \
   --sign "$SIGNING_IDENTITY" "$HOST_APP"
 codesign --force --timestamp --options runtime --generate-entitlement-der \
-  --entitlements MacViewer/SidecarBridgeViewer.entitlements \
+  --entitlements "$VIEWER_ENTITLEMENTS" \
   --sign "$SIGNING_IDENTITY" "$VIEWER_APP"
 
 for app in "$HOST_APP" "$VIEWER_APP"; do
   codesign --verify --deep --strict --verbose=2 "$app"
 done
 
-HOST_ZIP="$UPLOAD_DIR/SidecarBridge-$MARKETING_VERSION-$BUILD_NUMBER-macOS.zip"
-VIEWER_ZIP="$UPLOAD_DIR/SidecarBridge-Viewer-$MARKETING_VERSION-$BUILD_NUMBER-macOS.zip"
+HOST_ZIP="$UPLOAD_DIR/$HOST_ARTIFACT_STEM.zip"
+VIEWER_ZIP="$UPLOAD_DIR/$VIEWER_ARTIFACT_STEM.zip"
 ditto -c -k --sequesterRsrc --keepParent "$HOST_APP" "$HOST_ZIP"
 ditto -c -k --sequesterRsrc --keepParent "$VIEWER_APP" "$VIEWER_ZIP"
 
@@ -264,13 +315,15 @@ validate_zip() {
 }
 
 rm -rf -- "$RELEASE_ROOT/VerifySigned"
-validate_zip "$HOST_ZIP" "SidecarBridge.app" "io.sidecarbridge.mac" "$RELEASE_ROOT/VerifySigned/Host"
-validate_zip "$VIEWER_ZIP" "SidecarBridge Viewer.app" "io.sidecarbridge.viewer.mac" "$RELEASE_ROOT/VerifySigned/Viewer"
+validate_zip "$HOST_ZIP" "$HOST_APP_NAME" "$HOST_BUNDLE_ID" "$RELEASE_ROOT/VerifySigned/Host"
+validate_zip "$VIEWER_ZIP" "$VIEWER_APP_NAME" "$VIEWER_BUNDLE_ID" "$RELEASE_ROOT/VerifySigned/Viewer"
 
 if (( ! NOTARIZE )); then
   mkdir -p "$SIGNED_DIR"
-  cp "$HOST_ZIP" "$SIGNED_DIR/SidecarBridge-$MARKETING_VERSION-$BUILD_NUMBER-macOS-Signed.zip"
-  cp "$VIEWER_ZIP" "$SIGNED_DIR/SidecarBridge-Viewer-$MARKETING_VERSION-$BUILD_NUMBER-macOS-Signed.zip"
+  HOST_ARTIFACT="$SIGNED_DIR/$HOST_ARTIFACT_STEM-Signed.zip"
+  VIEWER_ARTIFACT="$SIGNED_DIR/$VIEWER_ARTIFACT_STEM-Signed.zip"
+  cp "$HOST_ZIP" "$HOST_ARTIFACT"
+  cp "$VIEWER_ZIP" "$VIEWER_ARTIFACT"
   ARTIFACT_DIR="$SIGNED_DIR"
   ARTIFACT_STATUS="signed"
   HOST_NOTARY_ID=""
@@ -307,26 +360,24 @@ else
     xcrun stapler validate -q "$app"
     spctl --assess --type execute --verbose=4 "$app"
   done
+  HOST_ARTIFACT="$FINAL_DIR/$HOST_ARTIFACT_STEM-Notarized.zip"
+  VIEWER_ARTIFACT="$FINAL_DIR/$VIEWER_ARTIFACT_STEM-Notarized.zip"
   ditto -c -k --sequesterRsrc --keepParent "$HOST_APP" \
-    "$FINAL_DIR/SidecarBridge-$MARKETING_VERSION-$BUILD_NUMBER-macOS-Notarized.zip"
+    "$HOST_ARTIFACT"
   ditto -c -k --sequesterRsrc --keepParent "$VIEWER_APP" \
-    "$FINAL_DIR/SidecarBridge-Viewer-$MARKETING_VERSION-$BUILD_NUMBER-macOS-Notarized.zip"
+    "$VIEWER_ARTIFACT"
   ARTIFACT_DIR="$FINAL_DIR"
   ARTIFACT_STATUS="notarized-and-stapled"
   rm -rf -- "$RELEASE_ROOT/VerifyNotarized"
-  validate_zip "$FINAL_DIR/SidecarBridge-$MARKETING_VERSION-$BUILD_NUMBER-macOS-Notarized.zip" \
-    "SidecarBridge.app" "io.sidecarbridge.mac" "$RELEASE_ROOT/VerifyNotarized/Host"
-  validate_zip "$FINAL_DIR/SidecarBridge-Viewer-$MARKETING_VERSION-$BUILD_NUMBER-macOS-Notarized.zip" \
-    "SidecarBridge Viewer.app" "io.sidecarbridge.viewer.mac" "$RELEASE_ROOT/VerifyNotarized/Viewer"
-  xcrun stapler validate -q "$RELEASE_ROOT/VerifyNotarized/Host/SidecarBridge.app"
-  xcrun stapler validate -q "$RELEASE_ROOT/VerifyNotarized/Viewer/SidecarBridge Viewer.app"
-  spctl --assess --type execute --verbose=4 "$RELEASE_ROOT/VerifyNotarized/Host/SidecarBridge.app"
-  spctl --assess --type execute --verbose=4 "$RELEASE_ROOT/VerifyNotarized/Viewer/SidecarBridge Viewer.app"
+  validate_zip "$HOST_ARTIFACT" "$HOST_APP_NAME" "$HOST_BUNDLE_ID" "$RELEASE_ROOT/VerifyNotarized/Host"
+  validate_zip "$VIEWER_ARTIFACT" "$VIEWER_APP_NAME" "$VIEWER_BUNDLE_ID" "$RELEASE_ROOT/VerifyNotarized/Viewer"
+  xcrun stapler validate -q "$RELEASE_ROOT/VerifyNotarized/Host/$HOST_APP_NAME"
+  xcrun stapler validate -q "$RELEASE_ROOT/VerifyNotarized/Viewer/$VIEWER_APP_NAME"
+  spctl --assess --type execute --verbose=4 "$RELEASE_ROOT/VerifyNotarized/Host/$HOST_APP_NAME"
+  spctl --assess --type execute --verbose=4 "$RELEASE_ROOT/VerifyNotarized/Viewer/$VIEWER_APP_NAME"
 fi
 
 PROJECT_REVISION=$(git rev-parse HEAD)
-HOST_ARTIFACT=$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name 'SidecarBridge-*.zip' -print | sort | head -n 1)
-VIEWER_ARTIFACT=$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name 'SidecarBridge-Viewer-*.zip' -print | sort | head -n 1)
 HOST_SHA=$(shasum -a 256 "$HOST_ARTIFACT" | awk '{print $1}')
 VIEWER_SHA=$(shasum -a 256 "$VIEWER_ARTIFACT" | awk '{print $1}')
 PROVENANCE="$RELEASE_ROOT/provenance.json"

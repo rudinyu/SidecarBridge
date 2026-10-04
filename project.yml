@@ -8,8 +8,9 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "1.4"
-    # macOS build 122 minimizes the Host window after the Viewer displays an image.
-    CURRENT_PROJECT_VERSION: "122"
+    # macOS builds must increase across marketing versions. App Store Connect
+    # rejected 1.4 (1) because previous Mac builds are higher; continue at 106.
+    CURRENT_PROJECT_VERSION: "106"
     DEVELOPMENT_TEAM: LYK4LV2859
 targets:
   SidecarBridgeMac:
@@ -18,9 +19,6 @@ targets:
     sources:
       - Shared
       - Mac
-      - Pad/PadDeviceIdentity.swift
-      - Pad/PadLANService.swift
-      - Pad/PadPeerService.swift
     info:
       path: Mac/Info.plist
       properties:
@@ -32,7 +30,7 @@ targets:
         NSBonjourServices:
           - _sb-screen._tcp
           - _sb-direct._tcp
-        NSLocalNetworkUsageDescription: SidecarBridge advertises an encrypted local display service and accepts connections from the Viewer app you choose.
+        NSLocalNetworkUsageDescription: SidecarBridge advertises an encrypted local display service and accepts an incoming connection from the iPhone or iPad you select.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.sidecarbridge.mac
@@ -56,59 +54,6 @@ targets:
       - sdk: LocalAuthentication.framework
       - sdk: Security.framework
       - sdk: Carbon.framework
-
-  SidecarBridgeViewerMac:
-    type: application
-    platform: macOS
-    sources:
-      - Shared
-      - Mac/Assets.xcassets
-      - MacViewer/MacViewerConnectionModel.swift
-      - MacViewer/MacViewerInputModeManager.swift
-      - MacViewer/MacViewerInputSurface.swift
-      - MacViewer/MacViewerPresentation.swift
-      - MacViewer/MacViewerVideoDisplay.swift
-      - MacViewer/MacViewerView.swift
-      - Mac/RemoteInputSourceController.swift
-      - MacViewer/SidecarBridgeViewerMacApp.swift
-      - Mac/PrivacyInfo.xcprivacy
-      - Pad/PadDeviceIdentity.swift
-      - Pad/PadLANService.swift
-      - Pad/PadPeerService.swift
-    info:
-      path: MacViewer/ViewerInfo.plist
-      properties:
-        CFBundleDisplayName: SidecarBridge Viewer
-        CFBundleShortVersionString: $(MARKETING_VERSION)
-        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-        ITSAppUsesNonExemptEncryption: false
-        LSApplicationCategoryType: public.app-category.utilities
-        NSBonjourServices:
-          - _sb-screen._tcp
-          - _sb-direct._tcp
-        NSLocalNetworkUsageDescription: SidecarBridge Viewer discovers selected Macs on your local network and connects to them over an encrypted link.
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: io.sidecarbridge.viewer.mac
-        PRODUCT_NAME: SidecarBridge Viewer
-        CODE_SIGN_STYLE: Automatic
-        CODE_SIGN_ENTITLEMENTS: MacViewer/SidecarBridgeViewer.entitlements
-        ENABLE_APP_SANDBOX: YES
-        ENABLE_HARDENED_RUNTIME: YES
-        DEAD_CODE_STRIPPING: YES
-        COPY_PHASE_STRIP: YES
-        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        ENABLE_DEBUG_DYLIB: NO
-      configs:
-        Debug:
-          PRODUCT_BUNDLE_IDENTIFIER: io.sidecarbridge.viewer.mac.debug
-    dependencies:
-      - sdk: AVFoundation.framework
-      - sdk: Carbon.framework
-      - sdk: MultipeerConnectivity.framework
-      - sdk: Network.framework
-      - sdk: Security.framework
-      - sdk: VideoToolbox.framework
 
   SidecarBridgePad:
     type: application
@@ -186,14 +131,6 @@ targets:
       - Mac/PairingQRCodeView.swift
       - Mac/MacPairingCard.swift
       - Mac/MacDeviceAuthorization.swift
-      - MacViewer/MacViewerConnectionModel.swift
-      - MacViewer/MacViewerInputSurface.swift
-      - MacViewer/MacViewerVideoDisplay.swift
-      - MacViewer/MacViewerPresentation.swift
-      - MacViewer/MacViewerView.swift
-      - Pad/PadDeviceIdentity.swift
-      - Pad/PadLANService.swift
-      - Pad/PadPeerService.swift
       - Pad/RemoteKeyboardToolbar.swift
     settings:
       base:
@@ -202,35 +139,7 @@ targets:
     dependencies:
       - sdk: Security.framework
 
-  SidecarBridgeUITests:
-    type: bundle.ui-testing
-    platform: macOS
-    sources:
-      - UITests
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: io.sidecarbridge.uitests
-        GENERATE_INFOPLIST_FILE: YES
-        TEST_TARGET_NAME: SidecarBridgeViewerMac
-    dependencies:
-      - target: SidecarBridgeViewerMac
-
 schemes:
-  SidecarBridgeViewerUI:
-    build:
-      targets:
-        SidecarBridgeViewerMac: all
-        SidecarBridgeUITests: [test]
-    test:
-      config: Debug
-      targets:
-        - SidecarBridgeUITests
-  SidecarBridgeViewerMac:
-    build:
-      targets:
-        SidecarBridgeViewerMac: all
-    run:
-      config: Debug
   SidecarBridgeMac:
     build:
       targets:
