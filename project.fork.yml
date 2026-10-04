@@ -6,7 +6,7 @@ name: SidecarBridgeFork
 settings:
   base:
     MARKETING_VERSION: "1.5"
-    CURRENT_PROJECT_VERSION: "123"
+    CURRENT_PROJECT_VERSION: "124"
 
 targets:
   SidecarBridgeMac:
@@ -15,10 +15,12 @@ targets:
       - path: Mac
         excludes:
           - Info.plist
+          - Assets.xcassets
       - Pad/PadDeviceIdentity.swift
       - Pad/PadLANService.swift
       - Pad/PadPeerService.swift
       - Fork/Runtime
+      - Fork/Resources/ScreenDockAssets.xcassets
       - path: Fork/Host
         optional: true
     info:REPLACE:
@@ -39,8 +41,9 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.screendock.host
         PRODUCT_NAME: ScreenDock Host
+        ASSETCATALOG_COMPILER_APPICON_NAME: ScreenDockAppIcon
         MARKETING_VERSION: "1.5"
-        CURRENT_PROJECT_VERSION: "123"
+        CURRENT_PROJECT_VERSION: "124"
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SIDECARBRIDGE_FORK"
       configs:
         Debug:
@@ -70,7 +73,7 @@ targets:
     platform: macOS
     sources:
       - Shared
-      - Mac/Assets.xcassets
+      - Fork/Resources/ScreenDockAssets.xcassets
       - MacViewer/MacViewerConnectionModel.swift
       - MacViewer/MacViewerInputModeManager.swift
       - MacViewer/MacViewerInputSurface.swift
@@ -101,7 +104,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.screendock.viewer
         PRODUCT_NAME: ScreenDock Viewer
         MARKETING_VERSION: "1.5"
-        CURRENT_PROJECT_VERSION: "123"
+        CURRENT_PROJECT_VERSION: "124"
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SIDECARBRIDGE_FORK"
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_ENTITLEMENTS: MacViewer/SidecarBridgeViewer.entitlements
@@ -109,7 +112,7 @@ targets:
         ENABLE_HARDENED_RUNTIME: YES
         DEAD_CODE_STRIPPING: YES
         COPY_PHASE_STRIP: YES
-        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_APPICON_NAME: ScreenDockAppIcon
         ENABLE_DEBUG_DYLIB: NO
       configs:
         Debug:

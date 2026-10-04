@@ -1,5 +1,19 @@
 import SwiftUI
 
+private enum MacPairingCardPalette {
+#if SIDECARBRIDGE_FORK
+    static let accent = ScreenDockPalette.blue
+    static let warmAccent = ScreenDockPalette.warmAccent
+    static let cardFill = ScreenDockPalette.blue.opacity(0.07)
+    static let cardBorder = ScreenDockPalette.violet.opacity(0.32)
+#else
+    static let accent = Color.cyan
+    static let warmAccent = Color.cyan
+    static let cardFill = Color.cyan.opacity(0.065)
+    static let cardBorder = Color.cyan.opacity(0.25)
+#endif
+}
+
 struct MacPairingCard: View {
     let invitation: PairingInvitation
     var enlarged = false
@@ -18,7 +32,7 @@ struct MacPairingCard: View {
                 }
                 Spacer()
                 Label("Private pairing", systemImage: "lock.shield")
-                    .font(.caption).foregroundStyle(.cyan)
+                    .font(.caption).foregroundStyle(MacPairingCardPalette.warmAccent)
             }
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .center, spacing: 28) {
@@ -33,7 +47,7 @@ struct MacPairingCard: View {
             }
             Divider().overlay(.white.opacity(0.08))
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "checkmark.shield").foregroundStyle(.cyan)
+                Image(systemName: "checkmark.shield").foregroundStyle(MacPairingCardPalette.accent)
                 Text("Pair once. Your trusted device is remembered. Scan from an iPad or iPhone, or enter this code in \(viewerAppName) on another Mac.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -48,8 +62,8 @@ struct MacPairingCard: View {
             }.font(.caption)
         }
         .padding(enlarged ? 30 : 24)
-        .background(.cyan.opacity(0.065), in: RoundedRectangle(cornerRadius: 22))
-        .overlay(RoundedRectangle(cornerRadius: 22).stroke(.cyan.opacity(0.25)))
+        .background(MacPairingCardPalette.cardFill, in: RoundedRectangle(cornerRadius: 22))
+        .overlay(RoundedRectangle(cornerRadius: 22).stroke(MacPairingCardPalette.cardBorder))
         .onChange(of: invitation.code) { _, _ in copied = false }
         .task(id: copied) {
             guard copied else { return }
@@ -86,7 +100,7 @@ struct MacPairingCard: View {
                 Label(copied ? "Code copied" : "Copy Code", systemImage: copied ? "checkmark" : "doc.on.doc")
                     .frame(minWidth: 130)
             }
-            .buttonStyle(.borderedProminent).tint(.cyan).controlSize(.large)
+            .buttonStyle(.borderedProminent).tint(MacPairingCardPalette.accent).controlSize(.large)
             .accessibilityHint("Copies all 16 digits with dashes for manual pairing.")
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 let seconds = max(0, Int(invitation.expiresAt.timeIntervalSince(context.date)))

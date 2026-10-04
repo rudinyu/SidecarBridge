@@ -2,6 +2,26 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+private enum MacContentPalette {
+#if SIDECARBRIDGE_FORK
+    static let backgroundTop = ScreenDockPalette.backgroundTop
+    static let backgroundBottom = ScreenDockPalette.backgroundBottom
+    static let glow = ScreenDockPalette.blue.opacity(0.13)
+    static let accent = ScreenDockPalette.blue
+    static let violet = ScreenDockPalette.violet
+    static let panel = ScreenDockPalette.panel
+    static let border = ScreenDockPalette.border
+#else
+    static let backgroundTop = Color(red: 0.025, green: 0.04, blue: 0.14)
+    static let backgroundBottom = Color(red: 0.06, green: 0.08, blue: 0.24)
+    static let glow = Color.cyan.opacity(0.12)
+    static let accent = Color.cyan
+    static let violet = Color.purple
+    static let panel = Color.white.opacity(0.045)
+    static let border = Color.white.opacity(0.07)
+#endif
+}
+
 struct MacContentView: View {
     @ObservedObject var model: MacConnectionModel
     @Environment(\.openWindow) private var openWindow
@@ -14,21 +34,21 @@ struct MacContentView: View {
     private var statusColor: Color {
         if model.isStreaming { return .green }
         if model.localNetworkPermissionNeeded { return .orange }
-        if model.hasPadPeer { return .cyan }
+        if model.hasPadPeer { return MacContentPalette.accent }
         return .indigo
     }
 
     var body: some View {
         ZStack {
             LinearGradient(
-                colors: [Color(red: 0.025, green: 0.04, blue: 0.14), Color(red: 0.06, green: 0.08, blue: 0.24)],
+                colors: [MacContentPalette.backgroundTop, MacContentPalette.backgroundBottom],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
             .ignoresSafeArea()
 
             RadialGradient(
-                colors: [.cyan.opacity(0.12), .clear],
+                colors: [MacContentPalette.glow, .clear],
                 center: .topTrailing,
                 startRadius: 10,
                 endRadius: 520
@@ -65,6 +85,7 @@ struct MacContentView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .tint(MacContentPalette.accent)
 #if SIDECARBRIDGE_FORK
         .modifier(ScreenDockHostWindowBehaviorModifier(behavior: model.screenDockHostWindowBehavior))
 #else
@@ -103,15 +124,15 @@ struct MacContentView: View {
                     Label(item, systemImage: item == "Connect" ? "link" : item == "Display" ? "display" : item == "Transfers" ? "folder" : "slider.horizontal.3")
                         .font(.callout.weight(.semibold))
                         .frame(maxWidth: .infinity, minHeight: 42)
-                        .background(section == item ? Color.cyan.opacity(0.18) : .clear, in: RoundedRectangle(cornerRadius: 10))
-                        .foregroundStyle(section == item ? .cyan : .white.opacity(0.72))
+                        .background(section == item ? MacContentPalette.accent.opacity(0.18) : .clear, in: RoundedRectangle(cornerRadius: 10))
+                        .foregroundStyle(section == item ? MacContentPalette.accent : .white.opacity(0.72))
                 }
                 .buttonStyle(.plain)
                 .accessibilityAddTraits(section == item ? .isSelected : [])
             }
         }
         .padding(6)
-        .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 16))
+        .background(MacContentPalette.panel, in: RoundedRectangle(cornerRadius: 16))
     }
 
     private var header: some View {
@@ -193,7 +214,7 @@ struct MacContentView: View {
                 } else if model.hasPadPeer {
                     Button("Start In-App Display") { model.startFallback() }
                         .buttonStyle(.borderedProminent)
-                        .tint(.cyan)
+                        .tint(MacContentPalette.accent)
                 } else {
                     Text("Connect from an iPad or iPhone app, or from \(MacProductBrand.viewerAppName) on another Mac")
                         .font(.caption)
@@ -226,7 +247,7 @@ struct MacContentView: View {
                     title: "Inbound route",
                     value: model.hasPadPeer ? "Connected" : (model.incomingListenerReady ? "Listening" : "Starting"),
                     detail: model.hasPadPeer ? model.connectionTransport : model.incomingListenerDetail,
-                    tint: model.hasPadPeer ? .green : .cyan
+                    tint: model.hasPadPeer ? .green : MacContentPalette.accent
                 )
                 DashboardMetric(
                     icon: "display",
@@ -235,7 +256,7 @@ struct MacContentView: View {
                     detail: model.isStreaming
                         ? "\(model.streamPreferences.resolution.title) • \(model.streamPreferences.frameRate.rawValue) FPS target"
                         : "Start when the viewer is ready",
-                    tint: model.isStreaming ? .green : .purple
+                    tint: model.isStreaming ? .green : MacContentPalette.violet
                 )
                 DashboardMetric(
                     icon: "keyboard",
@@ -253,13 +274,13 @@ struct MacContentView: View {
                         : (model.incomingListenerReady
                             ? "No Viewer is connected. Keep this Host app open to accept a Viewer connection."
                             : model.incomingListenerDetail),
-                    tint: model.connectionLatencyMS == nil ? .white.opacity(0.55) : .cyan
+                    tint: model.connectionLatencyMS == nil ? .white.opacity(0.55) : MacContentPalette.accent
                 )
             }
         }
         .padding(16)
-        .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.07)))
+        .background(MacContentPalette.panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(MacContentPalette.border))
     }
 
     private var quickActionsCard: some View {
@@ -284,8 +305,8 @@ struct MacContentView: View {
             }
         }
         .padding(14)
-        .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.07)))
+        .background(MacContentPalette.panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(MacContentPalette.border))
     }
 
     @ViewBuilder
@@ -303,7 +324,7 @@ struct MacContentView: View {
             )
         }
         .buttonStyle(.borderedProminent)
-        .tint(model.isStreaming ? .orange : .cyan)
+        .tint(model.isStreaming ? .orange : MacContentPalette.accent)
         .disabled(!model.hasPadPeer && !model.isStreaming)
         .keyboardShortcut("s", modifiers: [.command, .option])
 
@@ -350,7 +371,7 @@ struct MacContentView: View {
             title: "In-App Display",
             subtitle: "Recommended",
             description: inAppDisplayDescription,
-            tint: .cyan,
+            tint: MacContentPalette.accent,
             buttonTitle: model.isStreaming ? "Streaming" : "Start App Stream",
             isPrimary: true,
             isDisabled: !model.hasPadPeer || model.isStreaming,
@@ -362,7 +383,7 @@ struct MacContentView: View {
             title: systemDisplayTitle,
             subtitle: "Apple's separate display",
             description: systemDisplayDescription,
-            tint: .purple,
+            tint: MacContentPalette.violet,
             buttonTitle: "Set Up Apple Sidecar",
             isPrimary: false,
             isDisabled: false,
@@ -382,14 +403,14 @@ struct MacContentView: View {
                     .buttonStyle(.borderedProminent)
                 if model.isStreaming {
                     Label("The encrypted app stream is still running", systemImage: "lock.shield")
-                        .font(.caption).foregroundStyle(.cyan)
+                        .font(.caption).foregroundStyle(MacContentPalette.accent)
                 }
             }
             .padding(.top, 16)
         }
         .padding(20)
-        .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.07)))
+        .background(MacContentPalette.panel, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(MacContentPalette.border))
     }
 
     private var streamPerformanceCard: some View {
@@ -397,9 +418,9 @@ struct MacContentView: View {
             HStack(spacing: 12) {
                 Image(systemName: "gauge.with.needle")
                     .font(.system(size: 22, weight: .semibold))
-                    .foregroundStyle(.cyan)
+                    .foregroundStyle(MacContentPalette.accent)
                     .frame(width: 44, height: 44)
-                    .background(.cyan.opacity(0.13), in: RoundedRectangle(cornerRadius: 12))
+                    .background(MacContentPalette.accent.opacity(0.13), in: RoundedRectangle(cornerRadius: 12))
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Stream performance")
                         .font(.headline)
@@ -463,7 +484,7 @@ struct MacContentView: View {
 
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: "waveform.path.ecg")
-                    .foregroundStyle(.cyan)
+                    .foregroundStyle(MacContentPalette.accent)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Mac sender telemetry")
                         .font(.caption2.weight(.semibold))
@@ -476,8 +497,8 @@ struct MacContentView: View {
             }
         }
         .padding(17)
-        .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.07)))
+        .background(MacContentPalette.panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(MacContentPalette.border))
     }
 
     private var permissionCard: some View {
@@ -583,8 +604,8 @@ struct MacContentView: View {
                 }
             }
         }
-        .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.07)))
+        .background(MacContentPalette.panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(MacContentPalette.border))
     }
 
     private var inAppDisplayDescription: String {
@@ -604,9 +625,9 @@ struct MacContentView: View {
             HStack(spacing: 16) {
                 Image(systemName: "arrow.left.arrow.right.square.fill")
                     .font(.system(size: 26, weight: .semibold))
-                    .foregroundStyle(.cyan)
+                    .foregroundStyle(MacContentPalette.accent)
                     .frame(width: 52, height: 52)
-                    .background(.cyan.opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
+                    .background(MacContentPalette.accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
 
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Encrypted file transfer").font(.headline)
@@ -623,7 +644,7 @@ struct MacContentView: View {
                         }
                         .font(.caption2)
                         .foregroundStyle(.white.opacity(0.52))
-                        ProgressView(value: transfer.progress).tint(.cyan)
+                        ProgressView(value: transfer.progress).tint(MacContentPalette.accent)
                     } else if let error = model.fileTransferError {
                         Text(error).font(.caption).foregroundStyle(.orange)
                     } else {
@@ -641,7 +662,7 @@ struct MacContentView: View {
                     Label("Send Files…", systemImage: "paperplane.fill")
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(.cyan)
+                .tint(MacContentPalette.accent)
                 .disabled(!model.hasPadPeer)
 
                 Button {
@@ -663,8 +684,8 @@ struct MacContentView: View {
             }
         }
         .padding(17)
-        .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.07)))
+        .background(MacContentPalette.panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(MacContentPalette.border))
         .onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in
             model.acceptDroppedFiles(providers)
         }
@@ -675,9 +696,9 @@ struct MacContentView: View {
             HStack(spacing: 12) {
                 Image(systemName: "doc.on.clipboard.fill")
                     .font(.system(size: 22, weight: .semibold))
-                    .foregroundStyle(.purple)
+                    .foregroundStyle(MacContentPalette.violet)
                     .frame(width: 44, height: 44)
-                    .background(.purple.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
+                    .background(MacContentPalette.violet.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Clipboard transfer").font(.headline)
                     Text("Manual clipboard actions never interrupt live video. Automatic sync is optional and paused while streaming.")
@@ -697,7 +718,7 @@ struct MacContentView: View {
                         Label("Receive Clipboard", systemImage: "arrow.down.doc")
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(.purple)
+                    .tint(MacContentPalette.violet)
                     .disabled(!model.hasPadPeer)
 
                     Button {
@@ -715,8 +736,8 @@ struct MacContentView: View {
                 .foregroundStyle(.white.opacity(0.62))
         }
         .padding(17)
-        .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.07)))
+        .background(MacContentPalette.panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(MacContentPalette.border))
     }
 
     private var systemInformationCard: some View {
@@ -730,13 +751,13 @@ struct MacContentView: View {
                         title: "This Mac",
                         subtitle: "Local system",
                         information: model.localSystemInformation,
-                        tint: .cyan
+                        tint: MacContentPalette.accent
                     )
                     SystemInformationPanel(
                         title: "Connected device",
                         subtitle: model.hasPadPeer ? "Encrypted peer snapshot" : "Connect to retrieve",
                         information: model.remoteSystemInformation,
-                        tint: .purple
+                        tint: MacContentPalette.violet
                     )
                 }
                 VStack(spacing: 14) {
@@ -744,13 +765,13 @@ struct MacContentView: View {
                         title: "This Mac",
                         subtitle: "Local system",
                         information: model.localSystemInformation,
-                        tint: .cyan
+                        tint: MacContentPalette.accent
                     )
                     SystemInformationPanel(
                         title: "Connected device",
                         subtitle: model.hasPadPeer ? "Encrypted peer snapshot" : "Connect to retrieve",
                         information: model.remoteSystemInformation,
-                        tint: .purple
+                        tint: MacContentPalette.violet
                     )
                 }
             }
@@ -773,12 +794,12 @@ struct MacContentView: View {
                     Label("Copy Report", systemImage: "doc.on.doc")
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(.cyan)
+                .tint(MacContentPalette.accent)
             }
             .padding(16)
         }
-        .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.07)))
+        .background(MacContentPalette.panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(MacContentPalette.border))
     }
 
     private var connectionHealthText: String {
@@ -850,7 +871,7 @@ struct MacContentView: View {
                           ? "shield.lefthalf.filled.badge.checkmark"
                           : "shield.checkered")
                         .font(.title3.bold())
-                        .foregroundStyle(model.shutdownProtectionEnabled ? .cyan : .white.opacity(0.55))
+                        .foregroundStyle(model.shutdownProtectionEnabled ? MacContentPalette.accent : .white.opacity(0.55))
                 }
                 .frame(width: 44, height: 44)
 
@@ -875,8 +896,8 @@ struct MacContentView: View {
             }
         }
         .padding(16)
-        .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.07)))
+        .background(MacContentPalette.panel, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(MacContentPalette.border))
     }
 
     private var availableFrameRatePreferences: [StreamFrameRatePreference] {
@@ -1116,7 +1137,7 @@ private struct PermissionRow<Actions: View>: View {
 
     private var stateColor: Color {
         if isReady { return .green }
-        if isChecking { return .cyan }
+        if isChecking { return MacContentPalette.accent }
         return .orange
     }
 

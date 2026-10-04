@@ -1,5 +1,13 @@
 import SwiftUI
 
+private enum MacPairingWindowPalette {
+#if SIDECARBRIDGE_FORK
+    static let background = ScreenDockPalette.backgroundTop
+#else
+    static let background = Color(red: 0.025, green: 0.04, blue: 0.14)
+#endif
+}
+
 struct MacPairingWindow: View {
     @ObservedObject var model: MacConnectionModel
 
@@ -9,7 +17,7 @@ struct MacPairingWindow: View {
                 .padding(24)
         }
         .frame(minWidth: 720, idealWidth: 960, minHeight: 540)
-        .background(Color(red: 0.025, green: 0.04, blue: 0.14))
+        .background(MacPairingWindowPalette.background)
         .preferredColorScheme(.dark)
     }
 }

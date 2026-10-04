@@ -29,7 +29,7 @@ struct MacViewerView: View {
     var body: some View {
         ZStack {
             LinearGradient(
-                colors: [Color(red: 0.025, green: 0.04, blue: 0.14), Color(red: 0.06, green: 0.08, blue: 0.24)],
+                colors: ScreenDockPalette.backgroundGradient,
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
@@ -50,6 +50,7 @@ struct MacViewerView: View {
         .background(MacViewerWindowBridge(presentation: presentation).frame(width: 0, height: 0))
         .ignoresSafeArea(.container, edges: showsChrome ? [] : .all)
         .preferredColorScheme(.dark)
+        .tint(ScreenDockPalette.blue)
         .modifier(MacViewerFullScreenBehavior())
         .confirmationDialog(
             "Forget saved pairing?",
@@ -86,11 +87,11 @@ struct MacViewerView: View {
 
     private var header: some View {
         HStack(spacing: 14) {
-            Image(systemName: "macwindow.on.rectangle")
-                .font(.system(size: 25, weight: .semibold))
-                .foregroundStyle(.cyan)
+            Image("BrandMark")
+                .resizable()
+                .scaledToFit()
                 .frame(width: 50, height: 50)
-                .background(.cyan.opacity(0.13), in: RoundedRectangle(cornerRadius: 14))
+                .shadow(color: ScreenDockPalette.blue.opacity(0.3), radius: 14, y: 6)
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(MacViewerBranding.viewerTitle)
@@ -104,7 +105,7 @@ struct MacViewerView: View {
             presentationControls
             HStack(spacing: 8) {
                 Circle()
-                    .fill(model.isConnected ? .green : .cyan)
+                    .fill(model.isConnected ? .green : ScreenDockPalette.blue)
                     .frame(width: 8, height: 8)
                 Text(model.isConnected ? "CONNECTED" : "VIEWER")
                     .font(.caption2.bold())
@@ -175,7 +176,7 @@ struct MacViewerView: View {
                             .foregroundStyle(.white.opacity(0.58))
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(14)
-                            .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 12))
+                            .background(ScreenDockPalette.panel.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
                     } else {
                         HStack(spacing: 8) {
                             Picker("Mac", selection: selectedMacBinding) {
@@ -208,7 +209,7 @@ struct MacViewerView: View {
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(10)
-                        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+                        .background(ScreenDockPalette.violet.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -229,7 +230,7 @@ struct MacViewerView: View {
                     HStack(spacing: 10) {
                         Button("Connect") { model.connect() }
                         .buttonStyle(.borderedProminent)
-                        .tint(.cyan)
+                        .tint(ScreenDockPalette.blue)
                         .disabled(model.isConnecting || model.selectedDevice?.isLocal == true)
 
                         if model.isConnecting {
@@ -269,11 +270,11 @@ struct MacViewerView: View {
                 }
             }
             .padding(15)
-            .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 14))
+            .background(ScreenDockPalette.panel, in: RoundedRectangle(cornerRadius: 14))
         }
         .padding(20)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 20).stroke(.white.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 20).stroke(ScreenDockPalette.border))
     }
 
     private var viewerPanel: some View {
@@ -315,7 +316,7 @@ struct MacViewerView: View {
                 .foregroundStyle(.white.opacity(0.62))
             Text("In \(model.streamReceivedFPS) • queued \(model.streamSubmittedFPS) FPS")
                 .font(.caption.monospacedDigit())
-                .foregroundStyle(.cyan)
+                .foregroundStyle(ScreenDockPalette.blue)
                 .help("Received counts network frames. Queued counts frames submitted to AVFoundation.")
             if model.supportsVisiblePixelSampling {
                 Text("Visible sample changes \(model.streamOutputChangeRate)/s")
@@ -460,8 +461,8 @@ struct MacViewerView: View {
             }
         }
         .padding(16)
-        .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.08)))
+        .background(ScreenDockPalette.panel, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(ScreenDockPalette.border))
     }
 
     private var selectedMacBinding: Binding<String> {
