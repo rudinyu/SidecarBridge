@@ -40,12 +40,16 @@ final class PadLANService {
     private var endpoints: [NWEndpoint] = []
     private var discoveryKeyByEndpoint: [String: String] = [:]
     private var bonjourHostsByMac: [String: [String]] = [:]
+    private var bonjourPortsByMac: [String: UInt16] = [:]
     private var multipeerHostsByMac: [String: [String]] = [:]
+    private var multipeerPortsByMac: [String: UInt16] = [:]
     private var selectedMacName: String?
     private var selectedMacID: String?
     private var expectedMacID: String?
     private var preferredHosts: [String] = []
+    private var preferredDirectPort: UInt16?
     private var candidateHost: String?
+    private var candidatePort: UInt16?
     private var rejectedEndpointKeys = Set<String>()
     private let attemptToken = ConnectionAttemptToken()
     private var activeAttemptToken: UUID?
@@ -105,9 +109,12 @@ final class PadLANService {
             self.cancelSubnetProbes()
             self.expectedMacID = nil
             self.preferredHosts.removeAll()
+            self.preferredDirectPort = nil
             self.rejectedEndpointKeys.removeAll()
             self.bonjourHostsByMac.removeAll()
+            self.bonjourPortsByMac.removeAll()
             self.multipeerHostsByMac.removeAll()
+            self.multipeerPortsByMac.removeAll()
             self.discoveryKeyByEndpoint.removeAll()
             self.browser?.cancel()
             self.browser = nil
@@ -227,6 +234,7 @@ final class PadLANService {
             self.selectedMacID = invitation?.macID
             self.expectedMacID = invitation?.macID
             self.preferredHosts = (invitation?.hosts ?? []) + [host].compactMap { $0 }.filter(BridgeNetworkMetadata.isPrivateIPv4Address)
+            self.preferredDirectPort = nil
             self.rejectedEndpointKeys.removeAll()
             self.submittedPairingCode = normalized
             self.connectionAttemptWorkItem?.cancel()
@@ -263,6 +271,7 @@ final class PadLANService {
                 ?? SavedMacRouteStore.route(named: name)
             self.expectedMacID = macID ?? saved?.macID
             self.preferredHosts = saved?.hosts ?? []
+            self.preferredDirectPort = saved?.port
             self.rejectedEndpointKeys.removeAll()
             self.connection?.cancel()
             self.clearConnection(notify: false)
@@ -291,6 +300,7 @@ final class PadLANService {
             self.selectedMacID = nil
             self.expectedMacID = nil
             self.preferredHosts.removeAll()
+            self.preferredDirectPort = nil
             self.rejectedEndpointKeys.removeAll()
             self.connectionAttemptWorkItem?.cancel()
             self.connectionAttemptWorkItem = nil
@@ -308,11 +318,28 @@ final class PadLANService {
         setMultipeerAdvertisedHosts(hosts, forMacID: nil, displayName: name)
     }
 
-    func setMultipeerAdvertisedHosts(_ hosts: [String], forMacID macID: String?, displayName name: String) {
+    func setMultipeerAdvertisedHosts(
+        _ hosts: [String],
+        forMacID macID: String?,
+        displayName name: String,
+        port: UInt16? = nil
+    ) {
         queue.async { [weak self] in
             guard let self else { return }
             let key = macID ?? name
-            self.multipeerHostsByMac[key] = hosts
+            if hosts.isEmpty && port == nil {
+                self.multipeerHostsByMac.removeValue(forKey: key)
+                self.multipeerPortsByMac.removeValue(forKey: key)
+            } else {
+                self.multipeerHostsByMac[key] = hosts
+                #if SIDECARBRIDGE_FORK
+                if let port, ForkRuntimeProfile.isSupportedListenerPort(port) {
+                    self.multipeerPortsByMac[key] = port
+                } else {
+                    self.multipeerPortsByMac.removeValue(forKey: key)
+                }
+                #endif
+            }
             if (self.selectedMacID == macID && macID != nil ||
                 self.selectedMacID == nil && self.selectedMacName == name ||
                 self.codeFirstPairingRequested),
@@ -328,8 +355,13 @@ final class PadLANService {
         triedCachedHostForBrowser = false
         let parameters = lowLatencyParameters()
         parameters.includePeerToPeer = true
+        #if SIDECARBRIDGE_FORK
+        let serviceType = ForkRuntimeProfile.forkBonjourDirectServiceType
+        #else
+        let serviceType = BridgeConstants.lanServiceType
+        #endif
         let browser = NWBrowser(
-            for: .bonjourWithTXTRecord(type: BridgeConstants.lanServiceType, domain: nil),
+            for: .bonjourWithTXTRecord(type: serviceType, domain: nil),
             using: parameters
         )
         browser.browseResultsChangedHandler = { [weak self, weak browser] results, _ in
@@ -345,6 +377,7 @@ final class PadLANService {
             }
             self.endpoints = results.map(\.endpoint)
             var bonjourHosts: [String: [String]] = [:]
+            var bonjourPorts: [String: UInt16] = [:]
             var endpointKeys: [String: String] = [:]
             var devices: [MacDiscoveryRecord] = []
             for result in results {
@@ -356,6 +389,12 @@ final class PadLANService {
                     )
                     let key = macID ?? name
                     bonjourHosts[key] = Array(Set((bonjourHosts[key] ?? []) + hosts)).sorted()
+                    #if SIDECARBRIDGE_FORK
+                    if let advertisedPort = UInt16(txtRecord[ForkRuntimeProfile.advertisedPortTXTKey] ?? ""),
+                       ForkRuntimeProfile.isSupportedListenerPort(advertisedPort) {
+                        bonjourPorts[key] = advertisedPort
+                    }
+                    #endif
                     endpointKeys[String(describing: result.endpoint)] = key
                     devices.append(MacDiscoveryRecord(
                         macID: macID,
@@ -374,6 +413,7 @@ final class PadLANService {
                 }
             }
             self.bonjourHostsByMac = bonjourHosts
+            self.bonjourPortsByMac = bonjourPorts
             self.discoveryKeyByEndpoint = endpointKeys
             let names = devices.map(\.name)
             DispatchQueue.main.async {
@@ -462,10 +502,14 @@ final class PadLANService {
         } else {
             return
         }
-        let port = NWEndpoint.Port(rawValue: BridgeConstants.directPort)
         var selectableEndpoints: [NWEndpoint] = []
-        if let port {
-            selectableEndpoints.append(contentsOf: (preferredHosts + advertisedHosts).map {
+        var seenDirectHosts = Set<String>()
+        let directHosts = (preferredHosts + advertisedHosts).filter {
+            seenDirectHosts.insert($0).inserted
+        }
+        for portValue in directRoutePortCandidates() {
+            guard let port = NWEndpoint.Port(rawValue: portValue) else { continue }
+            selectableEndpoints.append(contentsOf: directHosts.map {
                 .hostPort(host: NWEndpoint.Host($0), port: port)
             })
         }
@@ -491,8 +535,11 @@ final class PadLANService {
             switch state {
             case .ready:
                 // Keep the timeout armed through authentication, not just TCP.
-                self.candidateHost = Self.privateIPv4Host(connection.currentPath?.remoteEndpoint)
+                let remoteEndpoint = connection.currentPath?.remoteEndpoint
+                self.candidateHost = Self.privateIPv4Host(remoteEndpoint)
                     ?? Self.privateIPv4Host(endpoint)
+                self.candidatePort = Self.portNumber(remoteEndpoint)
+                    ?? Self.portNumber(endpoint)
                 self.beginHandshake(on: connection)
                 self.receive(on: connection)
             case .failed(let error):
@@ -708,7 +755,14 @@ final class PadLANService {
             }
             SavedMacRouteStore.remember(
                 macID: macID, name: pairingMacName ?? "Mac",
-                hosts: [candidateHost].compactMap { $0 }
+                hosts: [candidateHost].compactMap { $0 },
+                port: {
+                    #if SIDECARBRIDGE_FORK
+                    return candidatePort
+                    #else
+                    return nil
+                    #endif
+                }()
             )
             onAuthenticatedMacChanged?(macID, pairingMacName ?? "Mac")
             connectionAttemptWorkItem?.cancel()
@@ -872,8 +926,8 @@ final class PadLANService {
     private func startSubnetProbe() {
         guard userRequestedConnection, !isConnected, connection == nil else { return }
         let hosts = Self.privateIPv4ProbeHosts()
-        guard !hosts.isEmpty,
-              let port = NWEndpoint.Port(rawValue: BridgeConstants.directPort) else { return }
+        let ports = directRoutePortCandidates().compactMap { NWEndpoint.Port(rawValue: $0) }
+        guard !hosts.isEmpty, !ports.isEmpty else { return }
 
         subnetProbeGeneration &+= 1
         let generation = subnetProbeGeneration
@@ -883,16 +937,17 @@ final class PadLANService {
         )
 
         let batchSize = 24
-        for offset in stride(from: 0, to: hosts.count, by: batchSize) {
-            let batch = Array(hosts[offset..<min(offset + batchSize, hosts.count)])
+        let candidates = hosts.flatMap { host in ports.map { (host: host, port: $0) } }
+        for offset in stride(from: 0, to: candidates.count, by: batchSize) {
+            let batch = Array(candidates[offset..<min(offset + batchSize, candidates.count)])
         let workItem = DispatchWorkItem { [weak self] in
             guard let self,
                   self.userRequestedConnection,
                   self.subnetProbeGeneration == generation,
                       !self.isConnected,
                       self.connection == nil else { return }
-                for host in batch {
-                    self.probe(host: host, port: port, generation: generation)
+                for candidate in batch {
+                    self.probe(host: candidate.host, port: candidate.port, generation: generation)
                 }
             }
             subnetProbeBatchWorkItems.append(workItem)
@@ -900,7 +955,7 @@ final class PadLANService {
             queue.asyncAfter(deadline: .now() + (Double(batchIndex) * 0.25), execute: workItem)
         }
 
-        let batchCount = Int(ceil(Double(hosts.count) / Double(batchSize)))
+        let batchCount = Int(ceil(Double(candidates.count) / Double(batchSize)))
         let finish = DispatchWorkItem { [weak self] in
             guard let self,
                   self.subnetProbeGeneration == generation,
@@ -928,13 +983,15 @@ final class PadLANService {
               connection == nil,
               subnetProbeConnections.isEmpty,
               let host = preferredHosts.first,
-              Self.isPrivateIPv4Address(host),
-              let port = NWEndpoint.Port(rawValue: BridgeConstants.directPort) else { return }
+              Self.isPrivateIPv4Address(host) else { return }
         triedCachedHostForBrowser = true
         subnetProbeGeneration &+= 1
         let generation = subnetProbeGeneration
         print("[SidecarBridge/LAN] Trying last successful Mac address \(host)")
-        probe(host: host, port: port, generation: generation)
+        for portValue in directRoutePortCandidates() {
+            guard let port = NWEndpoint.Port(rawValue: portValue) else { continue }
+            probe(host: host, port: port, generation: generation)
+        }
     }
 
     @discardableResult
@@ -944,33 +1001,36 @@ final class PadLANService {
               !isConnected,
               connection == nil,
               let host = preferredHosts.first,
-              Self.isPrivateIPv4Address(host),
-              let port = NWEndpoint.Port(rawValue: BridgeConstants.directPort) else {
+              Self.isPrivateIPv4Address(host) else {
             return false
         }
         triedCachedHostForBrowser = true
         subnetProbeGeneration &+= 1
         let generation = subnetProbeGeneration
         print("[SidecarBridge/LAN] Fast-resuming last Mac address \(host)")
-        probe(host: host, port: port, generation: generation)
+        for portValue in directRoutePortCandidates() {
+            guard let port = NWEndpoint.Port(rawValue: portValue) else { continue }
+            probe(host: host, port: port, generation: generation)
+        }
         return true
     }
 
     private func probe(host: String, port: NWEndpoint.Port, generation: Int) {
-        guard subnetProbeConnections[host] == nil,
+        let key = Self.directEndpointKey(host: host, port: port)
+        guard subnetProbeConnections[key] == nil,
               !rejectedEndpointKeys.contains(String(describing: NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: port))) else { return }
         let probe = NWConnection(host: NWEndpoint.Host(host), port: port, using: lowLatencyParameters())
-        subnetProbeConnections[host] = probe
+        subnetProbeConnections[key] = probe
         probe.stateUpdateHandler = { [weak self, weak probe] state in
             guard let self,
                   let probe,
                   self.subnetProbeGeneration == generation else { return }
             switch state {
             case .ready:
-                self.promoteSubnetProbe(probe, host: host)
+                self.promoteSubnetProbe(probe, host: host, port: port.rawValue)
             case .failed, .cancelled:
-                if self.subnetProbeConnections[host] === probe {
-                    self.subnetProbeConnections.removeValue(forKey: host)
+                if self.subnetProbeConnections[key] === probe {
+                    self.subnetProbeConnections.removeValue(forKey: key)
                 }
             default:
                 break
@@ -981,21 +1041,26 @@ final class PadLANService {
             guard let self,
                   let probe,
                   self.subnetProbeGeneration == generation,
-                  self.subnetProbeConnections[host] === probe else { return }
-            self.subnetProbeConnections.removeValue(forKey: host)
+                  self.subnetProbeConnections[key] === probe else { return }
+            self.subnetProbeConnections.removeValue(forKey: key)
             probe.cancel()
         }
     }
 
-    private func promoteSubnetProbe(_ directConnection: NWConnection, host: String) {
+    private func promoteSubnetProbe(
+        _ directConnection: NWConnection,
+        host: String,
+        port: UInt16
+    ) {
         guard connection == nil, !isConnected else {
             directConnection.cancel()
             return
         }
 
         cancelSubnetProbes(except: directConnection)
-        print("[SidecarBridge/LAN] Fixed-port fallback found \(host):\(BridgeConstants.directPort)")
+        print("[SidecarBridge/LAN] Fixed-port fallback found \(host):\(port)")
         candidateHost = host
+        candidatePort = port
         connection = directConnection
         armConnectionAttemptTimeout(for: directConnection)
         privateKey = Curve25519.KeyAgreement.PrivateKey()
@@ -1096,6 +1161,36 @@ final class PadLANService {
         return isPrivateIPv4Address(value) ? value : nil
     }
 
+    private static func portNumber(_ endpoint: NWEndpoint?) -> UInt16? {
+        guard case let .hostPort(_, port) = endpoint else { return nil }
+        return port.rawValue
+    }
+
+    private static func directEndpointKey(host: String, port: NWEndpoint.Port) -> String {
+        String(describing: NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: port))
+    }
+
+    private func directRoutePortCandidates() -> [UInt16] {
+        #if SIDECARBRIDGE_FORK
+        var discoveredPorts: [UInt16] = []
+        if let selectedMacID {
+            discoveredPorts.append(contentsOf: [bonjourPortsByMac[selectedMacID], multipeerPortsByMac[selectedMacID]].compactMap { $0 })
+        } else if let selectedMacName {
+            discoveredPorts.append(contentsOf: [bonjourPortsByMac[selectedMacName], multipeerPortsByMac[selectedMacName]].compactMap { $0 })
+        } else if codeFirstPairingRequested {
+            discoveredPorts.append(contentsOf: bonjourPortsByMac.values)
+            discoveredPorts.append(contentsOf: multipeerPortsByMac.values)
+        }
+
+        return ForkRuntimeProfile.listenerPortCandidates(
+            savedPort: preferredDirectPort,
+            advertisedPorts: discoveredPorts
+        )
+        #else
+        return [BridgeConstants.directPort]
+        #endif
+    }
+
     /// Bonjour can remain in `.ready` with an empty, stale result set after a
     /// Wi-Fi or AWDL transition. Recreating the browser forces mDNS discovery
     /// without requiring the user to close and reopen the iPad app.
@@ -1118,13 +1213,11 @@ final class PadLANService {
     /// stale service, so checking only whether the browser result list is
     /// non-empty is not sufficient.
     private var hasSelectableDirectCandidate: Bool {
-        let hasPreferredDirectRoute: Bool
-        if let port = NWEndpoint.Port(rawValue: BridgeConstants.directPort) {
-            hasPreferredDirectRoute = preferredHosts.contains {
-               !rejectedEndpointKeys.contains(String(describing: NWEndpoint.hostPort(host: NWEndpoint.Host($0), port: port)))
+        let hasPreferredDirectRoute = preferredHosts.contains { host in
+            directRoutePortCandidates().contains { portValue in
+                guard let port = NWEndpoint.Port(rawValue: portValue) else { return false }
+                return !rejectedEndpointKeys.contains(Self.directEndpointKey(host: host, port: port))
             }
-        } else {
-            hasPreferredDirectRoute = false
         }
 
         let hasMatchingSelectedRoute: Bool
@@ -1208,6 +1301,7 @@ final class PadLANService {
         connection = nil
         previousConnection?.cancel()
         candidateHost = nil
+        candidatePort = nil
         privateKey = nil
         secureSession = nil
         receiveBuffer.removeAll(keepingCapacity: true)
@@ -1231,8 +1325,10 @@ final class PadLANService {
         if let endpoint = connection?.endpoint {
             rejectedEndpointKeys.insert(String(describing: endpoint))
         }
-        if let host = candidateHost, let port = NWEndpoint.Port(rawValue: BridgeConstants.directPort) {
-            rejectedEndpointKeys.insert(String(describing: NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: port)))
+        if let host = candidateHost,
+           let portValue = candidatePort,
+           let port = NWEndpoint.Port(rawValue: portValue) {
+            rejectedEndpointKeys.insert(Self.directEndpointKey(host: host, port: port))
         }
         clearConnection(notify: false)
         nextEndpointIndex = 0

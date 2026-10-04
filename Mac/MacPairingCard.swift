@@ -34,12 +34,12 @@ struct MacPairingCard: View {
             Divider().overlay(.white.opacity(0.08))
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: "checkmark.shield").foregroundStyle(.cyan)
-                Text("Pair once. Your trusted device is remembered. Scan from an iPad or iPhone, or enter this code in SidecarBridge Viewer on another Mac.")
+                Text("Pair once. Your trusted device is remembered. Scan from an iPad or iPhone, or enter this code in \(viewerAppName) on another Mac.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             DisclosureGroup("Can't scan? Connection help") {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Enter the code above with or without dashes. Open SidecarBridge on both devices and allow Local Network access. Refreshing this code does not forget trusted devices.")
+                    Text("Enter the code above with or without dashes. Open SidecarBridge on your iPad or iPhone and \(hostAppName) on the Mac, then allow Local Network access. Refreshing this code does not forget trusted devices.")
                     if !invitation.hosts.isEmpty {
                         Text("Manual Mac address: \(invitation.hosts.joined(separator: " · "))")
                             .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
@@ -62,7 +62,7 @@ struct MacPairingCard: View {
         VStack(alignment: .leading, spacing: 16) {
             Label("Scan from SidecarBridge", systemImage: "qrcode.viewfinder")
                 .font(.headline)
-            Text("On your iPad or iPhone, tap Scan Mac Code and point the camera here. On another Mac, open SidecarBridge Viewer and enter this code.")
+            Text("On your iPad or iPhone, tap Scan Mac Code and point the camera here. On another Mac, open \(viewerAppName) and enter this code.")
                 .font(.callout).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Text("OR ENTER THE 16-DIGIT CODE")
@@ -104,5 +104,21 @@ struct MacPairingCard: View {
                     .buttonStyle(.bordered)
             }
         }
+    }
+
+    private var hostAppName: String {
+        #if SIDECARBRIDGE_FORK
+        "ScreenDock Host"
+        #else
+        "SidecarBridge"
+        #endif
+    }
+
+    private var viewerAppName: String {
+        #if SIDECARBRIDGE_FORK
+        "ScreenDock Viewer"
+        #else
+        "SidecarBridge Viewer"
+        #endif
     }
 }

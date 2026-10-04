@@ -32,9 +32,15 @@ final class MacPeerService: NSObject {
     var onP2PStateChanged: ((MacP2PState) -> Void)?
     var onConnectionHealthChanged: ((String, Int?) -> Void)?
 
-    private let peerID = MCPeerID(displayName: Host.current().localizedName ?? "Mac")
+    private let peerID = MCPeerID(
+        displayName: BridgeConstants.hostDisplayName(machineName: Host.current().localizedName)
+    )
     private var session: MCSession
     private var advertiser: MCNearbyServiceAdvertiser?
+#if SIDECARBRIDGE_FORK
+    private var forkAdvertiser: MCNearbyServiceAdvertiser?
+    private var advertisedListenerPort: UInt16?
+#endif
     private let lan = MacLANService()
     private var mcConnected = false
     private var lanConnected = false
@@ -102,6 +108,13 @@ final class MacPeerService: NSObject {
         lan.onListenerStateChanged = { [weak self] ready, detail in
             self?.onListenerStateChanged?(ready, detail)
         }
+#if SIDECARBRIDGE_FORK
+        lan.onListenerPortChanged = { [weak self] port in
+            DispatchQueue.main.async { [weak self] in
+                self?.hostListenerPortChanged(port)
+            }
+        }
+#endif
         lan.onConnectionChanged = { [weak self] connected, value in
             guard let self else { return }
             self.lanConnected = connected
@@ -445,19 +458,34 @@ final class MacPeerService: NSObject {
                 // lower-bandwidth nearby transport.
                 discoveryInfo[BridgeConstants.hostsTXTKey] = hosts
             }
-            if let macID = UserDefaults.standard.string(forKey: "macDeviceIdentifier"),
+            #if SIDECARBRIDGE_FORK
+            if let advertisedListenerPort = self.advertisedListenerPort {
+                discoveryInfo[ForkRuntimeProfile.advertisedPortTXTKey] = String(advertisedListenerPort)
+            }
+            let serviceTypes = [ForkRuntimeProfile.legacyMultipeerServiceType, ForkRuntimeProfile.forkMultipeerServiceType]
+            let defaults = ForkRuntimeProfile.userDefaults(for: .host)
+            #else
+            let serviceTypes = [BridgeConstants.serviceType]
+            let defaults = UserDefaults.standard
+            #endif
+            if let macID = defaults.string(forKey: "macDeviceIdentifier"),
                !macID.isEmpty {
                 discoveryInfo[BridgeConstants.macIDTXTKey] = macID
             }
-            let advertiser = MCNearbyServiceAdvertiser(
-                peer: self.peerID,
-                discoveryInfo: discoveryInfo,
-                serviceType: BridgeConstants.serviceType
-            )
-            advertiser.delegate = self
-            self.advertiser = advertiser
+            let advertisers = serviceTypes.map { serviceType in
+                MCNearbyServiceAdvertiser(
+                    peer: self.peerID,
+                    discoveryInfo: discoveryInfo,
+                    serviceType: serviceType
+                )
+            }
+            advertisers.forEach { $0.delegate = self }
+            self.advertiser = advertisers.first
+#if SIDECARBRIDGE_FORK
+            self.forkAdvertiser = advertisers.dropFirst().first
+#endif
             self.advertiserRunning = true
-            advertiser.startAdvertisingPeer()
+            advertisers.forEach { $0.startAdvertisingPeer() }
             self.onP2PStateChanged?(.advertising)
         }
         fallbackWorkItem = workItem
@@ -470,12 +498,7 @@ final class MacPeerService: NSObject {
         fallbackWorkItem = nil
         mcConnectionWatchdog?.cancel()
         mcConnectionWatchdog = nil
-        if advertiserRunning {
-            advertiser?.stopAdvertisingPeer()
-            advertiserRunning = false
-        }
-        advertiser?.delegate = nil
-        advertiser = nil
+        stopAdvertisers()
         session.disconnect()
         rebuildMultipeerSession()
         mcConnected = false
@@ -489,12 +512,7 @@ final class MacPeerService: NSObject {
             guard let self, !self.lanConnected, !self.mcConnected else { return }
             self.session.disconnect()
             self.rebuildMultipeerSession()
-            if self.advertiserRunning {
-                self.advertiser?.stopAdvertisingPeer()
-                self.advertiserRunning = false
-            }
-            self.advertiser?.delegate = nil
-            self.advertiser = nil
+            self.stopAdvertisers()
             let message = "Nearby P2P handshake timed out; advertising again."
             self.onP2PStateChanged?(.recovering(message))
             self.onConnectionChanged?(false, message)
@@ -669,16 +687,46 @@ final class MacPeerService: NSObject {
 
     private func restartMultipeerAdvertisingAfterDisconnect() {
         guard started, !lanConnected else { return }
-        if advertiserRunning {
-            advertiser?.stopAdvertisingPeer()
-            advertiserRunning = false
-        }
-        advertiser?.delegate = nil
-        advertiser = nil
+        stopAdvertisers()
         rebuildMultipeerSession()
         fallbackWorkItem?.cancel()
         fallbackWorkItem = nil
         scheduleMultipeerFallback()
+    }
+
+    private func stopAdvertisers() {
+        advertiser?.stopAdvertisingPeer()
+        advertiser?.delegate = nil
+        advertiser = nil
+#if SIDECARBRIDGE_FORK
+        forkAdvertiser?.stopAdvertisingPeer()
+        forkAdvertiser?.delegate = nil
+        forkAdvertiser = nil
+#endif
+        advertiserRunning = false
+    }
+
+    private func hostListenerPortChanged(_ port: UInt16?) {
+#if SIDECARBRIDGE_FORK
+        guard port == nil || port.map(ForkRuntimeProfile.isSupportedListenerPort) == true,
+              advertisedListenerPort != port else { return }
+        advertisedListenerPort = port
+        guard started, !lanConnected, advertiserRunning else { return }
+
+        // Refresh the two service records while leaving the MCSession and any
+        // authenticated nearby connection intact.
+        stopAdvertisers()
+        scheduleMultipeerFallback()
+#endif
+    }
+
+    private func isActiveAdvertiser(_ candidate: MCNearbyServiceAdvertiser) -> Bool {
+        if advertiser === candidate { return true }
+#if SIDECARBRIDGE_FORK
+        return forkAdvertiser === candidate
+#else
+        return false
+#endif
     }
 }
 
@@ -689,6 +737,10 @@ extension MacPeerService: MCNearbyServiceAdvertiserDelegate {
         withContext context: Data?,
         invitationHandler: @escaping (Bool, MCSession?) -> Void
     ) {
+        guard isActiveAdvertiser(advertiser) else {
+            invitationHandler(false, nil)
+            return
+        }
         onP2PStateChanged?(.connecting(peerID.displayName))
         guard !mcConnected,
               session.connectedPeers.isEmpty,
@@ -710,12 +762,12 @@ extension MacPeerService: MCNearbyServiceAdvertiserDelegate {
 
     func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didNotStartAdvertisingPeer error: Error) {
         DispatchQueue.main.async {
-            guard self.advertiser === advertiser else { return }
-            advertiser.delegate = nil
-            self.advertiser = nil
-            self.advertiserRunning = false
+            guard self.isActiveAdvertiser(advertiser) else { return }
+            self.stopAdvertisers()
             self.onP2PStateChanged?(.recovering(error.localizedDescription))
-            self.onConnectionChanged?(false, error.localizedDescription)
+            if !self.lanConnected && !self.mcConnected && self.session.connectedPeers.isEmpty {
+                self.onConnectionChanged?(false, error.localizedDescription)
+            }
             self.scheduleMultipeerFallback()
         }
     }

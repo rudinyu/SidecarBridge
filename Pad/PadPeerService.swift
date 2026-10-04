@@ -67,6 +67,7 @@ final class PadPeerService: NSObject {
     private var lanDiscoveredDevices: [String: MacDiscoveryRecord] = [:]
     private var multipeerDiscoveredMacs: [String: MCPeerID] = [:]
     private var multipeerDiscoveredHosts: [String: [String]] = [:]
+    private var multipeerDiscoveredPorts: [String: UInt16] = [:]
     private var multipeerDiscoveredDevices: [String: MacDiscoveryRecord] = [:]
     private var multipeerPeersByMacID: [String: MCPeerID] = [:]
     private var selectedMacName: String?
@@ -226,7 +227,8 @@ final class PadPeerService: NSObject {
         lan.setMultipeerAdvertisedHosts(
             multipeerDiscoveredHosts[routeKey] ?? [],
             forMacID: macID,
-            displayName: name
+            displayName: name,
+            port: multipeerDiscoveredPorts[routeKey]
         )
         lan.selectMac(macID: macID, named: name)
         if let peer = macID.flatMap({ multipeerPeersByMacID[$0] }) ?? multipeerDiscoveredMacs[routeKey], let browser {
@@ -446,6 +448,7 @@ final class PadPeerService: NSObject {
     private func clearMultipeerDiscovery() {
         multipeerDiscoveredMacs.removeAll()
         multipeerDiscoveredHosts.removeAll()
+        multipeerDiscoveredPorts.removeAll()
         multipeerDiscoveredDevices.removeAll()
         multipeerPeersByMacID.removeAll()
         publishDiscoveredMacs()
@@ -723,9 +726,14 @@ final class PadPeerService: NSObject {
         fallbackWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, self.started, !self.lanConnected, !self.browserRunning else { return }
+            #if SIDECARBRIDGE_FORK
+            let serviceType = ForkRuntimeProfile.forkMultipeerServiceType
+            #else
+            let serviceType = BridgeConstants.serviceType
+            #endif
             let browser = MCNearbyServiceBrowser(
                 peer: self.peerID,
-                serviceType: BridgeConstants.serviceType
+                serviceType: serviceType
             )
             browser.delegate = self
             self.browser = browser
@@ -872,7 +880,14 @@ final class PadPeerService: NSObject {
             }
             SavedMacRouteStore.remember(
                 macID: macID, name: remotePeer.displayName,
-                hosts: multipeerDiscoveredHosts[macID] ?? multipeerDiscoveredHosts[remotePeer.displayName] ?? []
+                hosts: multipeerDiscoveredHosts[macID] ?? multipeerDiscoveredHosts[remotePeer.displayName] ?? [],
+                port: {
+                    #if SIDECARBRIDGE_FORK
+                    return multipeerDiscoveredPorts[macID] ?? multipeerDiscoveredPorts[remotePeer.displayName]
+                    #else
+                    return nil
+                    #endif
+                }()
             )
             onAuthenticatedMacChanged?(macID, remotePeer.displayName)
             mcConnectionWatchdog?.cancel()
@@ -1037,6 +1052,14 @@ extension PadPeerService: MCNearbyServiceBrowserDelegate {
             let hosts = BridgeNetworkMetadata.decodePrivateIPv4Addresses(
                 info?[BridgeConstants.hostsTXTKey]
             )
+            #if SIDECARBRIDGE_FORK
+            let advertisedPort = ForkRuntimeProfile.advertisedPort(from: info)
+            if let advertisedPort {
+                self.multipeerDiscoveredPorts[discoveryKey] = advertisedPort
+            } else {
+                self.multipeerDiscoveredPorts.removeValue(forKey: discoveryKey)
+            }
+            #endif
             self.multipeerDiscoveredHosts[discoveryKey] = hosts
             self.multipeerDiscoveredDevices[discoveryKey] = MacDiscoveryRecord(
                 macID: macID,
@@ -1045,7 +1068,11 @@ extension PadPeerService: MCNearbyServiceBrowserDelegate {
                 hosts: hosts
             )
             if let macID { self.multipeerPeersByMacID[macID] = peerID }
+            #if SIDECARBRIDGE_FORK
+            self.lan.setMultipeerAdvertisedHosts(hosts, forMacID: macID, displayName: name, port: advertisedPort)
+            #else
             self.lan.setMultipeerAdvertisedHosts(hosts, forMacID: macID, displayName: name)
+            #endif
             self.multipeerDiscoveredMacs[discoveryKey] = peerID
             self.publishDiscoveredMacs()
             self.publishDiscoveredDevices()
@@ -1067,6 +1094,13 @@ extension PadPeerService: MCNearbyServiceBrowserDelegate {
             for key in keys {
                 self.invitedPeers.remove(key)
                 self.rejectedPeers.remove(key)
+                let device = self.multipeerDiscoveredDevices[key]
+                self.lan.setMultipeerAdvertisedHosts(
+                    [],
+                    forMacID: device?.macID,
+                    displayName: device?.name ?? key
+                )
+                self.multipeerDiscoveredPorts.removeValue(forKey: key)
             }
             self.multipeerDiscoveredMacs = self.multipeerDiscoveredMacs.filter { $0.value != peerID }
             for key in keys {

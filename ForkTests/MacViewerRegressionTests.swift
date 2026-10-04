@@ -183,6 +183,7 @@ final class MacViewerRegressionTests: XCTestCase {
         let (model, peer, _) = try fixture()
         model.isConnected = true
         model.isStreaming = true
+        model.remoteInputAuthorized = true
         let handled = expectation(description: "Rejected input acknowledged")
         let observation = model.$lastInputAccepted.dropFirst().sink { _ in handled.fulfill() }
         defer { observation.cancel() }

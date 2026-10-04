@@ -445,16 +445,21 @@ final class MacViewerConnectionTests: XCTestCase {
     }
 
     @MainActor
-    func testInputRequiresConnectionAndVideoAndGetsMonotonicSequences() async throws {
+    func testInputRequiresConnectionAndHostAuthorizationButNotVideo() async throws {
         let f = try makeViewerFixture()
-        for state in [(false, false), (true, false), (false, true)] {
-            f.model.isConnected = state.0
-            f.model.isStreaming = state.1
-            f.model.sendInput(.text("ignored"))
-        }
+        XCTAssertFalse(f.model.remoteInputAuthorized)
+        f.model.isStreaming = false
+        f.model.sendInput(.text("ignored"))
         XCTAssertTrue(f.peer.inputs.isEmpty)
+
         f.model.isConnected = true
-        f.model.isStreaming = true
+        f.model.sendInput(.text("ignored"))
+        XCTAssertTrue(f.peer.inputs.isEmpty, "Connection alone is not Host event-posting authorization")
+
+        await awaitViewerChange(f.model.$remoteInputAuthorized) {
+            f.peer.onCommand?(ControlMessage(.status, detail: "accessibility-passed"))
+        }
+        XCTAssertFalse(f.model.isStreaming, "The pre-image case must remain unstreamed")
         f.model.sendInput(.text("first"))
         f.model.sendInput(.hardwareKey(hidUsage: 4, modifiers: ["command"]))
         XCTAssertEqual(f.peer.inputs.map(\.sequence), [1, 2])
@@ -463,9 +468,13 @@ final class MacViewerConnectionTests: XCTestCase {
             f.peer.onCommand?(ControlMessage(.status, detail: "input-ack:2:1"))
         }
         XCTAssertGreaterThanOrEqual(try XCTUnwrap(f.model.connectionLatencyMS), 0)
+        f.model.remoteInputAuthorized = false
+        f.model.sendInput(.text("revoked"))
+        XCTAssertEqual(f.peer.inputs.count, 2)
         f.model.disconnect()
         f.model.sendInput(.text("ignored"))
         XCTAssertEqual(f.peer.inputs.count, 2)
+        XCTAssertFalse(f.model.remoteInputAuthorized)
         XCTAssertEqual(f.peer.restartCount, 1)
     }
 

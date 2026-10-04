@@ -125,7 +125,7 @@ final class MacViewerPresentationTests: XCTestCase {
         XCTAssertTrue(window.makeFirstResponder(input))
         XCTAssertTrue(input.performKeyEquivalent(with: try key(3, "f")))
         XCTAssertEqual(window.fullScreenRequests, 1)
-        input.keyDown(with: try key(4, "h"))
+        XCTAssertTrue(input.performKeyEquivalent(with: try key(4, "h")))
         XCTAssertFalse(presentation.controlsVisible)
         input.isEnabled = false
         XCTAssertTrue(input.performKeyEquivalent(with: try key(4, "h")))
@@ -231,14 +231,16 @@ final class MacViewerPresentationTests: XCTestCase {
         XCTAssertFalse(presentation.controlsVisible)
         XCTAssertTrue(descendant(MacViewerVideoView.self, in: hosting) === video)
         XCTAssertTrue(descendant(MacViewerInputView.self, in: hosting) === input)
+        XCTAssertTrue(descendants(NSButton.self, in: hosting).isEmpty,
+            "Hidden full-screen chrome must not leave buttons over remote input")
         XCTAssertEqual(video.bounds.height, hosting.bounds.height, accuracy: 1,
             "Full screen should hide the header and control panel to maximize video")
 
-        // This is the same action used by Hide Controls / Show Controls.
+        // This is the same state transition exposed through the View menu.
         presentation.toggleControls()
         hosting.rootView = root
         hosting.layoutSubtreeIfNeeded()
-        XCTAssertTrue(presentation.controlsVisible, "The compact Show Controls button must restore the panel")
+        XCTAssertTrue(presentation.controlsVisible, "Show Controls must restore the panel")
         XCTAssertLessThan(video.bounds.height, hosting.bounds.height)
 
         presentation.toggleControls()
@@ -248,7 +250,7 @@ final class MacViewerPresentationTests: XCTestCase {
         XCTAssertEqual(video.bounds.height, hosting.bounds.height, accuracy: 1)
 
         presentation.toggleFullScreen()
-        XCTAssertEqual(window.fullScreenRequests, 2, "The compact Exit Full Screen button must reach NSWindow")
+        XCTAssertEqual(window.fullScreenRequests, 2, "The View menu action must reach NSWindow")
         NotificationCenter.default.post(name: NSWindow.didExitFullScreenNotification, object: window)
         hosting.rootView = root
         hosting.layoutSubtreeIfNeeded()
@@ -262,6 +264,16 @@ final class MacViewerPresentationTests: XCTestCase {
     private func descendant<T: NSView>(_ type: T.Type, in view: NSView) -> T? {
         if let match = view as? T { return match }
         return view.subviews.lazy.compactMap { self.descendant(type, in: $0) }.first
+    }
+
+    @MainActor
+    private func descendants<T: NSView>(_ type: T.Type, in view: NSView) -> [T] {
+        var matches: [T] = []
+        for child in view.subviews {
+            if let match = child as? T { matches.append(match) }
+            matches.append(contentsOf: descendants(type, in: child))
+        }
+        return matches
     }
 
     @MainActor

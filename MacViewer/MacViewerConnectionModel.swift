@@ -116,7 +116,7 @@ final class MacViewerConnectionModel: ObservableObject {
     @Published var connectionTransport = "Direct local link / nearby P2P"
     @Published var connectionHealthDetail = "Waiting for encrypted link"
     @Published var connectionLatencyMS: Int?
-    @Published var remoteInputAuthorized = true
+    @Published var remoteInputAuthorized = false
     @Published var lastInputAccepted = true
     @Published var streamAspectRatio: CGFloat = 16.0 / 9.0
     @Published var streamDimensions = "Waiting for video"
@@ -188,43 +188,57 @@ final class MacViewerConnectionModel: ObservableObject {
     private var selectedDeviceID: String?
 
     private static let rememberedMacNamesKey = "macViewer.rememberedMacNames"
-    private static let transferDirectoryName = "SidecarBridge Transfers"
+    static let defaultDefaults: UserDefaults = {
+        #if SIDECARBRIDGE_FORK
+        return ForkRuntimeProfile.userDefaults(for: .viewer)
+        #else
+        return .standard
+        #endif
+    }()
+    private static let transferDirectoryName: String = {
+        #if SIDECARBRIDGE_FORK
+        return "Transfers"
+        #else
+        return "SidecarBridge Transfers"
+        #endif
+    }()
 
     init(
         peers: MacViewerPeerService = PadPeerService(),
         pasteboard: NSPasteboard = .general,
         receiveDirectory: URL? = nil,
-        defaults: UserDefaults = .standard,
+        defaults: UserDefaults? = nil,
         removeCredential: @escaping (String) -> Bool = { SecureCredentialStore.remove(account: $0) },
         removeAllCredentials: @escaping () -> Bool = { SecureCredentialStore.removeAll(accountPrefix: "pad.mac.") }
     ) {
+        let resolvedDefaults = defaults ?? Self.defaultDefaults
         self.peers = peers
         self.pasteboard = pasteboard
-        self.defaults = defaults
+        self.defaults = resolvedDefaults
         self.removeCredential = removeCredential
         self.removeAllCredentials = removeAllCredentials
-        streamResolution = defaults.string(forKey: StreamPreferenceStore.resolutionKey)
+        streamResolution = resolvedDefaults.string(forKey: StreamPreferenceStore.resolutionKey)
             .flatMap(StreamResolutionPreference.init(rawValue:)) ?? .adaptive
-        streamFrameRate = StreamPreferenceStore.loadFrameRate(defaults: defaults)
-        ultraModeEnabled = StreamPreferenceStore.loadUltraMode(defaults: defaults)
+        streamFrameRate = StreamPreferenceStore.loadFrameRate(defaults: resolvedDefaults)
+        ultraModeEnabled = StreamPreferenceStore.loadUltraMode(defaults: resolvedDefaults)
         let directory = receiveDirectory ?? Self.transferDirectoryURL()
         self.receiveDirectory = directory
         fileTransfer = FileTransferEngine(receiveDirectory: { directory })
 
-        let savedRoutes = SavedMacRouteStore.routes(defaults: defaults)
-        let storedMacID = defaults.string(forKey: "macViewer.selectedMacID")
-        let legacyName = defaults.string(forKey: "macViewer.selectedMacName")
-        let selectedRoute = storedMacID.flatMap { SavedMacRouteStore.route(macID: $0, defaults: defaults) }
-            ?? legacyName.flatMap { SavedMacRouteStore.route(named: $0, defaults: defaults) }
+        let savedRoutes = SavedMacRouteStore.routes(defaults: resolvedDefaults)
+        let storedMacID = resolvedDefaults.string(forKey: "macViewer.selectedMacID")
+        let legacyName = resolvedDefaults.string(forKey: "macViewer.selectedMacName")
+        let selectedRoute = storedMacID.flatMap { SavedMacRouteStore.route(macID: $0, defaults: resolvedDefaults) }
+            ?? legacyName.flatMap { SavedMacRouteStore.route(named: $0, defaults: resolvedDefaults) }
         selectedMacID = selectedRoute?.macID
         selectedMacName = selectedRoute?.name
         selectedDeviceID = selectedRoute?.macID
         if selectedRoute == nil {
-            defaults.removeObject(forKey: "macViewer.selectedMacID")
-            defaults.removeObject(forKey: "macViewer.selectedMacName")
+            resolvedDefaults.removeObject(forKey: "macViewer.selectedMacID")
+            resolvedDefaults.removeObject(forKey: "macViewer.selectedMacName")
         } else if let selectedRoute {
-            defaults.set(selectedRoute.macID, forKey: "macViewer.selectedMacID")
-            defaults.set(selectedRoute.name, forKey: "macViewer.selectedMacName")
+            resolvedDefaults.set(selectedRoute.macID, forKey: "macViewer.selectedMacID")
+            resolvedDefaults.set(selectedRoute.name, forKey: "macViewer.selectedMacName")
         }
         discoveredMacs = Array(Set(savedRoutes.map(\.name))).sorted()
         refreshDevices()
@@ -593,6 +607,7 @@ final class MacViewerConnectionModel: ObservableObject {
         isConnected = false
         didReportVisibleImageForSession = false
         isStreaming = false
+        remoteInputAuthorized = false
         pairingRequired = false
         resetVideoMetrics()
         videoDisplay.flush()
@@ -632,7 +647,7 @@ final class MacViewerConnectionModel: ObservableObject {
     }
 
     func sendInput(_ input: RemoteInputEvent) {
-        guard isConnected, isStreaming else { return }
+        guard isConnected, remoteInputAuthorized else { return }
         inputSequence &+= 1
         var sequenced = input
         sequenced.sequence = inputSequence
@@ -892,7 +907,7 @@ final class MacViewerConnectionModel: ObservableObject {
             isConnected = false
             didReportVisibleImageForSession = false
             isStreaming = false
-            remoteInputAuthorized = true
+            remoteInputAuthorized = false
             connectionLatencyMS = nil
             connectionHealthDetail = "Waiting for encrypted link"
             streamDimensions = "Waiting for video"
@@ -953,7 +968,7 @@ final class MacViewerConnectionModel: ObservableObject {
                 status = "Connected to " + (lastRemoteMacName ?? "Mac")
             } else if value.hasPrefix("fallback-error:") {
                 isStreaming = false
-                status = "Mac permission required"
+                status = "Screen capture unavailable"
                 detail = String(value.dropFirst("fallback-error:".count))
             } else if value == StreamSessionSignal.videoRefresh {
                 videoDisplay.prepareForForegroundResume()
@@ -1176,7 +1191,7 @@ final class MacViewerConnectionModel: ObservableObject {
     private static func transferDirectoryURL() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         return base
-            .appendingPathComponent("SidecarBridge", isDirectory: true)
+            .appendingPathComponent(BridgeConstants.applicationSupportDirectoryName, isDirectory: true)
             .appendingPathComponent(Self.transferDirectoryName, isDirectory: true)
     }
 }

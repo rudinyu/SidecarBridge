@@ -9,7 +9,11 @@ final class MacConnectionModel: ObservableObject {
     @Published var detail = "Looking for a remote viewer."
     @Published var isStreaming = false
     @Published var hasPadPeer = false
+#if SIDECARBRIDGE_FORK
+    let screenDockHostWindowBehavior = ScreenDockHostWindowBehavior()
+#else
     @Published private(set) var shouldMinimizeMainWindowForPresentedImage = false
+#endif
     @Published var showingNativeSidecarSetup = false
     @Published var nativeSidecarRoute: NativeSidecarRoute = .nearby
     @Published private(set) var nativeSidecarProgress = NativeSidecarSetupProgress()
@@ -27,6 +31,10 @@ final class MacConnectionModel: ObservableObject {
     @Published var connectionLatencyMS: Int?
     @Published var streamMemoryPressure: StreamMemoryPressureLevel = .normal
     @Published var senderVideoTelemetryDetail = "Not measured"
+#if SIDECARBRIDGE_FORK
+    @Published private(set) var captureLifecycleDetail = "Capture has not started."
+    @Published private(set) var viewerPresentationDetail = "No Viewer presentation signal received."
+#endif
     @Published var p2pState: MacP2PState = .starting
     @Published var fileTransferSnapshot: FileTransferSnapshot?
     @Published var lastReceivedFile: URL?
@@ -93,7 +101,7 @@ final class MacConnectionModel: ObservableObject {
         if hasPadPeer {
             return "The viewer is connected. Start In-App Display when you want to share the Mac screen."
         }
-        return "Keep SidecarBridge open, then choose this Mac in the iPad app or open Mac Viewer on another Mac."
+        return "Keep \(BridgeConstants.applicationName) open, then choose this Mac in the iPad app or open \(BridgeConstants.viewerApplicationName) on another Mac."
     }
 
     var sessionBadge: String {
@@ -111,12 +119,14 @@ final class MacConnectionModel: ObservableObject {
             throw CocoaError(.fileNoSuchFile)
         }
         return applicationSupport
-            .appendingPathComponent("SidecarBridge", isDirectory: true)
+            .appendingPathComponent(BridgeConstants.applicationSupportDirectoryName, isDirectory: true)
             .appendingPathComponent("Transfers", isDirectory: true)
     }
     private var started = false
     private var isStartingFallback = false
+#if !SIDECARBRIDGE_FORK
     private var didRequestMainWindowMinimizeForViewerImage = false
+#endif
     private var accessibilityPollTask: Task<Void, Never>?
     private var screenRecordingPollTask: Task<Void, Never>?
     private var streamResumeRetentionTask: Task<Void, Never>?
@@ -124,6 +134,20 @@ final class MacConnectionModel: ObservableObject {
     private var captureRefreshRetryTask: Task<Void, Never>?
     private var captureRefreshRetryGeneration = UUID()
     private var captureRefreshFailureCount = 0
+#if SIDECARBRIDGE_FORK
+    private let screenDockRemoteActivity = ScreenDockRemoteActivity()
+    private var screenDockCaptureRecoveryBudget = ScreenDockCaptureRecoveryBudget()
+    private var screenDockCaptureRequestGeneration = UUID()
+    private var screenDockCaptureRecoveryGeneration = UUID()
+    private var screenDockCaptureRecoveryTask: Task<Void, Never>?
+    private var screenDockFirstFrameDeadlineTask: Task<Void, Never>?
+    private var screenDockCaptureRecoveryInProgress = false
+    private var screenDockCaptureRecoveryExhausted = false
+    private var screenDockCaptureRequested = false
+    private var screenDockLastEnvironmentRecoveryUptime = -Double.infinity
+    private var screenDockLastInputRecoveryUptime = -Double.infinity
+    private var screenDockWorkspaceObservers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
+#endif
     private var remoteViewerIsBackgrounded = false
     private var pendingFileURLs: [URL] = []
     private var clipboardMonitorTask: Task<Void, Never>?
@@ -179,7 +203,7 @@ final class MacConnectionModel: ObservableObject {
             self.localNetworkAccess = state
             if state.needsPermission && !self.hasPadPeer {
                 self.status = "Allow Local Network access"
-                self.detail = "macOS blocked direct discovery. Turn on SidecarBridge in Privacy & Security → Local Network."
+                self.detail = "macOS blocked direct discovery. Turn on \(BridgeConstants.applicationName) in Privacy & Security → Local Network."
             }
         }
 
@@ -200,22 +224,108 @@ final class MacConnectionModel: ObservableObject {
         streamer.onCaptureRefreshCompleted = { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+#if SIDECARBRIDGE_FORK
+                self.screenDockCaptureRecoveryInProgress = false
+                self.remoteInput.setTargetDisplayID(self.streamer.captureDisplayID)
+                if let generation = self.streamer.currentCaptureGeneration,
+                   self.streamer.hasEncodedFrame(for: generation) {
+                    self.connectionHealthDetail = "Capture source has produced an encoded frame."
+                } else {
+                    self.connectionHealthDetail = "Capture source started; waiting for first encoded frame."
+                }
+#else
                 self.cancelCaptureRefreshRetry(resetFailureCount: true)
                 // A monitor can be attached or removed while iPadOS is in the
                 // background. Keep remote input on the same display that the
                 // newly rebuilt ScreenCaptureKit stream is showing.
                 self.remoteInput.setTargetDisplayID(self.streamer.captureDisplayID)
                 self.connectionHealthDetail = "Viewer returned — fresh Mac display frame"
+#endif
             }
         }
         streamer.onCaptureRefreshFailed = { [weak self] error in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+#if SIDECARBRIDGE_FORK
+                self.screenDockCaptureRecoveryInProgress = false
+                self.captureLifecycleDetail = "Capture refresh failed: \(error.localizedDescription)"
+                self.connectionHealthDetail = "Capture recovery is pending"
+                self.requestScreenDockCaptureRecovery(reason: "capture refresh failed")
+#else
                 self.connectionHealthDetail = "Viewer returned — capture refresh delayed"
                 self.detail = "The Mac display is still recovering: \(error.localizedDescription)"
                 self.scheduleCaptureRefreshRetry()
+#endif
             }
         }
+#if SIDECARBRIDGE_FORK
+        streamer.onCaptureStarted = { [weak self] generation in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.hasPadPeer,
+                      self.streamer.currentCaptureGeneration == generation,
+                      self.screenDockCaptureRequested,
+                      self.isStreaming || self.isStartingFallback || self.screenDockCaptureRecoveryInProgress else { return }
+                self.screenDockCaptureRecoveryInProgress = false
+                self.captureLifecycleDetail = self.streamer.hasEncodedFrame(for: generation)
+                    ? "Capture source has produced an encoded frame."
+                    : "Capture source started; waiting for first encoded frame."
+                if !self.streamer.hasEncodedFrame(for: generation) {
+                    self.scheduleScreenDockFirstFrameDeadline(generation: generation)
+                }
+            }
+        }
+        streamer.onFirstEncodedFrame = { [weak self] generation in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.streamer.currentCaptureGeneration == generation,
+                      self.hasPadPeer else { return }
+                self.screenDockFirstFrameDeadlineTask?.cancel()
+                self.screenDockFirstFrameDeadlineTask = nil
+                self.screenDockCaptureRecoveryBudget.encodedFrameReceived()
+                self.screenDockCaptureRecoveryExhausted = false
+                if self.screenDockCaptureRecoveryTask != nil {
+                    self.screenDockCaptureRecoveryGeneration = UUID()
+                    self.screenDockCaptureRecoveryTask?.cancel()
+                    self.screenDockCaptureRecoveryTask = nil
+                }
+                self.screenDockCaptureRecoveryInProgress = false
+                self.captureLifecycleDetail = "First encoded frame produced; Viewer presentation is tracked separately."
+                self.connectionHealthDetail = "Capture source has produced an encoded frame."
+            }
+        }
+        streamer.onCaptureSourceStopped = { [weak self] generation, domain, code in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.streamer.isCurrentUnexpectedStop(for: generation),
+                      self.hasPadPeer,
+                      self.screenDockCaptureRequested,
+                      self.isStreaming || self.isStartingFallback || self.screenDockCaptureRecoveryInProgress else { return }
+                self.screenDockFirstFrameDeadlineTask?.cancel()
+                self.screenDockFirstFrameDeadlineTask = nil
+                self.captureLifecycleDetail = "Capture stream stopped (\(domain)/\(code))."
+                self.connectionHealthDetail = "Capture stream stopped; recovery is pending"
+                self.requestScreenDockCaptureRecovery(
+                    reason: "capture stream stopped",
+                    failedGeneration: generation
+                )
+            }
+        }
+        streamer.onCaptureSourceUnavailable = { [weak self] generation, frameStatus in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.hasPadPeer,
+                      self.screenDockCaptureRequested,
+                      self.streamer.currentCaptureGeneration == generation else { return }
+                self.captureLifecycleDetail = "Capture source returned sustained \(frameStatus) frames."
+                self.connectionHealthDetail = "Capture source is \(frameStatus); recovery is pending"
+                self.requestScreenDockCaptureRecovery(
+                    reason: "sustained \(frameStatus) capture frames",
+                    failedGeneration: generation
+                )
+            }
+        }
+#endif
         streamer.onMemoryPressureChanged = { [weak self] level in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -236,10 +346,25 @@ final class MacConnectionModel: ObservableObject {
         peers.onConnectionChanged = { [weak self] connected, peerOrError in
             guard let self else { return }
             if !connected {
+#if SIDECARBRIDGE_FORK
+                self.screenDockHostWindowBehavior.viewerDisconnected()
+                self.viewerPresentationDetail = "No Viewer presentation signal received."
+#else
                 self.didRequestMainWindowMinimizeForViewerImage = false
                 self.shouldMinimizeMainWindowForPresentedImage = false
+#endif
             }
             self.hasPadPeer = connected
+#if SIDECARBRIDGE_FORK
+            if connected {
+                self.viewerPresentationDetail = "No Viewer presentation signal received."
+                self.screenDockRemoteActivity.beginAuthenticatedSession()
+                self.screenDockCaptureRecoveryBudget.resetForNewAuthenticatedSession()
+            } else {
+                self.screenDockRemoteActivity.endAuthenticatedSession()
+                self.cancelScreenDockCaptureRecovery(preserveRequest: self.isStreaming)
+            }
+#endif
             if !connected {
                 self.cancelCaptureRefreshRetry(resetFailureCount: true)
                 self.senderVideoTelemetryDetail = "Not measured"
@@ -277,7 +402,7 @@ final class MacConnectionModel: ObservableObject {
                 if peerOrError.localizedCaseInsensitiveContains("NoAuth") {
                     self.localNetworkAccess = .denied
                     self.status = "Allow Local Network access"
-                    self.detail = "macOS blocked same-Wi-Fi discovery. Turn on SidecarBridge in Privacy & Security → Local Network."
+                    self.detail = "macOS blocked same-Wi-Fi discovery. Turn on \(BridgeConstants.applicationName) in Privacy & Security → Local Network."
                 } else {
                     self.status = "Nearby connection unavailable"
                     self.detail = peerOrError
@@ -294,7 +419,7 @@ final class MacConnectionModel: ObservableObject {
                 self.connectionLatencyMS = nil
                 self.connectionTransport = "Searching direct P2P"
                 self.status = "Waiting for a remote viewer"
-                self.detail = "Open SidecarBridge on an iPad/iPhone, or Mac Viewer on another Mac."
+                self.detail = "Open SidecarBridge on an iPad/iPhone, or \(BridgeConstants.viewerApplicationName) on another Mac."
                 self.remoteInput.releaseButtons()
                 self.pendingFileURLs.removeAll(keepingCapacity: false)
                 self.queuedFileCount = 0
@@ -318,7 +443,14 @@ final class MacConnectionModel: ObservableObject {
                     ))
                 }
                 DispatchQueue.main.async { [weak self] in
-                    self?.refreshRemoteInputPermissionStatus()
+                    guard let self else { return }
+#if SIDECARBRIDGE_FORK
+                    if accepted {
+                        self.screenDockRemoteActivity.noteAcceptedRemoteInput()
+                        self.rearmScreenDockCaptureRecoveryAfterInput()
+                    }
+#endif
+                    self.refreshRemoteInputPermissionStatus()
                 }
             }
         }
@@ -337,6 +469,232 @@ final class MacConnectionModel: ObservableObject {
         configureFileTransfer()
         startClipboardMonitoring()
     }
+
+#if SIDECARBRIDGE_FORK
+    deinit {
+        screenDockWorkspaceObservers.forEach { $0.center.removeObserver($0.token) }
+    }
+
+    private func installScreenDockWorkspaceObservers() {
+        guard screenDockWorkspaceObservers.isEmpty else { return }
+
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        let wakeToken = workspaceCenter.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleScreenDockEnvironmentChange(reason: "display woke")
+            }
+        }
+        screenDockWorkspaceObservers.append((workspaceCenter, wakeToken))
+
+        let applicationCenter = NotificationCenter.default
+        let screenToken = applicationCenter.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleScreenDockEnvironmentChange(reason: "display configuration changed")
+            }
+        }
+        screenDockWorkspaceObservers.append((applicationCenter, screenToken))
+    }
+
+    private func handleScreenDockEnvironmentChange(reason: String) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - screenDockLastEnvironmentRecoveryUptime >= 10 else { return }
+        screenDockLastEnvironmentRecoveryUptime = now
+        screenDockCaptureRecoveryBudget.resetForDisplayWake()
+        screenDockCaptureRecoveryExhausted = false
+        guard hasPadPeer, screenDockCaptureRequested else { return }
+        captureLifecycleDetail = "\(reason); checking the capture source."
+        requestScreenDockCaptureRecovery(reason: reason, forceRefresh: true)
+    }
+
+    private func rearmScreenDockCaptureRecoveryAfterInput() {
+        guard hasPadPeer,
+              screenDockCaptureRequested,
+              !screenDockCaptureRecoveryInProgress else { return }
+        let activeGeneration = streamer.currentCaptureGeneration
+        let staleCaptureGeneration = activeGeneration.flatMap { generation in
+            streamer.needsCaptureRecoveryAfterInput(
+                for: generation,
+                inactivityThreshold: ScreenDockCaptureRecoveryBudget.inputRecoveryInactivityThreshold
+            ) ? generation : nil
+        }
+        guard screenDockCaptureRecoveryExhausted || staleCaptureGeneration != nil else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - screenDockLastInputRecoveryUptime >= ScreenDockCaptureRecoveryBudget.inputRecoveryDebounce else { return }
+        screenDockLastInputRecoveryUptime = now
+        if screenDockCaptureRecoveryExhausted {
+            screenDockCaptureRecoveryBudget.resetForDisplayWake()
+        }
+        screenDockCaptureRecoveryExhausted = false
+        captureLifecycleDetail = screenDockCaptureRecoveryBudget.attemptsWithoutEncodedFrame == 0
+            ? "Accepted remote input re-armed bounded capture recovery."
+            : "Accepted remote input detected stale capture and scheduled bounded recovery."
+        requestScreenDockCaptureRecovery(
+            reason: "accepted remote input",
+            forceRefresh: true,
+            revalidateCaptureHealthForGeneration: staleCaptureGeneration
+        )
+    }
+
+    private func cancelScreenDockCaptureRecovery(
+        preserveRequest: Bool,
+        resetBudget: Bool = false
+    ) {
+        screenDockCaptureRecoveryGeneration = UUID()
+        screenDockCaptureRecoveryTask?.cancel()
+        screenDockCaptureRecoveryTask = nil
+        screenDockFirstFrameDeadlineTask?.cancel()
+        screenDockFirstFrameDeadlineTask = nil
+        screenDockCaptureRecoveryInProgress = false
+        if resetBudget {
+            screenDockCaptureRecoveryBudget.resetForNewAuthenticatedSession()
+            screenDockCaptureRecoveryExhausted = false
+        }
+        if !preserveRequest {
+            screenDockCaptureRequested = false
+            screenDockCaptureRequestGeneration = UUID()
+            screenDockCaptureRecoveryExhausted = false
+        }
+    }
+
+    private func scheduleScreenDockFirstFrameDeadline(generation: UInt64) {
+        screenDockFirstFrameDeadlineTask?.cancel()
+        let requestGeneration = screenDockCaptureRequestGeneration
+        screenDockFirstFrameDeadlineTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(
+                for: .seconds(ScreenDockCaptureRecoveryBudget.firstEncodedFrameDeadline)
+            )
+            guard !Task.isCancelled,
+                  let self,
+                  self.screenDockCaptureRequestGeneration == requestGeneration,
+                  self.screenDockCaptureRequested,
+                  self.hasPadPeer,
+                  self.streamer.currentCaptureGeneration == generation,
+                  !self.streamer.hasEncodedFrame(for: generation) else { return }
+            self.screenDockFirstFrameDeadlineTask = nil
+            self.captureLifecycleDetail = "Capture source started but produced no encoded frame before the deadline."
+            self.connectionHealthDetail = "Capture source is waiting for its first encoded frame"
+            self.requestScreenDockCaptureRecovery(
+                reason: "no encoded frame after source start",
+                failedGeneration: generation
+            )
+        }
+    }
+
+    private func requestScreenDockCaptureRecovery(
+        reason: String,
+        failedGeneration: UInt64? = nil,
+        forceRefresh: Bool = false,
+        revalidateCaptureHealthForGeneration: UInt64? = nil
+    ) {
+        guard hasPadPeer, screenDockCaptureRequested else { return }
+        if let failedGeneration,
+           let activeGeneration = streamer.currentCaptureGeneration,
+           activeGeneration != failedGeneration {
+            return
+        }
+        guard !screenDockCaptureRecoveryInProgress else { return }
+        guard let delay = screenDockCaptureRecoveryBudget.nextRetryDelay() else {
+            screenDockCaptureRecoveryInProgress = false
+            screenDockCaptureRecoveryExhausted = true
+            captureLifecycleDetail = "Automatic capture recovery stopped after three attempts."
+            connectionHealthDetail = "Display capture needs attention"
+            status = "Display capture needs attention"
+            detail = "\(reason). Start the display stream again to retry."
+            peers.send(ControlMessage(
+                .status,
+                detail: "fallback-error:Automatic display capture recovery stopped after three attempts."
+            ))
+            return
+        }
+
+        let recoveryGeneration = UUID()
+        screenDockCaptureRecoveryGeneration = recoveryGeneration
+        screenDockCaptureRecoveryInProgress = true
+        screenDockCaptureRecoveryExhausted = false
+        captureLifecycleDetail = "\(reason); automatic capture recovery attempt \(screenDockCaptureRecoveryBudget.attemptsWithoutEncodedFrame) is scheduled."
+        screenDockCaptureRecoveryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled,
+                  let self,
+                  self.screenDockCaptureRecoveryGeneration == recoveryGeneration,
+                  self.screenDockCaptureRequested,
+                  self.hasPadPeer else { return }
+            self.screenDockCaptureRecoveryTask = nil
+
+            if let generation = revalidateCaptureHealthForGeneration {
+                guard self.streamer.currentCaptureGeneration == generation else {
+                    self.screenDockCaptureRecoveryInProgress = false
+                    self.captureLifecycleDetail = "Capture source changed before input-triggered recovery."
+                    return
+                }
+                guard self.streamer.needsCaptureRecoveryAfterInput(
+                    for: generation,
+                    inactivityThreshold: ScreenDockCaptureRecoveryBudget.inputRecoveryInactivityThreshold
+                ) else {
+                    self.screenDockCaptureRecoveryInProgress = false
+                    self.captureLifecycleDetail = "Capture source resumed before input-triggered recovery."
+                    return
+                }
+            }
+
+            if !forceRefresh,
+               let activeGeneration = self.streamer.currentCaptureGeneration,
+               self.streamer.hasEncodedFrame(for: activeGeneration),
+               !self.streamer.isCaptureSourceUnavailable(for: activeGeneration) {
+                self.screenDockCaptureRecoveryInProgress = false
+                self.captureLifecycleDetail = "Capture source is producing encoded frames."
+                return
+            }
+
+            if self.streamer.isCaptureActive {
+                self.streamer.refreshCaptureAfterForeground(force: true)
+                return
+            }
+
+            do {
+                try await self.streamer.start(resetSequence: false)
+                guard !Task.isCancelled,
+                      self.screenDockCaptureRecoveryGeneration == recoveryGeneration,
+                      self.screenDockCaptureRequested,
+                      self.hasPadPeer else { return }
+                guard self.streamer.isCaptureActive else {
+                    self.screenDockCaptureRecoveryInProgress = false
+                    self.captureLifecycleDetail = "A capture start is still pending; another bounded retry is scheduled."
+                    self.requestScreenDockCaptureRecovery(reason: "capture start remained pending")
+                    return
+                }
+                self.remoteInput.setTargetDisplayID(self.streamer.captureDisplayID)
+                let wasStreaming = self.isStreaming
+                self.isStartingFallback = false
+                self.isStreaming = true
+                self.screenRecordingAuthorized = true
+                self.status = "Streaming to viewer"
+                self.detail = "The authenticated display stream has restarted; waiting for video frames."
+                self.connectionHealthDetail = "Capture source started; waiting for first encoded frame"
+                self.screenDockCaptureRecoveryInProgress = false
+                if !wasStreaming {
+                    self.peers.send(ControlMessage(.status, detail: "fallback-active"))
+                }
+            } catch {
+                guard self.screenDockCaptureRecoveryGeneration == recoveryGeneration,
+                      self.screenDockCaptureRequested,
+                      self.hasPadPeer else { return }
+                self.screenDockCaptureRecoveryInProgress = false
+                self.captureLifecycleDetail = "Capture recovery attempt failed: \(error.localizedDescription)"
+                self.connectionHealthDetail = "Capture recovery is pending"
+                self.requestScreenDockCaptureRecovery(reason: "capture recovery attempt failed")
+            }
+        }
+    }
+#endif
 
     var isFileTransferring: Bool { fileTransfer.isBusy }
 
@@ -403,11 +761,11 @@ final class MacConnectionModel: ObservableObject {
 
     func openTransferFolder() {
         guard let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            fileTransferError = "The SidecarBridge application-support folder is unavailable."
+            fileTransferError = "The \(BridgeConstants.applicationName) application-support folder is unavailable."
             return
         }
         let directory = applicationSupport
-            .appendingPathComponent("SidecarBridge", isDirectory: true)
+            .appendingPathComponent(BridgeConstants.applicationSupportDirectoryName, isDirectory: true)
             .appendingPathComponent("Transfers", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -460,12 +818,15 @@ final class MacConnectionModel: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+#if SIDECARBRIDGE_FORK
+        installScreenDockWorkspaceObservers()
+#endif
         repairLaunchAtLoginIfNeeded()
         refreshPermissions()
         peers.start()
         startClipboardMonitoring()
         status = "Waiting for a remote viewer"
-        detail = "Open SidecarBridge on your iPad or iPhone, or Mac Viewer on another Mac, and tap Connect. Apple Sidecar setup is separate."
+        detail = "Open SidecarBridge on your iPad or iPhone, or \(BridgeConstants.viewerApplicationName) on another Mac, and tap Connect. Apple Sidecar setup is separate."
     }
 
     func setShutdownProtectionEnabled(_ enabled: Bool) {
@@ -473,7 +834,7 @@ final class MacConnectionModel: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: shutdownProtectionDefaultsKey)
         shutdownProtectionDetail = enabled
             ? "Ready to preserve remote control during system shutdown."
-            : "Off — SidecarBridge will quit when macOS asks it to."
+            : "Off — \(BridgeConstants.applicationName) will quit when macOS asks it to."
     }
 
     func setStreamResolution(_ resolution: StreamResolutionPreference) {
@@ -544,6 +905,10 @@ final class MacConnectionModel: ObservableObject {
     }
 
     func prepareForTermination() {
+#if SIDECARBRIDGE_FORK
+        cancelScreenDockCaptureRecovery(preserveRequest: false, resetBudget: true)
+        screenDockRemoteActivity.endAuthenticatedSession()
+#endif
         accessibilityPollTask?.cancel()
         accessibilityPollTask = nil
         screenRecordingPollTask?.cancel()
@@ -557,7 +922,7 @@ final class MacConnectionModel: ObservableObject {
         clipboardMonitorTask = nil
         pendingFileURLs.removeAll(keepingCapacity: false)
         queuedFileCount = 0
-        fileTransfer.cancelAll(reason: "SidecarBridge is quitting.")
+        fileTransfer.cancelAll(reason: "\(BridgeConstants.applicationName) is quitting.")
         remoteInput.releaseButtons()
         streamer.stop()
         peers.stop()
@@ -614,6 +979,24 @@ final class MacConnectionModel: ObservableObject {
             detail = "The private stream starts after the two apps find each other."
             return
         }
+#if SIDECARBRIDGE_FORK
+        if !isStreaming && !isStartingFallback {
+            if screenDockCaptureRecoveryInProgress && !screenDockCaptureRecoveryExhausted {
+                return
+            }
+            if !screenDockCaptureRequested || screenDockCaptureRecoveryExhausted {
+                screenDockCaptureRequested = true
+                screenDockCaptureRequestGeneration = UUID()
+                screenDockCaptureRecoveryBudget.resetForNewAuthenticatedSession()
+                screenDockCaptureRecoveryExhausted = false
+            }
+        }
+        if screenDockCaptureRecoveryExhausted {
+            screenDockCaptureRecoveryBudget.resetForNewAuthenticatedSession()
+            screenDockCaptureRecoveryExhausted = false
+            screenDockCaptureRequestGeneration = UUID()
+        }
+#endif
         if isStreaming {
             cancelStreamResumeRetention()
             remoteViewerIsBackgrounded = false
@@ -656,6 +1039,53 @@ final class MacConnectionModel: ObservableObject {
 
         status = "Starting app stream…"
         detail = "macOS may ask for Screen Recording permission."
+#if SIDECARBRIDGE_FORK
+        let requestGeneration = screenDockCaptureRequestGeneration
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.streamer.start()
+                guard self.screenDockCaptureRequestGeneration == requestGeneration,
+                      self.screenDockCaptureRequested,
+                      self.hasPadPeer else { return }
+                self.remoteInput.setTargetDisplayID(self.streamer.captureDisplayID)
+                self.remoteInput.currentPointerPosition { [weak self] pointer in
+                    guard let self, let pointer else { return }
+                    DispatchQueue.main.async {
+                        self.peers.send(ControlMessage(
+                            .status,
+                            detail: "pointer-position:\(pointer.x):\(pointer.y)"
+                        ))
+                    }
+                }
+                self.isStartingFallback = false
+                self.isStreaming = true
+                self.screenRecordingAuthorized = true
+                self.status = "Streaming to viewer"
+                self.detail = "Using the encrypted app stream with remote keyboard and pointer input."
+                self.peers.send(ControlMessage(.status, detail: "fallback-active"))
+            } catch {
+                guard self.screenDockCaptureRequestGeneration == requestGeneration,
+                      self.screenDockCaptureRequested else { return }
+                self.isStartingFallback = false
+                self.status = "App stream needs attention"
+                self.detail = error.localizedDescription
+                self.captureLifecycleDetail = "Capture start failed: \(error.localizedDescription)"
+                self.connectionHealthDetail = "Capture start failed; recovery is pending"
+                self.peers.send(ControlMessage(.status, detail: "fallback-error:\(error.localizedDescription)"))
+                let isPermissionFailure: Bool
+                if let streamError = error as? ScreenStreamer.StreamError,
+                   case .permissionRequired = streamError {
+                    isPermissionFailure = true
+                } else {
+                    isPermissionFailure = false
+                }
+                if !isPermissionFailure {
+                    self.requestScreenDockCaptureRecovery(reason: "capture start failed")
+                }
+            }
+        }
+#else
         Task {
             do {
                 try await streamer.start()
@@ -682,9 +1112,13 @@ final class MacConnectionModel: ObservableObject {
                 peers.send(ControlMessage(.status, detail: "fallback-error:\(error.localizedDescription)"))
             }
         }
+#endif
     }
 
     func stopFallback() {
+#if SIDECARBRIDGE_FORK
+        cancelScreenDockCaptureRecovery(preserveRequest: false, resetBudget: true)
+#endif
         streamResumeRetentionTask?.cancel()
         streamResumeRetentionTask = nil
         cancelCaptureRefreshRetry(resetFailureCount: true)
@@ -796,7 +1230,7 @@ final class MacConnectionModel: ObservableObject {
             detail = "The Mac screen is ready for the encrypted app stream."
         } else {
             status = "Allow Screen Recording"
-            detail = "Enable SidecarBridge in Privacy & Security → Screen & System Audio Recording."
+            detail = "Enable \(BridgeConstants.applicationName) in Privacy & Security → Screen & System Audio Recording."
             openScreenRecordingSettings()
             pollForScreenRecordingAccess()
         }
@@ -820,6 +1254,12 @@ final class MacConnectionModel: ObservableObject {
         let removed = MacPairingSecurity.shared.forgetAllDevices()
         MacAuthorizedDeviceStore.shared.forgetAll()
         pairedPeer = removed ? nil : "Revoked devices — Keychain cleanup incomplete"
+#if SIDECARBRIDGE_FORK
+        screenDockHostWindowBehavior.viewerDisconnected()
+#else
+        didRequestMainWindowMinimizeForViewerImage = false
+        shouldMinimizeMainWindowForPresentedImage = false
+#endif
         hasPadPeer = false
         remoteSystemInformation = nil
         status = removed ? "All devices disconnected and forgotten" : "Disconnected — Keychain cleanup needs attention"
@@ -837,7 +1277,7 @@ final class MacConnectionModel: ObservableObject {
         let security = MacPairingSecurity.shared
         return PairingInvitation(
             macID: security.macID,
-            name: PairingInvitation.displayName(Host.current().localizedName ?? "Mac"),
+            name: BridgeConstants.pairingDisplayName(machineName: Host.current().localizedName),
             code: PairingCode.normalize(pairingCode),
             hosts: Array(BridgeNetworkMetadata.localPrivateIPv4Addresses().prefix(8)),
             expiresAt: security.pairingCodeExpiresAt
@@ -848,7 +1288,7 @@ final class MacConnectionModel: ObservableObject {
         localSystemInformation = SystemInformation.current()
         diagnosticActionDetail = hasPadPeer
             ? "Refreshed this Mac and requested the connected device."
-            : "Refreshed this Mac. Connect an iPad, iPhone, or Mac Viewer to see both devices."
+            : "Refreshed this Mac. Connect an iPad, iPhone, or \(BridgeConstants.viewerApplicationName) to see both devices."
         exchangeSystemInformation()
     }
 
@@ -1056,6 +1496,11 @@ final class MacConnectionModel: ObservableObject {
                 remoteInputAuthorized ? "Passed" : "Required"
             )
         )
+#if SIDECARBRIDGE_FORK
+        connectionFields.append(DiagnosticField("Capture lifecycle", captureLifecycleDetail))
+        connectionFields.append(DiagnosticField("Capture source counters", streamer.captureDiagnosticsSummary))
+        connectionFields.append(DiagnosticField("Viewer presentation", viewerPresentationDetail))
+#endif
         return DiagnosticReportBuilder.make(
             local: localSystemInformation,
             remote: remoteSystemInformation,
@@ -1135,7 +1580,7 @@ final class MacConnectionModel: ObservableObject {
             launchAtLoginNeedsApproval = false
             let registeredPath = UserDefaults.standard.string(forKey: "loginItemBundlePath")
             if registeredPath == Bundle.main.bundlePath {
-                launchAtLoginDetail = "On — SidecarBridge will start after you sign in."
+                launchAtLoginDetail = "On — \(BridgeConstants.applicationName) will start after you sign in."
             } else {
                 launchAtLoginDetail = "On, but it may point to an older build. Click Repair."
             }
@@ -1146,7 +1591,7 @@ final class MacConnectionModel: ObservableObject {
         case .notRegistered:
             launchAtLogin = false
             launchAtLoginNeedsApproval = false
-            launchAtLoginDetail = "Off — SidecarBridge must be opened manually."
+            launchAtLoginDetail = "Off — \(BridgeConstants.applicationName) must be opened manually."
         case .notFound:
             launchAtLogin = false
             launchAtLoginNeedsApproval = false
@@ -1182,7 +1627,7 @@ final class MacConnectionModel: ObservableObject {
             sendRemoteInputPermissionStatus()
         } else {
             status = "Allow Mac input access"
-            detail = "Allow SidecarBridge to post keyboard and pointer events; macOS may show a native permission prompt."
+            detail = "Allow \(BridgeConstants.applicationName) to post keyboard and pointer events; macOS may show a native permission prompt."
             remoteInput.openAccessibilitySettings()
             pollForAccessibilityAccess()
         }
@@ -1298,9 +1743,14 @@ final class MacConnectionModel: ObservableObject {
                         streamer.refreshCaptureAfterForeground(force: true)
                     }
                 } else if detail == "viewer-image-presented" {
+#if SIDECARBRIDGE_FORK
+                    viewerPresentationDetail = "Viewer reported that a frame was rendered."
+                    screenDockHostWindowBehavior.viewerPresentedImage(isConnected: hasPadPeer)
+#else
                     guard hasPadPeer, !didRequestMainWindowMinimizeForViewerImage else { return }
                     didRequestMainWindowMinimizeForViewerImage = true
                     shouldMinimizeMainWindowForPresentedImage = true
+#endif
                 } else if detail == "video-keyframe-needed" {
                     // The iPad detected a sequence gap or a decoder queue
                     // reset. Recover immediately instead of waiting for the
@@ -1323,7 +1773,14 @@ final class MacConnectionModel: ObservableObject {
                     ))
                 }
                 DispatchQueue.main.async { [weak self] in
-                    self?.refreshRemoteInputPermissionStatus()
+                    guard let self else { return }
+#if SIDECARBRIDGE_FORK
+                    if accepted {
+                        self.screenDockRemoteActivity.noteAcceptedRemoteInput()
+                        self.rearmScreenDockCaptureRecoveryAfterInput()
+                    }
+#endif
+                    self.refreshRemoteInputPermissionStatus()
                 }
             }
         case .requestSystemInformation:

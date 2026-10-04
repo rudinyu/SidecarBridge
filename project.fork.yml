@@ -5,17 +5,46 @@ name: SidecarBridgeFork
 # This overlay is the only project definition used to build the fork apps.
 settings:
   base:
-    MARKETING_VERSION: "1.4"
-    CURRENT_PROJECT_VERSION: "122"
+    MARKETING_VERSION: "1.5"
+    CURRENT_PROJECT_VERSION: "123"
 
 targets:
   SidecarBridgeMac:
     sources:REPLACE:
       - Shared
-      - Mac
+      - path: Mac
+        excludes:
+          - Info.plist
       - Pad/PadDeviceIdentity.swift
       - Pad/PadLANService.swift
       - Pad/PadPeerService.swift
+      - Fork/Runtime
+      - path: Fork/Host
+        optional: true
+    info:REPLACE:
+      path: Fork/Resources/HostInfo.plist
+      properties:
+        CFBundleDisplayName: ScreenDock Host
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        ITSAppUsesNonExemptEncryption: false
+        LSApplicationCategoryType: public.app-category.utilities
+        NSBonjourServices:
+          - _sb-screen._tcp
+          - _sb-direct._tcp
+          - _sd-screen._tcp
+          - _sd-direct._tcp
+        NSLocalNetworkUsageDescription: ScreenDock Host accepts encrypted local display connections from ScreenDock Viewer and compatible SidecarBridge iPhone and iPad apps.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.screendock.host
+        PRODUCT_NAME: ScreenDock Host
+        MARKETING_VERSION: "1.5"
+        CURRENT_PROJECT_VERSION: "123"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SIDECARBRIDGE_FORK"
+      configs:
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.screendock.host.debug
 
   SidecarBridgeTests:
     sources:
@@ -28,6 +57,13 @@ targets:
       - Pad/PadDeviceIdentity.swift
       - Pad/PadLANService.swift
       - Pad/PadPeerService.swift
+      - Fork/Runtime
+      - path: Fork/Host
+        optional: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.screendock.tests
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SIDECARBRIDGE_FORK SIDECARBRIDGE_TESTING"
 
   SidecarBridgeViewerMac:
     type: application
@@ -47,22 +83,26 @@ targets:
       - Pad/PadDeviceIdentity.swift
       - Pad/PadLANService.swift
       - Pad/PadPeerService.swift
+      - Fork/Runtime
     info:
-      path: MacViewer/ViewerInfo.plist
+      path: Fork/Resources/ViewerInfo.plist
       properties:
-        CFBundleDisplayName: SidecarBridge Viewer
+        CFBundleDisplayName: ScreenDock Viewer
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         ITSAppUsesNonExemptEncryption: false
         LSApplicationCategoryType: public.app-category.utilities
         NSBonjourServices:
-          - _sb-screen._tcp
-          - _sb-direct._tcp
-        NSLocalNetworkUsageDescription: SidecarBridge Viewer discovers selected Macs on your local network and connects to them over an encrypted link.
+          - _sd-screen._tcp
+          - _sd-direct._tcp
+        NSLocalNetworkUsageDescription: ScreenDock Viewer discovers compatible ScreenDock Hosts on your local network and connects to them over an encrypted link.
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: io.sidecarbridge.viewer.mac
-        PRODUCT_NAME: SidecarBridge Viewer
+        PRODUCT_BUNDLE_IDENTIFIER: com.screendock.viewer
+        PRODUCT_NAME: ScreenDock Viewer
+        MARKETING_VERSION: "1.5"
+        CURRENT_PROJECT_VERSION: "123"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SIDECARBRIDGE_FORK"
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_ENTITLEMENTS: MacViewer/SidecarBridgeViewer.entitlements
         ENABLE_APP_SANDBOX: YES
@@ -73,7 +113,7 @@ targets:
         ENABLE_DEBUG_DYLIB: NO
       configs:
         Debug:
-          PRODUCT_BUNDLE_IDENTIFIER: io.sidecarbridge.viewer.mac.debug
+          PRODUCT_BUNDLE_IDENTIFIER: com.screendock.viewer.debug
     dependencies:
       - sdk: AVFoundation.framework
       - sdk: Carbon.framework
@@ -89,11 +129,17 @@ targets:
       - UITests
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: io.sidecarbridge.uitests
+        PRODUCT_BUNDLE_IDENTIFIER: com.screendock.uitests
         GENERATE_INFOPLIST_FILE: YES
         TEST_TARGET_NAME: SidecarBridgeViewerMac
     dependencies:
       - target: SidecarBridgeViewerMac
+
+  SidecarBridgePad:
+    settings:
+      base:
+        MARKETING_VERSION: "1.4"
+        CURRENT_PROJECT_VERSION: "6"
 
 schemes:
   SidecarBridgeViewerUI:

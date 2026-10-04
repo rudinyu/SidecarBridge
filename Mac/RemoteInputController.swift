@@ -101,15 +101,8 @@ final class RemoteInputController {
                 self.inputSourceController.toggleChineseEnglish()
             } ?? false
         case .text:
-            guard let text = input.text,
-                  let inserted = gate.onMain(ifCurrent: generation, {
-                      self.insertTextUsingAccessibility(text)
-                  }) else { return false }
-            if inserted { return true }
-            // Clipboard fallback remains off main and rechecks authorization.
-            return gate.perform(ifCurrent: generation) {
-                self.type(text, skipAccessibility: true)
-            }
+            guard let text = input.text else { return false }
+            return type(text, generation: generation)
         default:
             var accepted = false
             gate.perform(ifCurrent: generation) { accepted = self.handle(input) }
@@ -236,12 +229,9 @@ final class RemoteInputController {
         case .text:
             guard let text = input.text else { return false }
             // Keep the serial input queue responsive to later key events. The
-            // Accessibility text insertion API is the only main-thread hop;
-            // pasteboard fallback work must stay off the UI queue because a
-            // pasteboard owner (for example a browser) can take an
-            // unpredictable amount of time to provide data.
-            type(text)
-            return true
+            // focused-target classification and optional text-field update
+            // are the only main-thread work; pasteboard fallback stays off it.
+            return type(text)
         case .key:
             let code = input.hidUsage.flatMap(keyCode(forHIDUsage:))
                 ?? input.key.flatMap(keyCode(for:))
@@ -506,51 +496,46 @@ final class RemoteInputController {
         }
     }
 
-    private func type(_ text: String, skipAccessibility: Bool = false) {
-        let requiresReliableUnicodeInsertion = text.unicodeScalars.contains {
-            !$0.isASCII
-        }
-
-        // Some custom controls do not expose AXSelectedText and Apple notes
-        // that application frameworks may ignore Unicode attached to
-        // synthetic keyboard events. A normal paste is the most compatible
-        // fallback, especially for committed CJK text.
-        let insertedUsingAccessibility = !skipAccessibility && MainQueueExecutor.sync {
-            insertTextUsingAccessibility(text)
-        }
-        if insertedUsingAccessibility {
-            remoteInputLog.notice(
-                "Remote text route=accessibility utf16Count=\(text.utf16.count, privacy: .public)"
-            )
-            return
-        }
-
-        if requiresReliableUnicodeInsertion,
-           pasteTextPreservingClipboard(text) {
-            remoteInputLog.notice(
-                "Remote text route=paste utf16Count=\(text.utf16.count, privacy: .public)"
-            )
-            return
-        }
-
-        // Keep Quartz as the final fallback for secure fields or unusual
-        // pasteboards that cannot be snapshotted safely.
-        for characters in unicodeEventChunks(text) {
-            let down = CGEvent(keyboardEventSource: keyboardEventSource, virtualKey: 0, keyDown: true)
-            down?.flags = []
-            down?.keyboardSetUnicodeString(stringLength: characters.count, unicodeString: characters)
-            down?.post(tap: .cghidEventTap)
-            let up = CGEvent(keyboardEventSource: keyboardEventSource, virtualKey: 0, keyDown: false)
-            up?.flags = []
-            up?.keyboardSetUnicodeString(stringLength: characters.count, unicodeString: characters)
-            up?.post(tap: .cghidEventTap)
-        }
-        remoteInputLog.notice(
-            "Remote text route=quartz utf16Count=\(text.utf16.count, privacy: .public)"
-        )
+    private enum TextInsertionPreparation {
+        case inserted
+        case quartzOnly
+        case clipboardThenQuartz
     }
 
-    private func insertTextUsingAccessibility(_ text: String) -> Bool {
+    @discardableResult
+    private func type(_ text: String, generation: UUID? = nil) -> Bool {
+        let preparation: TextInsertionPreparation
+        if let generation {
+            guard let current = AuthorizationGeneration.shared.onMain(ifCurrent: generation, {
+                self.prepareTextInsertion(text)
+            }) else { return false }
+            preparation = current
+        } else {
+            preparation = MainQueueExecutor.sync { prepareTextInsertion(text) }
+        }
+
+        if case .inserted = preparation { return true }
+
+        var accepted = false
+        let fallback = {
+            if case .clipboardThenQuartz = preparation,
+               self.pasteTextPreservingClipboard(text) {
+                accepted = true
+                return
+            }
+            accepted = self.postQuartzUnicode(text)
+        }
+        if let generation {
+            guard AuthorizationGeneration.shared.perform(ifCurrent: generation, fallback) else {
+                return false
+            }
+        } else {
+            fallback()
+        }
+        return accepted
+    }
+
+    private func prepareTextInsertion(_ text: String) -> TextInsertionPreparation {
         let systemWideElement = AXUIElementCreateSystemWide()
         var focusedValue: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
@@ -559,10 +544,14 @@ final class RemoteInputController {
             &focusedValue
         ) == .success,
         let focusedValue else {
-            return false
+            return .quartzOnly
         }
 
         let focusedElement = focusedValue as! AXUIElement
+        let targetKind = focusedTextTargetKind(focusedElement)
+        let strategy = RemoteTextInputRoutePolicy.strategy(for: targetKind, text: text)
+        guard strategy != .quartzOnly else { return .quartzOnly }
+
         var isSettable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(
             focusedElement,
@@ -570,14 +559,62 @@ final class RemoteInputController {
             &isSettable
         ) == .success,
         isSettable.boolValue else {
-            return false
+            return strategy == .accessibilityThenPasteboardThenQuartz
+                ? .clipboardThenQuartz
+                : .quartzOnly
         }
 
-        return AXUIElementSetAttributeValue(
+        if AXUIElementSetAttributeValue(
             focusedElement,
             kAXSelectedTextAttribute as CFString,
             text as CFString
-        ) == .success
+        ) == .success {
+            return .inserted
+        }
+        return strategy == .accessibilityThenPasteboardThenQuartz
+            ? .clipboardThenQuartz
+            : .quartzOnly
+    }
+
+    private func focusedTextTargetKind(_ focusedElement: AXUIElement) -> RemoteTextTargetKind {
+        var roleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            focusedElement,
+            kAXRoleAttribute as CFString,
+            &roleValue
+        ) == .success,
+        let role = roleValue as? String else {
+            return .unknown
+        }
+
+        var subroleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            focusedElement,
+            kAXSubroleAttribute as CFString,
+            &subroleValue
+        ) == .success,
+        let subrole = subroleValue as? String else {
+            return .unknown
+        }
+        return RemoteTextTargetKind.classify(role: role, subrole: subrole)
+    }
+
+    private func postQuartzUnicode(_ text: String) -> Bool {
+        guard !text.isEmpty else { return true }
+        // Unknown and secure targets never use AX writes or clipboard staging.
+        for characters in unicodeEventChunks(text) {
+            guard let down = CGEvent(keyboardEventSource: keyboardEventSource, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: keyboardEventSource, virtualKey: 0, keyDown: false) else {
+                return false
+            }
+            down.flags = []
+            down.keyboardSetUnicodeString(stringLength: characters.count, unicodeString: characters)
+            up.flags = []
+            up.keyboardSetUnicodeString(stringLength: characters.count, unicodeString: characters)
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        }
+        return true
     }
 
     private struct PasteboardSnapshot {

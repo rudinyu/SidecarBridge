@@ -1,5 +1,27 @@
 import SwiftUI
 
+enum MacProductBrand {
+    static var productName: String {
+        #if SIDECARBRIDGE_FORK
+        "ScreenDock"
+        #else
+        "SidecarBridge"
+        #endif
+    }
+
+    static var hostAppName: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? productName
+    }
+
+    static var viewerAppName: String {
+        #if SIDECARBRIDGE_FORK
+        "ScreenDock Viewer"
+        #else
+        "SidecarBridge Viewer"
+        #endif
+    }
+}
+
 final class MacAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         MacShutdownCoordinator.shared.startObserving()
@@ -45,7 +67,7 @@ struct SidecarBridgeMacApp: App {
         .windowResizability(.contentMinSize)
 
         MenuBarExtra {
-            Text("SidecarBridge")
+            Text(MacProductBrand.hostAppName)
                 .font(.headline)
             Label(model.menuBarStatusText, systemImage: model.menuBarStatusIcon)
                 .font(.caption)
@@ -91,8 +113,10 @@ struct SidecarBridgeMacApp: App {
 
             Divider()
 
-            Button("Open SidecarBridge") {
+            Button {
                 NSApplication.shared.activate(ignoringOtherApps: true)
+            } label: {
+                Text("Open \(MacProductBrand.hostAppName)")
             }
             .keyboardShortcut("o", modifiers: [.command])
             Button("Open Displays Settings") { model.openDisplaysSettings() }
@@ -100,7 +124,11 @@ struct SidecarBridgeMacApp: App {
             Button("Quit") { NSApplication.shared.terminate(nil) }
                 .keyboardShortcut("q", modifiers: [.command])
         } label: {
-            Label("SidecarBridge", systemImage: model.menuBarStatusIcon)
+            Label {
+                Text(MacProductBrand.hostAppName)
+            } icon: {
+                Image(systemName: model.menuBarStatusIcon)
+            }
         }
         .menuBarExtraStyle(.menu)
     }

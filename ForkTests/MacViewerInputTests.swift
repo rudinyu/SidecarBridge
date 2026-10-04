@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import XCTest
 
 private final class StubMacViewerInputModeManager: MacViewerInputModeManaging {
@@ -19,6 +20,15 @@ private final class StubMacViewerInputModeManager: MacViewerInputModeManaging {
 }
 
 final class MacViewerInputTests: XCTestCase {
+    @MainActor
+    private func remoteInputView(in root: NSView) -> MacViewerInputView? {
+        if let inputView = root as? MacViewerInputView { return inputView }
+        for child in root.subviews {
+            if let inputView = remoteInputView(in: child) { return inputView }
+        }
+        return nil
+    }
+
     @MainActor
     private func mouse(
         _ type: NSEvent.EventType, _ x: CGFloat, _ y: CGFloat,
@@ -198,5 +208,127 @@ final class MacViewerInputTests: XCTestCase {
         view.scrollWheel(with: event)
         XCTAssertEqual(events, [.scroll(x: event.scrollingDeltaX, y: event.scrollingDeltaY,
             phase: nil, continuous: event.hasPreciseScrollingDeltas)])
+    }
+
+    @MainActor
+    func testConnectedSurfaceKeepsIdentityAcrossPermissionAndVideoChangesWithoutAutofocus() throws {
+        _ = NSApplication.shared
+        let frame = NSRect(x: 0, y: 0, width: 640, height: 360)
+        let window = ViewerTestWindow(
+            contentRect: frame,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+
+        let content = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        let host = NSHostingView(rootView: MacViewerInputOverlay(
+            isConnected: true,
+            isEnabled: false,
+            isStreaming: false,
+            contentAspectRatio: 16 / 9,
+            onInput: { _ in }
+        ))
+        host.frame = content.bounds
+        host.autoresizingMask = [.width, .height]
+        content.addSubview(host)
+        let localField = NSTextField(frame: NSRect(x: 8, y: 8, width: 120, height: 24))
+        content.addSubview(localField)
+        window.contentView = content
+        host.layoutSubtreeIfNeeded()
+
+        let beforePermission = try XCTUnwrap(remoteInputView(in: host))
+        XCTAssertFalse(beforePermission.isEnabled)
+        XCTAssertTrue(window.makeFirstResponder(localField))
+        let localFocusResponder = window.firstResponder
+        XCTAssertFalse(
+            localFocusResponder === beforePermission,
+            "The local field's actual responder must remain separate from the Viewer input surface"
+        )
+
+        host.rootView = MacViewerInputOverlay(
+            isConnected: true,
+            isEnabled: true,
+            isStreaming: true,
+            contentAspectRatio: 16 / 9,
+            onInput: { _ in }
+        )
+        host.layoutSubtreeIfNeeded()
+        let afterFirstFrame = try XCTUnwrap(remoteInputView(in: host))
+        XCTAssertTrue(beforePermission === afterFirstFrame)
+        XCTAssertTrue(window.firstResponder === localFocusResponder, "Permission arrival must not steal local focus")
+
+        host.rootView = MacViewerInputOverlay(
+            isConnected: true,
+            isEnabled: true,
+            isStreaming: false,
+            contentAspectRatio: 4 / 3,
+            onInput: { _ in }
+        )
+        host.layoutSubtreeIfNeeded()
+        let afterRecovery = try XCTUnwrap(remoteInputView(in: host))
+        XCTAssertTrue(afterFirstFrame === afterRecovery, "Stream recovery must retain the input NSView")
+        XCTAssertTrue(window.firstResponder === localFocusResponder)
+
+        let windowPoint = afterRecovery.convert(
+            NSPoint(x: afterRecovery.bounds.midX, y: afterRecovery.bounds.midY),
+            to: nil
+        )
+        afterRecovery.mouseDown(with: try mouse(.leftMouseDown, windowPoint.x, windowPoint.y))
+        XCTAssertTrue(window.firstResponder === afterRecovery, "An explicit viewer click may focus the remote surface")
+    }
+
+    func testSecureAndUnknownTextTargetsAlwaysChooseQuartzOnly() {
+        XCTAssertEqual(
+            RemoteTextTargetKind.classify(role: "AXTextField", subrole: "AXSecureTextField"),
+            .secureTextField
+        )
+
+        let unknownTargets: [(role: String?, subrole: String?)] = [
+            ("AXTextField", nil),
+            ("AXTextField", "AXCustomTextField"),
+            ("AXTextField", "AXPasswordTextField"),
+            ("AXTextArea", "AXFauxSecureTextArea"),
+        ]
+        for (role, subrole) in unknownTargets {
+            let target = RemoteTextTargetKind.classify(role: role, subrole: subrole)
+            XCTAssertEqual(target, .unknown, "Unexpectedly recognized subrole: \(subrole ?? "nil")")
+            XCTAssertEqual(RemoteTextInputRoutePolicy.strategy(for: target, text: "test"), .quartzOnly)
+            XCTAssertEqual(RemoteTextInputRoutePolicy.strategy(for: target, text: "密碼"), .quartzOnly)
+        }
+
+        let secureTarget = RemoteTextTargetKind.classify(
+            role: "AXTextField",
+            subrole: "AXSecureTextField"
+        )
+        XCTAssertEqual(RemoteTextInputRoutePolicy.strategy(for: secureTarget, text: "test"), .quartzOnly)
+        XCTAssertEqual(RemoteTextInputRoutePolicy.strategy(for: secureTarget, text: "密碼"), .quartzOnly)
+    }
+
+    func testOnlyRecognizedOrdinaryAndSearchSubrolesUseNonsecureRoutes() {
+        for (role, subrole) in [
+            ("AXTextField", "AXUnknown"),
+            ("AXTextField", "AXSearchField"),
+            ("AXTextArea", "AXUnknown"),
+        ] {
+            XCTAssertEqual(
+                RemoteTextTargetKind.classify(role: role, subrole: subrole),
+                .knownNonsecureTextField,
+                "Expected SDK text subrole to be recognized: \(role)/\(subrole)"
+            )
+        }
+    }
+
+    func testKnownNonsecureTextFieldMayUseExistingCompositionFallbacks() {
+        XCTAssertEqual(
+            RemoteTextInputRoutePolicy.strategy(for: .knownNonsecureTextField, text: "test"),
+            .accessibilityThenQuartz
+        )
+        XCTAssertEqual(
+            RemoteTextInputRoutePolicy.strategy(for: .knownNonsecureTextField, text: "文字"),
+            .accessibilityThenPasteboardThenQuartz
+        )
     }
 }

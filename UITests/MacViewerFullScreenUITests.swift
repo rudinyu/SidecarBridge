@@ -39,7 +39,7 @@ final class MacViewerFullScreenUITests: XCTestCase {
     }
 
     func testStandaloneViewerDoesNotExposeHostPairingControls() {
-        XCTAssertTrue(app.staticTexts["Mac Viewer"].exists)
+        XCTAssertTrue(app.staticTexts["ScreenDock Viewer"].exists)
         XCTAssertFalse(app.buttons["Show Pairing QR and Code"].exists)
         XCTAssertFalse(app.buttons["Start In-App Display"].exists)
     }
@@ -50,7 +50,20 @@ final class MacViewerFullScreenUITests: XCTestCase {
         XCTAssertEqual(app.windows.count, 1)
     }
 
-    func testCustomButtonAndShortcutEachEnterAndExitFullScreen() {
+    func testViewMenuListsViewerControlsAndNativeFullScreenCommand() {
+        let viewMenu = app.menuBars.menuBarItems["View"]
+        XCTAssertTrue(viewMenu.waitForExistence(timeout: 5))
+        viewMenu.click()
+
+        XCTAssertTrue(
+            app.menuItems["Show ScreenDock Controls"].exists || app.menuItems["Hide ScreenDock Controls"].exists,
+            "The View menu must expose the Viewer controls toggle"
+        )
+        XCTAssertTrue(app.menuItems["Enter Full Screen"].exists,
+            "The View menu must retain its native full-screen action")
+    }
+
+    func testWindowButtonShortcutAndViewMenuControlFullScreen() {
         let original = viewer.frame
         toggle.click()
         waitForFullScreen(true)
@@ -59,10 +72,10 @@ final class MacViewerFullScreenUITests: XCTestCase {
         waitForFullScreen(false)
         waitForWindowSize(original.size)
 
-        viewer.typeKey("f", modifierFlags: [.control, .command])
+        clickViewCommand("Enter Full Screen")
         waitForFullScreen(true)
         assertScreenSizedWindow()
-        toggle.click()
+        clickViewCommand("Exit Full Screen")
         waitForFullScreen(false)
         waitForWindowSize(original.size)
         attachViewer("Viewer-restored-window")
@@ -95,6 +108,15 @@ final class MacViewerFullScreenUITests: XCTestCase {
             return abs(actual.width - expected.width) <= 2 && abs(actual.height - expected.height) <= 2
         }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [settled], timeout: 5), .completed)
+    }
+
+    private func clickViewCommand(_ title: String) {
+        let viewMenu = app.menuBars.menuBarItems["View"]
+        XCTAssertTrue(viewMenu.waitForExistence(timeout: 5))
+        viewMenu.click()
+        let command = app.menuItems[title]
+        XCTAssertTrue(command.waitForExistence(timeout: 5), "The View menu must contain \(title)")
+        command.click()
     }
 
     private func attachViewer(_ name: String) {

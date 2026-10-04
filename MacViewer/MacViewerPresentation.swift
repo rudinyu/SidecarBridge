@@ -1,6 +1,32 @@
 import AppKit
 import SwiftUI
 
+enum MacViewerBranding {
+    static var viewerTitle: String {
+        #if SIDECARBRIDGE_FORK
+        "ScreenDock Viewer"
+        #else
+        "Mac Viewer"
+        #endif
+    }
+
+    static var hostName: String {
+        #if SIDECARBRIDGE_FORK
+        "ScreenDock Host"
+        #else
+        "SidecarBridge Mac"
+        #endif
+    }
+
+    static func controlsActionTitle(controlsVisible: Bool) -> String {
+        #if SIDECARBRIDGE_FORK
+        controlsVisible ? "Hide ScreenDock Controls" : "Show ScreenDock Controls"
+        #else
+        controlsVisible ? "Hide Controls" : "Show Controls"
+        #endif
+    }
+}
+
 /// Window-local presentation only: changing chrome never restarts the stream.
 @MainActor
 final class MacViewerPresentation: NSObject, ObservableObject {

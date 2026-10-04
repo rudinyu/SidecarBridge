@@ -49,9 +49,6 @@ struct MacViewerView: View {
         .frame(minWidth: showsChrome ? 980 : 640, minHeight: showsChrome ? 700 : 360)
         .background(MacViewerWindowBridge(presentation: presentation).frame(width: 0, height: 0))
         .ignoresSafeArea(.container, edges: showsChrome ? [] : .all)
-        .overlay(alignment: .topTrailing) {
-            if !showsChrome { presentationControls.padding(12) }
-        }
         .preferredColorScheme(.dark)
         .modifier(MacViewerFullScreenBehavior())
         .confirmationDialog(
@@ -96,10 +93,10 @@ struct MacViewerView: View {
                 .background(.cyan.opacity(0.13), in: RoundedRectangle(cornerRadius: 14))
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Mac Viewer")
+                Text(MacViewerBranding.viewerTitle)
                     .font(.system(size: 25, weight: .bold, design: .rounded))
                     .accessibilityIdentifier("macViewer.title")
-                Text("Connect this Mac to another SidecarBridge Mac")
+                Text("Connect this Mac to another \(MacViewerBranding.hostName)")
                     .font(.callout)
                     .foregroundStyle(.white.opacity(0.62))
             }
@@ -126,25 +123,23 @@ struct MacViewerView: View {
                 Button {
                     presentation.toggleControls()
                 } label: {
-                    Label(presentation.controlsVisible ? "Hide Controls" : "Show Controls",
+                    Label(MacViewerBranding.controlsActionTitle(controlsVisible: presentation.controlsVisible),
                         systemImage: "slider.horizontal.3")
                 }
                 .accessibilityIdentifier("macViewer.controls.toggle")
-                .keyboardShortcut("h", modifiers: [.control, .command])
-                .help("Show or hide Viewer controls (Control-Command-H)")
+                .help("Show or hide \(MacViewerBranding.viewerTitle) controls")
             }
 
             Button {
                 presentation.toggleFullScreen()
             } label: {
-                Label(presentation.isFullScreen ? "Exit Full Screen" : "Full Screen",
+                Label(presentation.isFullScreen ? "Exit Full Screen" : "Enter Full Screen",
                     systemImage: presentation.isFullScreen
                         ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
             }
             .accessibilityIdentifier("macViewer.fullScreen.toggle")
             .accessibilityValue(presentation.isFullScreen ? "fullScreen" : "windowed")
-            .keyboardShortcut("f", modifiers: [.control, .command])
-            .help("Toggle full screen (Control-Command-F)")
+            .help("Toggle \(MacViewerBranding.viewerTitle) full screen")
         }
         .buttonStyle(.bordered)
         .padding(8)
@@ -285,26 +280,15 @@ struct MacViewerView: View {
         VStack(spacing: 0) {
             ZStack {
                 MacViewerVideoSurface(controller: model.videoDisplay)
-
-                if model.isStreaming {
-                    MacViewerInputSurface(
-                        contentAspectRatio: model.streamAspectRatio,
-                        isEnabled: model.remoteInputAuthorized,
-                        onInput: model.sendInput,
-                        inputModeManager: inputModeManager,
-                        onLocalShortcut: presentation.handleLocalShortcut
-                    )
-                } else {
-                    VStack(spacing: 10) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Waiting for the other Mac's screen…")
-                            .font(.callout)
-                            .foregroundStyle(.white.opacity(0.7))
-                    }
-                    .padding(18)
-                    .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 14))
-                }
+                MacViewerInputOverlay(
+                    isConnected: model.isConnected,
+                    isEnabled: model.remoteInputAuthorized,
+                    isStreaming: model.isStreaming,
+                    contentAspectRatio: model.streamAspectRatio,
+                    onInput: model.sendInput,
+                    inputModeManager: inputModeManager,
+                    onLocalShortcut: presentation.handleLocalShortcut
+                )
             }
             .frame(minHeight: showsChrome ? 300 : 0, maxHeight: .infinity)
             .background(.black)

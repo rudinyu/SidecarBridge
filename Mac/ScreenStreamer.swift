@@ -1,7 +1,21 @@
 import AppKit
 @preconcurrency import ScreenCaptureKit
+import OSLog
 
-final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
+final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    private final class StartCompletionGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var hasCompleted = false
+
+        func claim() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !hasCompleted else { return false }
+            hasCompleted = true
+            return true
+        }
+    }
+
     /// ScreenCaptureKit's stream object is callback-driven and not annotated
     /// Sendable in the SDK. This small reference lets the async configuration
     /// task carry the already-owned stream without pretending its internals
@@ -125,6 +139,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
         case permissionRequired
         case noDisplay
         case configurationUpdateFailed
+        case captureStartTimedOut
+        case captureStartCapacityExhausted
+        case captureRefreshTimedOut
 
         var errorDescription: String? {
             switch self {
@@ -134,8 +151,27 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
                 return "No Mac display is available to capture."
             case .configurationUpdateFailed:
                 return "The display capture configuration could not be updated safely."
+            case .captureStartTimedOut:
+                return "ScreenCaptureKit did not finish starting the display capture in time."
+            case .captureStartCapacityExhausted:
+                return "Earlier display capture starts are still pending. Wait for the display to wake, then retry."
+            case .captureRefreshTimedOut:
+                return "The previous display capture could not be stopped in time. A fresh bounded retry can start without it."
             }
         }
+    }
+
+    private struct FrameStatusCounts {
+        var completeSamples = 0
+        var idle = 0
+        var blank = 0
+        var suspended = 0
+        var started = 0
+        var stopped = 0
+        var missingOrInvalid = 0
+        var encoded = 0
+        var consecutiveUnavailable = 0
+        var unavailableStatusReported = false
     }
 
     var onFrame: ((VideoFrame) -> Void)?
@@ -145,10 +181,43 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
     var onCaptureRefreshCompleted: (() -> Void)?
     var onCaptureRefreshFailed: ((Error) -> Void)?
     var onMemoryPressureChanged: ((StreamMemoryPressureLevel) -> Void)?
+    var onCaptureStarted: ((UInt64) -> Void)?
+    var onFirstEncodedFrame: ((UInt64) -> Void)?
+    var onCaptureSourceStopped: ((UInt64, String, Int) -> Void)?
+    var onCaptureSourceUnavailable: ((UInt64, String) -> Void)?
 
     private let captureQueue = DispatchQueue(label: "io.sidecarbridge.capture", qos: .userInteractive)
+    private let captureQueueSpecificKey = DispatchSpecificKey<Bool>()
+    private let captureStateLock = NSLock()
+    private let captureLogger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "io.sidecarbridge.mac",
+        category: "ScreenCapture"
+    )
     private let encoder = H264Encoder()
     private var stream: SCStream?
+    private var captureGeneration: UInt64 = 0
+    private var activeCaptureGeneration: UInt64?
+    private var captureStartInProgress = false
+    private var pendingCaptureStartOperations = 0
+    private var frameStatusCounts = FrameStatusCounts()
+    private var captureDiagnosticStage = "Stopped"
+    private var lastCaptureFailureDomain: String?
+    private var lastCaptureFailureCode: Int?
+    private var lastUnexpectedlyStoppedGeneration: UInt64?
+    private var pendingUnavailableStatus: String?
+    private var pendingUnavailableStatusGeneration: UInt64?
+    private var unavailableStatusDeadlineWorkItem: DispatchWorkItem?
+    private var currentUnavailableStatus: String?
+    private var currentUnavailableStatusGeneration: UInt64?
+    private var lastHealthyCaptureActivityUptime: TimeInterval = 0
+    private let unavailableStatusGracePeriod: TimeInterval = 2
+#if SIDECARBRIDGE_FORK
+    private static let captureStartDeadline = ScreenDockCaptureRecoveryBudget.startDeadline
+    private let maximumPendingCaptureStartOperations = ScreenDockCaptureRecoveryBudget.maximumConcurrentStartOperations
+#else
+    private static let captureStartDeadline: TimeInterval = 15
+    private let maximumPendingCaptureStartOperations = 2
+#endif
     /// The display selected by ScreenCaptureKit for this stream. Input events
     /// must target the same display; the main display can differ when an
     /// external monitor is attached.
@@ -177,6 +246,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
     private var lastMemoryPressureApplyUptime: TimeInterval = 0
     private let configurationScheduler = StreamConfigurationScheduler()
     private var foregroundRefreshTask: Task<Void, Never>?
+#if SIDECARBRIDGE_FORK
+    private var foregroundRefreshDeadlineTask: Task<Void, Never>?
+#endif
     private var foregroundRefreshToken = UUID()
     private var lastForegroundRefreshUptime: TimeInterval = 0
     private let minimumForegroundRefreshInterval: TimeInterval = 0.75
@@ -187,7 +259,15 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
 
     override init() {
         super.init()
+        captureQueue.setSpecific(key: captureQueueSpecificKey, value: true)
         installMemoryPressureMonitor()
+    }
+
+    private func onCaptureQueueSync<T>(_ operation: () throws -> T) rethrows -> T {
+        if DispatchQueue.getSpecific(key: captureQueueSpecificKey) == true {
+            return try operation()
+        }
+        return try captureQueue.sync(execute: operation)
     }
 
     deinit {
@@ -196,6 +276,460 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
         let scheduler = configurationScheduler
         let inFlight = scheduler.invalidate()
         Task { await inFlight?.value }
+    }
+
+    var currentCaptureGeneration: UInt64? {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        return activeCaptureGeneration
+    }
+
+    var isCaptureActive: Bool {
+        currentCaptureGeneration != nil
+    }
+
+    func isCaptureSourceUnavailable(for generation: UInt64) -> Bool {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        return currentUnavailableStatusGeneration == generation
+            && currentUnavailableStatus != nil
+    }
+
+    func isCurrentUnexpectedStop(for generation: UInt64) -> Bool {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        return lastUnexpectedlyStoppedGeneration == generation
+            && captureGeneration == generation &+ 1
+            && activeCaptureGeneration == nil
+            && stream == nil
+            && !captureStartInProgress
+    }
+
+    func needsCaptureRecoveryAfterInput(
+        for generation: UInt64,
+        inactivityThreshold: TimeInterval
+    ) -> Bool {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        guard activeCaptureGeneration == generation else { return false }
+        if currentUnavailableStatusGeneration == generation,
+           currentUnavailableStatus != nil {
+            return true
+        }
+        return ProcessInfo.processInfo.systemUptime - lastHealthyCaptureActivityUptime >= inactivityThreshold
+    }
+
+    private func isCaptureActive(for generation: UInt64) -> Bool {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        return activeCaptureGeneration == generation
+    }
+
+    private func isCurrentDetachedGeneration(_ generation: UInt64) -> Bool {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        return captureGeneration == generation
+            && activeCaptureGeneration == nil
+            && !captureStartInProgress
+    }
+
+    private func activeStreamSnapshot() -> (stream: SCStream, generation: UInt64)? {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        guard let stream, let generation = activeCaptureGeneration else { return nil }
+        return (stream, generation)
+    }
+
+    func hasEncodedFrame(for generation: UInt64) -> Bool {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        return activeCaptureGeneration == generation && frameStatusCounts.encoded > 0
+    }
+
+    /// A privacy-safe lifecycle summary for the host diagnostic report. It
+    /// contains only source states and aggregate counts, never captured pixels
+    /// or remote input.
+    var captureDiagnosticsSummary: String {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        let failure = if let lastCaptureFailureDomain, let lastCaptureFailureCode {
+            "\(lastCaptureFailureDomain)/\(lastCaptureFailureCode)"
+        } else {
+            "none"
+        }
+        return "generation=\(captureGeneration); stage=\(captureDiagnosticStage); "
+            + "completeSamples=\(frameStatusCounts.completeSamples); "
+            + "encoded=\(frameStatusCounts.encoded); idle=\(frameStatusCounts.idle); "
+            + "blank=\(frameStatusCounts.blank); suspended=\(frameStatusCounts.suspended); "
+            + "started=\(frameStatusCounts.started); stopped=\(frameStatusCounts.stopped); "
+            + "missingOrInvalid=\(frameStatusCounts.missingOrInvalid); "
+            + "consecutiveUnavailable=\(frameStatusCounts.consecutiveUnavailable); lastError=\(failure)"
+    }
+
+    private func reserveCaptureStart() throws -> UInt64? {
+        try onCaptureQueueSync {
+            captureStateLock.lock()
+            defer { captureStateLock.unlock() }
+            guard stream == nil, !captureStartInProgress else { return nil }
+            guard pendingCaptureStartOperations < maximumPendingCaptureStartOperations else {
+                captureDiagnosticStage = "Start capacity exhausted"
+                throw StreamError.captureStartCapacityExhausted
+            }
+            captureGeneration &+= 1
+            lastUnexpectedlyStoppedGeneration = nil
+            cancelUnavailableStatusCheckLocked()
+            captureStartInProgress = true
+            pendingCaptureStartOperations += 1
+            activeCaptureGeneration = nil
+            captureDisplayID = nil
+            captureDisplayWidth = 0
+            captureDisplayHeight = 0
+            captureWidth = 0
+            captureHeight = 0
+            frameStatusCounts = FrameStatusCounts()
+            captureDiagnosticStage = "Starting"
+            lastHealthyCaptureActivityUptime = ProcessInfo.processInfo.systemUptime
+            lastCaptureFailureDomain = nil
+            lastCaptureFailureCode = nil
+            configurationScheduler.activate()
+            return captureGeneration
+        }
+    }
+
+    private func isCurrentStart(_ generation: UInt64) -> Bool {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        return captureGeneration == generation && captureStartInProgress
+    }
+
+    private func install(_ stream: SCStream, generation: UInt64) -> Bool {
+        onCaptureQueueSync {
+            captureStateLock.lock()
+            defer { captureStateLock.unlock() }
+            guard captureGeneration == generation,
+                  captureStartInProgress,
+                  self.stream == nil else { return false }
+            self.stream = stream
+            activeCaptureGeneration = generation
+            return true
+        }
+    }
+
+    private func markCaptureStarted(
+        _ stream: SCStream,
+        generation: UInt64,
+        completion: StartCompletionGate
+    ) -> Bool {
+        let didStart = onCaptureQueueSync {
+            captureStateLock.lock()
+            defer { captureStateLock.unlock() }
+            guard captureGeneration == generation,
+                  activeCaptureGeneration == generation,
+                  self.stream === stream,
+                  completion.claim() else { return false }
+            captureStartInProgress = false
+            lastHealthyCaptureActivityUptime = ProcessInfo.processInfo.systemUptime
+            if frameStatusCounts.encoded == 0 {
+                captureDiagnosticStage = "Source started; waiting for first encoded frame"
+            }
+            return true
+        }
+        guard didStart else { return false }
+        captureLogger.notice("capture source started generation=\(generation, privacy: .public)")
+        onCaptureStarted?(generation)
+        return true
+    }
+
+    private func releasePendingStartOperation() {
+        onCaptureQueueSync {
+            captureStateLock.lock()
+            pendingCaptureStartOperations = max(0, pendingCaptureStartOperations - 1)
+            captureStateLock.unlock()
+        }
+    }
+
+    /// Must be called with `captureStateLock` held on `captureQueue`.
+    private func cancelUnavailableStatusCheckLocked() {
+        unavailableStatusDeadlineWorkItem?.cancel()
+        unavailableStatusDeadlineWorkItem = nil
+        pendingUnavailableStatus = nil
+        pendingUnavailableStatusGeneration = nil
+        currentUnavailableStatus = nil
+        currentUnavailableStatusGeneration = nil
+    }
+
+    /// Must be called with `captureStateLock` held on `captureQueue`.
+    private func scheduleUnavailableStatusCheckLocked(status: String, generation: UInt64) {
+        pendingUnavailableStatus = status
+        pendingUnavailableStatusGeneration = generation
+        guard unavailableStatusDeadlineWorkItem == nil else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.confirmSustainedUnavailableStatus(generation: generation)
+        }
+        unavailableStatusDeadlineWorkItem = workItem
+        captureQueue.asyncAfter(
+            deadline: .now() + unavailableStatusGracePeriod,
+            execute: workItem
+        )
+    }
+
+    private func confirmSustainedUnavailableStatus(generation: UInt64) {
+        captureStateLock.lock()
+        guard activeCaptureGeneration == generation,
+              frameStatusCounts.encoded > 0,
+              !frameStatusCounts.unavailableStatusReported,
+              pendingUnavailableStatusGeneration == generation,
+              let status = pendingUnavailableStatus else {
+            captureStateLock.unlock()
+            return
+        }
+        frameStatusCounts.unavailableStatusReported = true
+        captureDiagnosticStage = "Capture source remained \(status)"
+        currentUnavailableStatus = status
+        currentUnavailableStatusGeneration = generation
+        unavailableStatusDeadlineWorkItem = nil
+        pendingUnavailableStatus = nil
+        pendingUnavailableStatusGeneration = nil
+        captureStateLock.unlock()
+
+        captureLogger.error(
+            "capture source unavailable status=\(status, privacy: .public) generation=\(generation, privacy: .public)"
+        )
+        onCaptureSourceUnavailable?(generation, status)
+    }
+
+    @discardableResult
+    private func finishCaptureStartFailure(
+        generation: UInt64,
+        error: Error,
+        completion: StartCompletionGate
+    ) -> Bool {
+        let nsError = error as NSError
+        let result = onCaptureQueueSync { () -> (Bool, SCStream?, Task<Void, Never>?) in
+            guard completion.claim() else { return (false, nil, nil) }
+            captureStateLock.lock()
+            guard captureGeneration == generation else {
+                captureStateLock.unlock()
+                return (true, nil, nil)
+            }
+            let stoppedStream = stream
+            stream = nil
+            activeCaptureGeneration = nil
+            captureStartInProgress = false
+            cancelUnavailableStatusCheckLocked()
+            captureDiagnosticStage = "Start failed"
+            lastCaptureFailureDomain = nsError.domain
+            lastCaptureFailureCode = nsError.code
+            captureStateLock.unlock()
+            encoder.stop()
+            let inFlight = configurationScheduler.invalidate()
+            return (true, stoppedStream, inFlight)
+        }
+        guard result.0 else { return false }
+
+        captureLogger.error(
+            "capture start failed generation=\(generation, privacy: .public) domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public)"
+        )
+        if let stoppedStream = result.1 {
+            Task {
+                await result.2?.value
+                try? await stoppedStream.stopCapture()
+            }
+        }
+        return true
+    }
+
+    private func invalidateTimedOutStart(
+        generation: UInt64,
+        completion: StartCompletionGate
+    ) -> Bool {
+        let timeoutResult = onCaptureQueueSync { () -> (Bool, SCStream?, Task<Void, Never>?) in
+            guard completion.claim() else { return (false, nil, nil) }
+            captureStateLock.lock()
+            guard captureGeneration == generation,
+                  captureStartInProgress || activeCaptureGeneration == generation else {
+                captureStateLock.unlock()
+                return (true, nil, nil)
+            }
+            let timedOutStream = stream
+            stream = nil
+            activeCaptureGeneration = nil
+            captureStartInProgress = false
+            captureGeneration &+= 1
+            lastUnexpectedlyStoppedGeneration = nil
+            cancelUnavailableStatusCheckLocked()
+            captureDiagnosticStage = "Start timed out"
+            lastCaptureFailureDomain = "ScreenCaptureKitStartTimeout"
+            lastCaptureFailureCode = 1
+            captureStateLock.unlock()
+            encoder.stop()
+            let inFlight = configurationScheduler.invalidate()
+            return (true, timedOutStream, inFlight)
+        }
+        guard timeoutResult.0 else { return false }
+
+        captureLogger.error("capture start timed out generation=\(generation, privacy: .public)")
+        if let timedOutStream = timeoutResult.1 {
+            Task {
+                await timeoutResult.2?.value
+                try? await timedOutStream.stopCapture()
+            }
+        }
+        return true
+    }
+
+    private func detachActiveStreamForRebuild() -> (stream: SCStream, generation: UInt64, inFlightConfiguration: Task<Void, Never>?)? {
+        onCaptureQueueSync {
+            captureStateLock.lock()
+            defer { captureStateLock.unlock() }
+            guard let stream, activeCaptureGeneration != nil else { return nil }
+            self.stream = nil
+            activeCaptureGeneration = nil
+            captureStartInProgress = false
+            captureGeneration &+= 1
+            lastUnexpectedlyStoppedGeneration = nil
+            cancelUnavailableStatusCheckLocked()
+            captureDiagnosticStage = "Rebuilding source"
+            let inFlightConfiguration = configurationScheduler.invalidate()
+            return (stream, captureGeneration, inFlightConfiguration)
+        }
+    }
+
+    private func markUnexpectedStop(
+        _ stream: SCStream,
+        error: Error
+    ) -> (generation: UInt64, domain: String, code: Int)? {
+        let nsError = error as NSError
+        let stopped = onCaptureQueueSync { () -> (UInt64, String, Int)? in
+            captureStateLock.lock()
+            guard let generation = activeCaptureGeneration,
+                  self.stream === stream else {
+                captureStateLock.unlock()
+                return nil
+            }
+            self.stream = nil
+            activeCaptureGeneration = nil
+            captureStartInProgress = false
+            captureGeneration &+= 1
+            lastUnexpectedlyStoppedGeneration = generation
+            cancelUnavailableStatusCheckLocked()
+            captureDiagnosticStage = "Stream stopped unexpectedly"
+            lastCaptureFailureDomain = nsError.domain
+            lastCaptureFailureCode = nsError.code
+            frameStatusCounts.stopped += 1
+            captureStateLock.unlock()
+            encoder.stop()
+            _ = configurationScheduler.invalidate()
+            return (generation, nsError.domain, nsError.code)
+        }
+        return stopped.map { (generation: $0.0, domain: $0.1, code: $0.2) }
+    }
+
+    private func activeGeneration(for stream: SCStream) -> UInt64? {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        guard self.stream === stream else { return nil }
+        return activeCaptureGeneration
+    }
+
+    private func recordFrameStatus(
+        _ status: SCFrameStatus?,
+        generation: UInt64,
+        acceptedComplete: Bool = false
+    ) {
+        guard let status else {
+            captureStateLock.lock()
+            guard activeCaptureGeneration == generation else {
+                captureStateLock.unlock()
+                return
+            }
+            frameStatusCounts.missingOrInvalid += 1
+            captureStateLock.unlock()
+            return
+        }
+        var shouldLog = false
+        captureStateLock.lock()
+        guard activeCaptureGeneration == generation else {
+            captureStateLock.unlock()
+            return
+        }
+        switch status {
+        case .complete:
+            if acceptedComplete {
+                frameStatusCounts.completeSamples += 1
+                frameStatusCounts.consecutiveUnavailable = 0
+                frameStatusCounts.unavailableStatusReported = false
+                lastHealthyCaptureActivityUptime = ProcessInfo.processInfo.systemUptime
+                cancelUnavailableStatusCheckLocked()
+                if frameStatusCounts.completeSamples == 1 { shouldLog = true }
+            } else {
+                frameStatusCounts.missingOrInvalid += 1
+            }
+        case .idle:
+            frameStatusCounts.idle += 1
+            frameStatusCounts.consecutiveUnavailable = 0
+            frameStatusCounts.unavailableStatusReported = false
+            lastHealthyCaptureActivityUptime = ProcessInfo.processInfo.systemUptime
+            cancelUnavailableStatusCheckLocked()
+            shouldLog = frameStatusCounts.idle == 1
+        case .blank:
+            frameStatusCounts.blank += 1
+            frameStatusCounts.consecutiveUnavailable += 1
+            shouldLog = frameStatusCounts.blank == 1
+            if frameStatusCounts.encoded > 0,
+               !frameStatusCounts.unavailableStatusReported {
+                scheduleUnavailableStatusCheckLocked(status: "blank", generation: generation)
+            }
+        case .suspended:
+            frameStatusCounts.suspended += 1
+            frameStatusCounts.consecutiveUnavailable += 1
+            shouldLog = frameStatusCounts.suspended == 1
+            if frameStatusCounts.encoded > 0,
+               !frameStatusCounts.unavailableStatusReported {
+                scheduleUnavailableStatusCheckLocked(status: "suspended", generation: generation)
+            }
+        case .started:
+            frameStatusCounts.started += 1
+            frameStatusCounts.consecutiveUnavailable = 0
+            shouldLog = frameStatusCounts.started == 1
+        case .stopped:
+            frameStatusCounts.stopped += 1
+            frameStatusCounts.consecutiveUnavailable += 1
+            shouldLog = frameStatusCounts.stopped == 1
+            if frameStatusCounts.encoded > 0,
+               !frameStatusCounts.unavailableStatusReported {
+                scheduleUnavailableStatusCheckLocked(status: "stopped", generation: generation)
+            }
+        @unknown default:
+            frameStatusCounts.missingOrInvalid += 1
+            shouldLog = frameStatusCounts.missingOrInvalid == 1
+        }
+        captureStateLock.unlock()
+        if shouldLog {
+            captureLogger.notice(
+                "capture frame status=\(String(describing: status), privacy: .public) generation=\(generation, privacy: .public)"
+            )
+        }
+    }
+
+    private func recordEncodedFrame(_ frame: VideoFrame, generation: UInt64) {
+        captureStateLock.lock()
+        guard activeCaptureGeneration == generation else {
+            captureStateLock.unlock()
+            return
+        }
+        frameStatusCounts.encoded += 1
+        let isFirstEncodedFrame = frameStatusCounts.encoded == 1
+        if isFirstEncodedFrame {
+            captureDiagnosticStage = "First encoded frame produced"
+        }
+        captureStateLock.unlock()
+
+        if isFirstEncodedFrame {
+            captureLogger.notice("first encoded frame generation=\(generation, privacy: .public)")
+            onFirstEncodedFrame?(generation)
+        }
+        onFrame?(frame)
     }
 
     func setPreferredWidth(_ width: Int) {
@@ -217,14 +751,14 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
     /// the encoder sequence monotonic, so the input channel never has to
     /// reconnect just because the viewer profile changed.
     func applyStreamPreferences() async throws {
-        guard stream != nil else { return }
+        guard activeStreamSnapshot() != nil else { return }
 
         if requiresMediaBoundaryForCurrentPreferences {
-            try await rebuildCaptureAfterForeground()
+            try await rebuildCaptureAfterForeground(refreshToken: foregroundRefreshToken)
             return
         }
 
-        guard let stream else { return }
+        guard let (stream, _) = activeStreamSnapshot() else { return }
         let configuration = makeConfiguration(
             width: captureWidth,
             height: captureHeight,
@@ -395,19 +929,23 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
             return
         }
         lastForegroundRefreshUptime = now
-        let rebuildExistingStream = stream != nil
+        let rebuildExistingStream = isCaptureActive
         let token = UUID()
         foregroundRefreshToken = token
-        foregroundRefreshTask = Task { [weak self] in
+        foregroundRefreshTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
                 if self.foregroundRefreshToken == token {
                     self.foregroundRefreshTask = nil
+#if SIDECARBRIDGE_FORK
+                    self.foregroundRefreshDeadlineTask?.cancel()
+                    self.foregroundRefreshDeadlineTask = nil
+#endif
                 }
             }
             do {
                 if rebuildExistingStream {
-                    try await self.rebuildCaptureAfterForeground()
+                    try await self.rebuildCaptureAfterForeground(refreshToken: token)
                 } else {
                     // `isStreaming` can survive a short transport reconnect
                     // while ScreenCaptureKit has already lost its source.
@@ -415,28 +953,97 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
                     // keyframe request alone cannot produce a video frame.
                     try await self.start(resetSequence: false)
                 }
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled,
+                      self.foregroundRefreshToken == token,
+                      self.isCaptureActive else { return }
                 self.onCaptureRefreshCompleted?()
             } catch {
                 guard !Task.isCancelled else { return }
+                if error is CancellationError { return }
                 self.onCaptureRefreshFailed?(error)
                 // A keyframe is still useful if the old capture source could
                 // not be rebuilt (for example while a monitor is reattaching).
                 self.requestKeyFrame()
             }
         }
+#if SIDECARBRIDGE_FORK
+        foregroundRefreshDeadlineTask?.cancel()
+        foregroundRefreshDeadlineTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(ScreenDockCaptureRecoveryBudget.refreshDeadline))
+            guard !Task.isCancelled,
+                  let self,
+                  self.foregroundRefreshToken == token,
+                  let timedOutTask = self.foregroundRefreshTask else { return }
+            self.foregroundRefreshToken = UUID()
+            self.foregroundRefreshTask = nil
+            self.foregroundRefreshDeadlineTask = nil
+            timedOutTask.cancel()
+            self.captureQueue.async {
+                self.captureStateLock.lock()
+                if self.stream == nil,
+                   self.activeCaptureGeneration == nil,
+                   !self.captureStartInProgress {
+                    self.captureDiagnosticStage = "Capture refresh timed out"
+                    self.lastCaptureFailureDomain = "ScreenCaptureKitRefreshTimeout"
+                    self.lastCaptureFailureCode = 1
+                }
+                self.captureStateLock.unlock()
+            }
+            self.captureLogger.error("capture refresh timed out")
+            self.onCaptureRefreshFailed?(StreamError.captureRefreshTimedOut)
+        }
+#endif
     }
 
     func start(resetSequence: Bool = true) async throws {
-        guard stream == nil else { return }
-        try await startCapture(resetSequence: resetSequence)
+        guard let generation = try reserveCaptureStart() else { return }
+        let completion = StartCompletionGate()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            Task { [weak self] in
+                guard let self else {
+                    guard completion.claim() else { return }
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                do {
+                    try await self.performCaptureStart(
+                        resetSequence: resetSequence,
+                        generation: generation,
+                        completion: completion
+                    )
+                    continuation.resume()
+                } catch {
+                    guard self.finishCaptureStartFailure(
+                        generation: generation,
+                        error: error,
+                        completion: completion
+                    ) else { return }
+                    continuation.resume(throwing: error)
+                }
+            }
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(Self.captureStartDeadline))
+                guard let self,
+                      self.invalidateTimedOutStart(
+                        generation: generation,
+                        completion: completion
+                      ) else { return }
+                continuation.resume(throwing: StreamError.captureStartTimedOut)
+            }
+        }
         if !resetSequence {
-            captureQueue.sync { encoder.requestKeyFrame() }
+            captureQueue.sync {
+                if isCaptureActive(for: generation) { encoder.requestKeyFrame() }
+            }
         }
     }
 
-    private func startCapture(resetSequence: Bool) async throws {
-        configurationScheduler.activate()
+    private func performCaptureStart(
+        resetSequence: Bool,
+        generation: UInt64,
+        completion: StartCompletionGate
+    ) async throws {
+        defer { releasePendingStartOperation() }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
             throw StreamError.permissionRequired
@@ -447,6 +1054,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
         // that has just been attached can otherwise be omitted from
         // ScreenCaptureKit's filtered list even though it is capturable.
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        guard !Task.isCancelled, isCurrentStart(generation) else {
+            throw CancellationError()
+        }
         let onlineDisplays = content.displays.filter { display in
             let isOnline = CGDisplayIsOnline(display.displayID) != 0
             let isActive = CGDisplayIsActive(display.displayID) != 0
@@ -462,75 +1072,87 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
         guard let display = mainDisplay ?? largestDisplay ?? content.displays.first else {
             throw StreamError.noDisplay
         }
-        captureDisplayID = display.displayID
-        displayRefreshRate = Self.refreshRate(for: display.displayID)
-
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         // contentRect is in points, not native capture pixels. A 1920x1080
         // HiDPI desktop can supply 3840x2160 pixels without upscaling.
         let source = StreamQualityPolicy.sourcePixels(points: filter.contentRect.size,
                                                        scale: CGFloat(filter.pointPixelScale))
-        captureDisplayWidth = source.width > 0 ? Int(source.width) : display.width
-        captureDisplayHeight = source.height > 0 ? Int(source.height) : display.height
-        let configuration = SCStreamConfiguration()
-        let dimensions = captureDimensions(
-            displayWidth: captureDisplayWidth,
-            displayHeight: captureDisplayHeight
-        )
-        foregroundFrameRate = transportProfile == .nearbyP2P
-            ? min(
-                streamPreferences.frameRate.rawValue,
-                min(
-                    streamPreferences.ultraModeEnabled
-                        ? StreamCadencePolicy.ultraFrameRateCeiling
-                        : StreamCadencePolicy.nearbyFrameRateCeiling,
-                    viewerRefreshRate
+        let displayWidth = source.width > 0 ? Int(source.width) : display.width
+        let displayHeight = source.height > 0 ? Int(source.height) : display.height
+        let stream = try onCaptureQueueSync { () throws -> SCStream in
+            guard isCurrentStart(generation) else { throw CancellationError() }
+            captureDisplayID = display.displayID
+            displayRefreshRate = Self.refreshRate(for: display.displayID)
+            captureDisplayWidth = displayWidth
+            captureDisplayHeight = displayHeight
+            foregroundFrameRate = transportProfile == .nearbyP2P
+                ? min(
+                    streamPreferences.frameRate.rawValue,
+                    min(
+                        streamPreferences.ultraModeEnabled
+                            ? StreamCadencePolicy.ultraFrameRateCeiling
+                            : StreamCadencePolicy.nearbyFrameRateCeiling,
+                        viewerRefreshRate
+                    )
                 )
+                : min(streamPreferences.frameRate.rawValue, min(displayRefreshRate, viewerRefreshRate))
+            updateActiveFrameRate()
+
+            let configuration = SCStreamConfiguration()
+            let dimensions = captureDimensions(
+                displayWidth: captureDisplayWidth,
+                displayHeight: captureDisplayHeight
             )
-            : min(streamPreferences.frameRate.rawValue, min(displayRefreshRate, viewerRefreshRate))
-        updateActiveFrameRate()
-        configuration.width = dimensions.width
-        configuration.height = dimensions.height
-        captureWidth = configuration.width
-        captureHeight = configuration.height
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(activeFrameRate))
-        // Keep only a small capture cushion. A deep ScreenCaptureKit queue
-        // makes the viewer look smooth while adding avoidable end-to-end
-        // latency when the link is busy.
-        configuration.queueDepth = StreamCadencePolicy.captureQueueDepth(for: activeFrameRate)
-        // Capture the real Mac cursor. The iPad viewer deliberately does not
-        // draw a second software cursor, so the pointer users see is the one
-        // that WindowServer actually moved after a remote input event.
-        configuration.showsCursor = true
-        configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-        configuration.colorSpaceName = CGColorSpace.sRGB
+            configuration.width = dimensions.width
+            configuration.height = dimensions.height
+            captureWidth = configuration.width
+            captureHeight = configuration.height
+            configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(activeFrameRate))
+            // Keep only a small capture cushion. A deep ScreenCaptureKit queue
+            // makes the viewer look smooth while adding avoidable end-to-end
+            // latency when the link is busy.
+            configuration.queueDepth = StreamCadencePolicy.captureQueueDepth(for: activeFrameRate)
+            // Capture the real Mac cursor. The iPad viewer deliberately does not
+            // draw a second software cursor, so the pointer users see is the one
+            // that WindowServer actually moved after a remote input event.
+            configuration.showsCursor = true
+            configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            configuration.colorSpaceName = CGColorSpace.sRGB
 
-        let targetBitrate = targetBitrate(
-            width: configuration.width,
-            height: configuration.height,
-            frameRate: activeFrameRate
-        )
-        encoder.onFrame = { [weak self] frame in self?.onFrame?(frame) }
-        captureClock.reset()
-        try encoder.start(
-            width: configuration.width,
-            height: configuration.height,
-            frameRate: activeFrameRate,
-            targetBitrate: targetBitrate,
-            resetSequence: resetSequence
-        )
-        encoder.setMemoryPressure(memoryPressureLevel)
+            let bitrate = targetBitrate(
+                width: configuration.width,
+                height: configuration.height,
+                frameRate: activeFrameRate
+            )
+            encoder.onFrame = { [weak self] frame in
+                self?.recordEncodedFrame(frame, generation: generation)
+            }
+            captureClock.reset()
+            try encoder.start(
+                width: configuration.width,
+                height: configuration.height,
+                frameRate: activeFrameRate,
+                targetBitrate: bitrate,
+                resetSequence: resetSequence
+            )
+            encoder.setMemoryPressure(memoryPressureLevel)
 
-        let stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
-        self.stream = stream
+            let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
+            guard install(stream, generation: generation) else {
+                throw CancellationError()
+            }
+            return stream
+        }
         do {
             try await stream.startCapture()
         } catch {
-            self.stream = nil
-            encoder.stop()
-            try? await stream.stopCapture()
             throw error
+        }
+        guard !Task.isCancelled,
+              markCaptureStarted(stream, generation: generation, completion: completion) else {
+            Task { try? await stream.stopCapture() }
+            throw CancellationError()
         }
     }
 
@@ -562,44 +1184,77 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
     func stop() {
         foregroundRefreshTask?.cancel()
         foregroundRefreshTask = nil
-        encoder.stop()
-        captureDisplayID = nil
-        guard let stream else { return }
-        self.stream = nil
+        foregroundRefreshToken = UUID()
+#if SIDECARBRIDGE_FORK
+        foregroundRefreshDeadlineTask?.cancel()
+        foregroundRefreshDeadlineTask = nil
+#endif
         let scheduler = configurationScheduler
-        let inFlight = scheduler.invalidate()
-        Task {
-            await inFlight?.value
-            try? await stream.stopCapture()
+        let stopResult = onCaptureQueueSync { () -> (SCStream?, Task<Void, Never>?) in
+            captureStateLock.lock()
+            captureGeneration &+= 1
+            lastUnexpectedlyStoppedGeneration = nil
+            let stoppedStream = stream
+            stream = nil
+            activeCaptureGeneration = nil
+            captureStartInProgress = false
+            cancelUnavailableStatusCheckLocked()
+            captureDiagnosticStage = "Stopped"
+            captureDisplayID = nil
+            captureDisplayWidth = 0
+            captureDisplayHeight = 0
+            captureWidth = 0
+            captureHeight = 0
+            captureStateLock.unlock()
+            encoder.stop()
+            let inFlight = scheduler.invalidate()
+            return (stoppedStream, inFlight)
+        }
+        if let stoppedStream = stopResult.0 {
+            Task {
+                await stopResult.1?.value
+                try? await stoppedStream.stopCapture()
+            }
         }
     }
 
-    private func rebuildCaptureAfterForeground() async throws {
-        guard let oldStream = stream else {
+    private func rebuildCaptureAfterForeground(refreshToken: UUID) async throws {
+        guard let (oldStream, rebuildGeneration, inFlightConfiguration) = detachActiveStreamForRebuild() else {
             throw StreamError.noDisplay
         }
 
         // Stop the old source before touching VideoToolbox. Waiting for the
         // capture queue to drain prevents one final pre-background sample from
         // being encoded into the newly presented stream.
-        self.stream = nil
-        let inFlight = configurationScheduler.invalidate()
-        await inFlight?.value
+        await inFlightConfiguration?.value
         try? await oldStream.stopCapture()
-        captureQueue.sync { }
-        encoder.stop()
-        captureDisplayID = nil
-        captureWidth = 0
-        captureHeight = 0
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled,
+              foregroundRefreshToken == refreshToken,
+              isCurrentDetachedGeneration(rebuildGeneration) else {
+            throw CancellationError()
+        }
+        let didStopEncoder = onCaptureQueueSync { () -> Bool in
+            guard isCurrentDetachedGeneration(rebuildGeneration) else { return false }
+            encoder.stop()
+            captureDisplayID = nil
+            captureDisplayWidth = 0
+            captureDisplayHeight = 0
+            captureWidth = 0
+            captureHeight = 0
+            return true
+        }
+        guard didStopEncoder,
+              !Task.isCancelled,
+              foregroundRefreshToken == refreshToken else {
+            throw CancellationError()
+        }
 
         // Build the same capture configuration as a normal start, but keep
         // the packet sequence continuous across this presentation-only
         // restart. The iPad decoder is already gated on a fresh keyframe.
-        try await startCapture(resetSequence: false)
-        guard !Task.isCancelled else {
-            stop()
-            return
+        try await start(resetSequence: false)
+        guard !Task.isCancelled, foregroundRefreshToken == refreshToken else {
+            throw CancellationError()
         }
         // Make the first sample from the new source an IDR. The synchronous
         // hop establishes the request before any queued capture callback can
@@ -667,9 +1322,11 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
     /// but leaving the capture source at 120 FPS would still spend memory and
     /// scheduling time producing frames that pressure mode immediately drops.
     private func updateCaptureConfigurationForActiveCadence() {
-        guard let activeStream = stream,
+        guard let activeSnapshot = activeStreamSnapshot(),
               captureWidth > 0,
               captureHeight > 0 else { return }
+        let activeStream = activeSnapshot.stream
+        let generation = activeSnapshot.generation
         let configuration = makeConfiguration(
             width: captureWidth,
             height: captureHeight,
@@ -682,7 +1339,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
         ) { [weak self, reference] in
             guard let self else { return }
             self.captureQueue.async { [weak self, reference] in
-                guard let self, self.stream === reference.stream else { return }
+                guard let self,
+                      self.activeGeneration(for: reference.stream) == generation else { return }
                 self.captureClock.reset()
                 self.encoder.requestKeyFrame()
             }
@@ -711,22 +1369,49 @@ final class ScreenStreamer: NSObject, SCStreamOutput, @unchecked Sendable {
         // A stopped SCStream can have one or two callbacks already queued on
         // its sample handler queue. Ignore those callbacks after a foreground
         // rebuild so an old surface can never overwrite the new capture.
-        guard self.stream === stream else { return }
-        guard type == .screen,
-              sampleBuffer.isValid,
-              let pixelBuffer = sampleBuffer.imageBuffer else { return }
+        guard let generation = activeGeneration(for: stream),
+              type == .screen else { return }
 
         guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
             sampleBuffer, createIfNecessary: false
         ) as? [[SCStreamFrameInfo: Any]],
-              let rawStatus = attachments.first?[.status] as? Int,
-              SCFrameStatus(rawValue: rawStatus) == .complete else { return }
+              let rawStatus = attachments.first?[.status] as? Int else {
+            recordFrameStatus(nil, generation: generation)
+            return
+        }
+        guard let status = SCFrameStatus(rawValue: rawStatus) else {
+            recordFrameStatus(nil, generation: generation)
+            return
+        }
+        guard status == .complete else {
+            recordFrameStatus(status, generation: generation)
+            return
+        }
+        guard sampleBuffer.isValid,
+              let pixelBuffer = sampleBuffer.imageBuffer else {
+            recordFrameStatus(.complete, generation: generation)
+            return
+        }
 
         // Callback arrival spacing includes scheduler jitter. The capture
         // timestamp preserves the actual cadence even when callbacks bunch up.
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        guard presentationTime.isNumeric,
-              captureClock.accepts(timestamp: presentationTime.seconds, frameRate: activeFrameRate) else { return }
+        guard presentationTime.isNumeric else {
+            recordFrameStatus(.complete, generation: generation)
+            return
+        }
+        recordFrameStatus(.complete, generation: generation, acceptedComplete: true)
+        guard captureClock.accepts(timestamp: presentationTime.seconds, frameRate: activeFrameRate) else {
+            return
+        }
         encoder.encode(pixelBuffer, presentationTime: presentationTime)
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        guard let stopped = markUnexpectedStop(stream, error: error) else { return }
+        captureLogger.error(
+            "capture stream stopped generation=\(stopped.generation, privacy: .public) domain=\(stopped.domain, privacy: .public) code=\(stopped.code, privacy: .public)"
+        )
+        onCaptureSourceStopped?(stopped.generation, stopped.domain, stopped.code)
     }
 }

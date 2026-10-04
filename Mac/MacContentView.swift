@@ -5,7 +5,9 @@ import UniformTypeIdentifiers
 struct MacContentView: View {
     @ObservedObject var model: MacConnectionModel
     @Environment(\.openWindow) private var openWindow
+#if !SIDECARBRIDGE_FORK
     @State private var hostMainWindowReference = HostMainWindowReference()
+#endif
     @State private var section = "Connect"
     @State private var showingForgetPairingConfirmation = false
 
@@ -63,6 +65,9 @@ struct MacContentView: View {
             }
         }
         .preferredColorScheme(.dark)
+#if SIDECARBRIDGE_FORK
+        .modifier(ScreenDockHostWindowBehaviorModifier(behavior: model.screenDockHostWindowBehavior))
+#else
         .background {
             HostMainWindowAccessor { window in
                 hostMainWindowReference.window = window
@@ -73,6 +78,7 @@ struct MacContentView: View {
             guard shouldMinimize else { return }
             hostMainWindowReference.window?.miniaturize(nil)
         }
+#endif
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.refreshPermissions()
         }
@@ -117,7 +123,7 @@ struct MacContentView: View {
                 .shadow(color: .blue.opacity(0.35), radius: 18, y: 8)
 
             VStack(alignment: .leading, spacing: 5) {
-                Text("SidecarBridge")
+                Text(MacProductBrand.hostAppName)
                     .font(.system(size: 26, weight: .bold, design: .rounded))
                 Text("Your workspace. Within reach.")
                     .font(.callout)
@@ -189,7 +195,7 @@ struct MacContentView: View {
                         .buttonStyle(.borderedProminent)
                         .tint(.cyan)
                 } else {
-                    Text("Connect from an iPad or iPhone app, or from SidecarBridge Viewer on another Mac")
+                    Text("Connect from an iPad or iPhone app, or from \(MacProductBrand.viewerAppName) on another Mac")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.42))
                 }
@@ -549,7 +555,7 @@ struct MacContentView: View {
                 title: "Keyboard & trackpad",
                 detail: model.remoteInputAuthorized
                     ? "Keyboard, trackpad, and scroll event posting are enabled"
-                    : "Allow SidecarBridge to post keyboard and pointer events",
+                    : "Allow \(MacProductBrand.hostAppName) to post keyboard and pointer events",
                 isReady: model.remoteInputAuthorized
             ) {
                 if !model.remoteInputAuthorized {
@@ -590,7 +596,7 @@ struct MacContentView: View {
     }
 
     private var systemDisplayDescription: String {
-        return "USB or nearby wireless. Choose your iPad in Apple's Displays settings; the native display opens outside SidecarBridge."
+        return "USB or nearby wireless. Choose your iPad in Apple's Displays settings; the native display opens outside \(MacProductBrand.productName)."
     }
 
     private var fileTransferCard: some View {
@@ -621,7 +627,7 @@ struct MacContentView: View {
                     } else if let error = model.fileTransferError {
                         Text(error).font(.caption).foregroundStyle(.orange)
                     } else {
-                        Text("Send one or more files to the viewer, or receive into SidecarBridge's private Transfers folder.")
+                        Text("Send one or more files to the viewer, or receive into \(MacProductBrand.productName)'s private Transfers folder.")
                             .font(.caption)
                             .foregroundStyle(.white.opacity(0.55))
                     }
@@ -903,6 +909,7 @@ struct MacContentView: View {
     }
 }
 
+#if !SIDECARBRIDGE_FORK
 @MainActor
 private final class HostMainWindowReference {
     weak var window: NSWindow?
@@ -933,6 +940,7 @@ private struct HostMainWindowAccessor: NSViewRepresentable {
         onWindowChange(view.window)
     }
 }
+#endif
 
 private struct ModeCard: View {
     let icon: String

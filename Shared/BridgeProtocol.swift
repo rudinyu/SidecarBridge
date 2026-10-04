@@ -116,6 +116,41 @@ enum RemoteDisplayGeometry {
 }
 
 enum BridgeConstants {
+    static let applicationName: String = {
+        #if SIDECARBRIDGE_FORK
+        return ForkRuntimeProfile.productName
+        #else
+        return "SidecarBridge"
+        #endif
+    }()
+    static let viewerApplicationName: String = {
+        #if SIDECARBRIDGE_FORK
+        return "\(ForkRuntimeProfile.productName) Viewer"
+        #else
+        return "Mac Viewer"
+        #endif
+    }()
+    static let applicationSupportDirectoryName: String = {
+        #if SIDECARBRIDGE_FORK
+        return ForkRuntimeProfile.applicationSupportFolderName
+        #else
+        return "SidecarBridge"
+        #endif
+    }()
+    static func hostDisplayName(machineName: String?) -> String {
+        #if SIDECARBRIDGE_FORK
+        return ForkRuntimeProfile.hostDisplayName(machineName: machineName)
+        #else
+        return machineName ?? "Mac"
+        #endif
+    }
+    static func pairingDisplayName(machineName: String?) -> String {
+        #if SIDECARBRIDGE_FORK
+        return hostDisplayName(machineName: machineName)
+        #else
+        return PairingInvitation.displayName(machineName ?? "Mac")
+        #endif
+    }
     static let serviceType = "sb-screen"
     static let lanServiceType = "_sb-direct._tcp"
     static let directPort: UInt16 = 45_454

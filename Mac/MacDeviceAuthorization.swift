@@ -19,6 +19,13 @@ struct PairingVerification {
 @MainActor
 final class MacPairingSecurity {
     static let shared = MacPairingSecurity()
+    static let defaultDefaults: UserDefaults = {
+        #if SIDECARBRIDGE_FORK
+        return ForkRuntimeProfile.userDefaults(for: .host)
+        #else
+        return .standard
+        #endif
+    }()
 
     var onPairingCodeChanged: ((String) -> Void)?
 
@@ -36,19 +43,20 @@ final class MacPairingSecurity {
     private let automaticallyRotate: Bool
     private var rotationTask: Task<Void, Never>?
 
-    init(defaults: UserDefaults = .standard,
+    init(defaults: UserDefaults? = nil,
          read: @escaping (String) -> Data? = { SecureCredentialStore.data(account: $0) },
          write: @escaping (Data, String) -> Bool = { SecureCredentialStore.set($0, account: $1) },
          delete: @escaping (String) -> Bool = { SecureCredentialStore.removeAll(accountPrefix: $0) },
          authorize: @escaping @MainActor (BridgePeerIdentity) -> Void = { MacAuthorizedDeviceStore.shared.authorize($0) },
          automaticallyRotate: Bool = true) {
-        self.defaults = defaults
+        let resolvedDefaults = defaults ?? MacPairingSecurity.defaultDefaults
+        self.defaults = resolvedDefaults
         self.readCredential = read
         self.writeCredential = write
         self.deleteCredentials = delete
         self.recordAuthorization = authorize
         self.automaticallyRotate = automaticallyRotate
-        self.credentialGeneration = defaults.string(forKey: "pairingCredentialGeneration") ?? ""
+        self.credentialGeneration = resolvedDefaults.string(forKey: "pairingCredentialGeneration") ?? ""
         if let saved = read("mac.identity"),
            let value = String(data: saved, encoding: .utf8),
            !value.isEmpty {
@@ -57,15 +65,15 @@ final class MacPairingSecurity {
             // while the Mac is relaunching or the protected Keychain is
             // temporarily unavailable. The actual pairing credentials still
             // remain in SecureCredentialStore.
-            defaults.set(value, forKey: "macDeviceIdentifier")
-        } else if let saved = defaults.string(forKey: "macDeviceIdentifier"),
+            resolvedDefaults.set(value, forKey: "macDeviceIdentifier")
+        } else if let saved = resolvedDefaults.string(forKey: "macDeviceIdentifier"),
                   !saved.isEmpty {
             macID = saved
             _ = write(Data(saved.utf8), "mac.identity")
         } else {
             let value = UUID().uuidString
             macID = value
-            defaults.set(value, forKey: "macDeviceIdentifier")
+            resolvedDefaults.set(value, forKey: "macDeviceIdentifier")
             _ = write(Data(value.utf8), "mac.identity")
         }
         pairingCode = PairingCode.generate()
@@ -239,10 +247,16 @@ final class MacAuthorizedDeviceStore {
     static let shared = MacAuthorizedDeviceStore()
 
     private let recordsKey = "authorizedDeviceRecords"
+    private let defaults: UserDefaults
     private(set) var devices: [MacAuthorizedDevice]
 
     private init() {
-        if let data = UserDefaults.standard.data(forKey: recordsKey),
+        #if SIDECARBRIDGE_FORK
+        defaults = ForkRuntimeProfile.userDefaults(for: .host)
+        #else
+        defaults = .standard
+        #endif
+        if let data = defaults.data(forKey: recordsKey),
            let decoded = try? JSONDecoder().decode([MacAuthorizedDevice].self, from: data) {
             devices = decoded
         } else {
@@ -281,8 +295,8 @@ final class MacAuthorizedDeviceStore {
 
     func forgetAll() {
         devices.removeAll()
-        UserDefaults.standard.removeObject(forKey: recordsKey)
-        UserDefaults.standard.removeObject(forKey: "pairedPeerName")
+        defaults.removeObject(forKey: recordsKey)
+        defaults.removeObject(forKey: "pairedPeerName")
     }
 
     var displaySummary: String? {
@@ -295,7 +309,7 @@ final class MacAuthorizedDeviceStore {
 
     private func save() {
         guard let data = try? JSONEncoder().encode(devices) else { return }
-        UserDefaults.standard.set(data, forKey: recordsKey)
+        defaults.set(data, forKey: recordsKey)
     }
 }
 
@@ -340,7 +354,7 @@ final class MacDeviceAuthorizer {
             return
         }
 
-        let reason = "Authorize \(request.identity.deviceName) (\(request.identity.deviceKind)) for SidecarBridge. This is required only once."
+        let reason = "Authorize \(request.identity.deviceName) (\(request.identity.deviceKind)) for \(BridgeConstants.applicationName). This is required only once."
         context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { [weak self] accepted, _ in
             DispatchQueue.main.async {
                 guard let self else { return }

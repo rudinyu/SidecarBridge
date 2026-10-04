@@ -6,6 +6,44 @@ protocol MacViewerInputModeManaging: AnyObject {
     func toggleChineseEnglishAndReturnLanguage() -> String?
 }
 
+struct MacViewerInputOverlay: View {
+    let isConnected: Bool
+    let isEnabled: Bool
+    let isStreaming: Bool
+    let contentAspectRatio: CGFloat
+    let onInput: (RemoteInputEvent) -> Void
+    var inputModeManager: MacViewerInputModeManaging = NoOpMacViewerInputModeManager()
+    var onLocalShortcut: (NSEvent) -> Bool = { _ in false }
+
+    var body: some View {
+        ZStack {
+            if !isStreaming {
+                VStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Waiting for the other Mac's screen…")
+                        .font(.callout)
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+                .padding(18)
+                .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 14))
+                .allowsHitTesting(false)
+            }
+
+            if isConnected {
+                MacViewerInputSurface(
+                    contentAspectRatio: contentAspectRatio,
+                    isEnabled: isConnected && isEnabled,
+                    onInput: onInput,
+                    inputModeManager: inputModeManager,
+                    onLocalShortcut: onLocalShortcut
+                )
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
 final class NoOpMacViewerInputModeManager: MacViewerInputModeManaging {
     func cycleAndReturnLanguage() -> String? { nil }
     func toggleChineseEnglishAndReturnLanguage() -> String? { nil }
@@ -30,11 +68,13 @@ struct MacViewerInputSurface: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: MacViewerInputView, context: Context) {
-        nsView.contentAspectRatio = contentAspectRatio
-        nsView.isEnabled = isEnabled
-        nsView.onInput = onInput
-        nsView.inputModeManager = inputModeManager
-        nsView.onLocalShortcut = onLocalShortcut
+        nsView.update(
+            contentAspectRatio: contentAspectRatio,
+            isEnabled: isEnabled,
+            onInput: onInput,
+            inputModeManager: inputModeManager,
+            onLocalShortcut: onLocalShortcut
+        )
     }
 }
 
@@ -88,9 +128,20 @@ final class MacViewerInputView: NSView, NSTextInputClient {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true
-        if window != nil, isEnabled {
-            window?.makeFirstResponder(self)
-        }
+    }
+
+    func update(
+        contentAspectRatio: CGFloat,
+        isEnabled: Bool,
+        onInput: @escaping (RemoteInputEvent) -> Void,
+        inputModeManager: MacViewerInputModeManaging,
+        onLocalShortcut: @escaping (NSEvent) -> Bool
+    ) {
+        self.contentAspectRatio = contentAspectRatio
+        self.isEnabled = isEnabled
+        self.onInput = onInput
+        self.inputModeManager = inputModeManager
+        self.onLocalShortcut = onLocalShortcut
     }
 
     override func mouseMoved(with event: NSEvent) {

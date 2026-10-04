@@ -119,6 +119,14 @@ struct SavedMacRoute: Codable, Equatable {
     let macID: String
     let name: String
     let hosts: [String]
+    let port: UInt16?
+
+    init(macID: String, name: String, hosts: [String], port: UInt16? = nil) {
+        self.macID = macID
+        self.name = name
+        self.hosts = hosts
+        self.port = port
+    }
 }
 
 /// Passive discovery metadata. `macID` is an unauthenticated routing hint
@@ -138,37 +146,59 @@ struct MacDiscoveryRecord: Equatable, Identifiable {
 enum SavedMacRouteStore {
     private static let key = "authenticatedMacRoutesV1"
     private static let lock = NSLock()
+    static let defaultDefaults: UserDefaults = {
+        #if SIDECARBRIDGE_FORK
+        return ForkRuntimeProfile.userDefaults(for: .viewer)
+        #else
+        return .standard
+        #endif
+    }()
 
-    static func routes(defaults: UserDefaults = .standard) -> [SavedMacRoute] {
+    static func routes(defaults: UserDefaults = SavedMacRouteStore.defaultDefaults) -> [SavedMacRoute] {
         lock.lock(); defer { lock.unlock() }
         return load(defaults)
     }
 
-    static func route(macID: String, defaults: UserDefaults = .standard) -> SavedMacRoute? {
+    static func route(macID: String, defaults: UserDefaults = SavedMacRouteStore.defaultDefaults) -> SavedMacRoute? {
         lock.lock(); defer { lock.unlock() }
         return load(defaults).first { $0.macID == macID }
     }
 
     /// Compatibility lookup for older clients that only know a display name.
     /// Ambiguous names intentionally resolve to no route.
-    static func route(named name: String, defaults: UserDefaults = .standard) -> SavedMacRoute? {
+    static func route(named name: String, defaults: UserDefaults = SavedMacRouteStore.defaultDefaults) -> SavedMacRoute? {
         lock.lock(); defer { lock.unlock() }
         let matches = load(defaults).filter { $0.name == name }
         return matches.count == 1 ? matches[0] : nil
     }
 
-    static func remember(macID: String, name: String, hosts: [String], defaults: UserDefaults = .standard) {
+    static func remember(
+        macID: String,
+        name: String,
+        hosts: [String],
+        port: UInt16? = nil,
+        defaults: UserDefaults = SavedMacRouteStore.defaultDefaults
+    ) {
         lock.lock(); defer { lock.unlock() }
         var routes = load(defaults)
         let previous = routes.first { $0.macID == macID }
         let addresses = Array(Set((hosts + (previous?.hosts ?? [])).filter(BridgeNetworkMetadata.isPrivateIPv4Address))).sorted()
+        #if SIDECARBRIDGE_FORK
+        let routePort = port.flatMap { ForkRuntimeProfile.isSupportedListenerPort($0) ? $0 : nil }
+            ?? previous?.port
+        #else
+        let routePort = port ?? previous?.port
+        #endif
         routes.removeAll { $0.macID == macID }
-        routes.insert(SavedMacRoute(macID: macID, name: name, hosts: Array(addresses.prefix(8))), at: 0)
+        routes.insert(
+            SavedMacRoute(macID: macID, name: name, hosts: Array(addresses.prefix(8)), port: routePort),
+            at: 0
+        )
         save(Array(routes.prefix(32)), defaults: defaults)
     }
 
     @discardableResult
-    static func remove(macID: String, defaults: UserDefaults = .standard) -> SavedMacRoute? {
+    static func remove(macID: String, defaults: UserDefaults = SavedMacRouteStore.defaultDefaults) -> SavedMacRoute? {
         lock.lock(); defer { lock.unlock() }
         var routes = load(defaults)
         guard let removed = routes.first(where: { $0.macID == macID }) else { return nil }
@@ -178,7 +208,7 @@ enum SavedMacRouteStore {
     }
 
     @discardableResult
-    static func remove(named name: String, defaults: UserDefaults = .standard) -> SavedMacRoute? {
+    static func remove(named name: String, defaults: UserDefaults = SavedMacRouteStore.defaultDefaults) -> SavedMacRoute? {
         lock.lock(); defer { lock.unlock() }
         var routes = load(defaults)
         let matches = routes.filter { $0.name == name }
@@ -188,7 +218,7 @@ enum SavedMacRouteStore {
         return removed
     }
 
-    static func removeAll(defaults: UserDefaults = .standard) {
+    static func removeAll(defaults: UserDefaults = SavedMacRouteStore.defaultDefaults) {
         lock.lock(); defer { lock.unlock() }
         defaults.removeObject(forKey: key)
     }

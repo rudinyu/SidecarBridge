@@ -194,7 +194,15 @@ enum PairingProof {
 }
 
 enum SecureCredentialStore {
-    private static let service = "io.sidecarbridge.trusted-devices"
+    private static func service(forAccount account: String) -> String {
+        #if SIDECARBRIDGE_FORK
+        return ForkRuntimeProfile.keychainService(
+            for: ForkRuntimeProfile.keychainRole(forAccount: account)
+        )
+        #else
+        return "io.sidecarbridge.trusted-devices"
+        #endif
+    }
 
     static func data(account: String) -> Data? {
         var query = baseQuery(account: account, dataProtection: true)
@@ -286,7 +294,7 @@ enum SecureCredentialStore {
     private static func removeAll(accountPrefix: String, dataProtection: Bool) -> Bool {
         var query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
+            kSecAttrService: service(forAccount: accountPrefix),
             kSecReturnAttributes: true,
             kSecMatchLimit: kSecMatchLimitAll
         ]
@@ -317,7 +325,7 @@ enum SecureCredentialStore {
     private static func baseQuery(account: String, dataProtection: Bool) -> [CFString: Any] {
         var query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
+            kSecAttrService: service(forAccount: account),
             kSecAttrAccount: account
         ]
         if dataProtection {

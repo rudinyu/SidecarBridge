@@ -13,7 +13,11 @@ enum PadDeviceIdentity {
     #endif
 
     static let current: BridgePeerIdentity = {
+        #if SIDECARBRIDGE_FORK && os(macOS)
+        let defaults = ForkRuntimeProfile.userDefaults(for: .viewer)
+        #else
         let defaults = UserDefaults.standard
+        #endif
         let identifier: String
         if let saved = SecureCredentialStore.data(account: keychainAccount)
             .flatMap({ String(data: $0, encoding: .utf8) }),
@@ -47,7 +51,7 @@ enum PadDeviceIdentity {
         }
         let name = UIDevice.current.name
         #else
-        let kind = "Mac Viewer"
+        let kind = BridgeConstants.viewerApplicationName
         let name = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
         #endif
 

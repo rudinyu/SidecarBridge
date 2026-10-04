@@ -8,20 +8,26 @@
 
 <p align="center">
   <a href="https://apps.apple.com/app/sidecarbridge/id6792298083">
-    <img src="https://img.shields.io/badge/Mac%20App%20Store-Available-0A84FF?logo=apple&logoColor=white" alt="Mac App Store available">
+    <img src="https://img.shields.io/badge/Mac%20App%20Store-Available-0A84FF?logo=apple&logoColor=white" alt="SidecarBridge Mac App Store release">
   </a>
-  <img src="https://img.shields.io/badge/iOS%2FiPadOS-Available-34C759?logo=apple&logoColor=white" alt="iOS and iPadOS available">
+  <img src="https://img.shields.io/badge/iOS%2FiPadOS-Available-34C759?logo=apple&logoColor=white" alt="SidecarBridge iOS and iPadOS release">
 </p>
+
+The App Store references above identify the author's SidecarBridge apps. They
+are separate from this fork's ScreenDock Host and Viewer builds.
 
 For the full architecture, protocol, permission, distribution, testing, and troubleshooting reference, see [SIDECARBRIDGE_TECHNICAL_GUIDE.md](SIDECARBRIDGE_TECHNICAL_GUIDE.md). The current accessibility support matrix is in [ACCESSIBILITY.md](ACCESSIBILITY.md).
 
-SidecarBridge pairs macOS with iPhone/iPad viewers and also supports encrypted Mac-to-Mac viewing through its native Mac Viewer.
+This fork preserves SidecarBridge iPhone/iPad compatibility and adds encrypted
+Mac-to-Mac viewing through ScreenDock Host and ScreenDock Viewer.
 
-### Mac-to-Mac Viewer
+### ScreenDock Host and Viewer
 
-The new standalone **SidecarBridge Viewer** app connects to a Mac running the existing SidecarBridge macOS app. Select the discovered Mac and tap **Connect**. For first-time pairing, enter the Mac's current 16-digit code; an optional private IPv4 address can be supplied with that code when Bonjour discovery is unavailable. The encrypted session carries the Mac screen, mouse and keyboard input, clipboard text, and verified file transfers. Both Macs need Local Network access, and the Mac being viewed still needs Screen Recording and Accessibility permission for capture and remote input. This is an in-app remote display stream; it does not create Apple's native extended Sidecar display.
+The fork builds two macOS products: **ScreenDock Host** and **ScreenDock Viewer**. ScreenDock Viewer connects to a Mac running ScreenDock Host. Select the discovered Mac and tap **Connect**. For first-time pairing, enter the Mac's current 16-digit code; an optional private IPv4 address can be supplied with that code when Bonjour discovery is unavailable. The encrypted session carries the Mac screen, mouse and keyboard input, clipboard text, and verified file transfers. Both Macs need Local Network access, and the Mac being viewed still needs Screen Recording and Accessibility permission for capture and remote input. This is an in-app remote display stream; it does not create Apple's native extended Sidecar display.
 
-The existing SidecarBridge macOS and iPad apps remain the original product and targets. The repository root now has a separate `MacViewer/` folder for the standalone Viewer app, built by the additional `SidecarBridgeViewerMac` target; it does not replace or rename the existing apps. The Viewer has its own bundle identifier and local app data, so saved Viewer pairings may need to be created once in the new app. Build it with the `SidecarBridgeViewerMac` scheme; the existing `SidecarBridgeMac` and `SidecarBridgePad` schemes continue to build the original apps.
+ScreenDock Host remains compatible with the existing SidecarBridge iPhone and iPad apps. It advertises both the original SidecarBridge Bonjour services and ScreenDock's fork-specific services; the Viewer searches only for ScreenDock services. ScreenDock uses TCP port `45454` by default, the same port as the author app. It selects `45455` only when the original SidecarBridge Host is already running or port `45454` is occupied. ScreenDock has its own pairing-trust namespace, so pair each Viewer with a Mac once; that first pairing does not replace the SidecarBridge apps' saved trust.
+
+The fork products are version `1.5` build `123`, with bundle identifiers `com.screendock.host` and `com.screendock.viewer` (Debug builds add `.debug`). The author-owned iPad target remains version `1.4` build `6` with its existing identity. Build ScreenDock Host with the `SidecarBridgeMac` scheme and ScreenDock Viewer with `SidecarBridgeViewerMac`; `SidecarBridgePad` remains the original iPad app target.
 
 The author-owned `project.yml` and `SidecarBridge.xcodeproj` stay at their
 upstream baseline. Fork builds use the additive `project.fork.yml` overlay and
@@ -33,21 +39,21 @@ building the fork project:
 open SidecarBridgeFork.xcodeproj
 ```
 
-The macOS Host and Viewer schemes preserve the current app names and bundle
-identifiers. CI and release builds generate this fork project first and build
-only the macOS apps.
+The Host and Viewer schemes generate the ScreenDock products from the fork
+overlay. CI and release builds generate this fork project first and build only
+the macOS apps; the author-owned project and iPad target retain their original
+settings.
 
 Text composition uses the Viewer Mac's active macOS input method; only committed
 text is sent to the remote Mac. The Magic Keyboard 中/英 key toggles the remote
 Mac's Chinese/English input source, and Control-Space cycles its input sources.
 
-Use **Full Screen** (Control-Command-F, or the green window button) for an
-edge-to-edge viewing area. Entering full screen hides Viewer chrome; **Show
-Controls / Hide Controls** (Control-Command-H) brings back or hides the settings
-panel. The small overlay remains available when controls are hidden. Exiting
-full screen restores the previous windowed layout; the windowed visibility
-preference is saved. These two shortcuts stay local; plain Escape and other
-remote shortcuts still go to the host.
+Use native macOS **Full Screen** (Control-Command-F, or the green window button)
+for an edge-to-edge viewing area. Full screen hides Viewer controls. Use the
+**View** menu's **Show ScreenDock Controls / Hide ScreenDock Controls** command
+(Control-Command-H) to bring them back or hide them. Exiting full screen restores
+the previous windowed layout and its saved control visibility. These shortcuts
+stay local; plain Escape and other remote shortcuts still go to the host.
 
 Successful pairing saves the trust credential in Keychain and remembers the
 last authenticated Mac, including code-first/manual-IP connections. Temporary
@@ -109,6 +115,17 @@ the local test app, and temporarily switches Spaces. Do not run it during an
 active remote session.
 It never presses Connect, grants permissions, or runs the iPad target. Its local
 ad-hoc signature is for testing only, not Developer ID distribution.
+
+If the UI-test preflight is not ready, use this command to run CI without
+launching the UI runner:
+
+```sh
+./.codex/ci.sh --skip-viewer-ui-tests
+```
+
+For a release check in the same state, pass `--skip-viewer-ui-tests` to
+`scripts/release-macos.sh`. This skips only the UI suite and does not count as a
+UI-test pass.
 
 macOS build 111 keeps the Viewer trust credential across reconnects and adds a
 confirmed per-Mac **Forget** action. Build 110 explicitly gives the Viewer a
@@ -190,10 +207,10 @@ In Xcode:
 1. Select the `SidecarBridgeMac` target, choose your Apple development team, then run it on **My Mac**.
 2. Select `SidecarBridgePad`, choose the same or another valid development team, then run it on an iPhone or iPad.
 3. Accept **Local Network** on both devices.
-4. For first-time pairing, scan the Mac's QR code or enter its 16-digit one-time code, then tap Connect. SidecarBridge mutually authenticates LAN and nearby P2P and saves a device-specific Keychain credential for later connections.
-5. If the fallback is needed, grant **Screen Recording** to SidecarBridge on the Mac, quit it, and reopen it.
+4. For first-time pairing, scan the Mac's QR code or enter its 16-digit one-time code, then tap Connect. ScreenDock Host mutually authenticates LAN and nearby P2P and saves a device-specific Keychain credential for later connections.
+5. If the fallback is needed, grant **Screen Recording** to ScreenDock Host on the Mac, quit it, and reopen it.
 
-For automatic startup, use the **Automatic startup** card in the Mac app. It distinguishes enabled, disabled, and macOS-approval-required states. If the app was moved or rebuilt after startup was enabled, click **Repair** once so the Login Item points to `/Volumes/D/Applications/SidecarBridge.app` instead of an old Xcode build.
+For automatic startup, use the **Automatic startup** card in the Mac app. It distinguishes enabled, disabled, and macOS-approval-required states. If the app was moved or rebuilt after startup was enabled, click **Repair** once so the Login Item points at the currently installed app instead of an old Xcode build.
 
 For reliable native Sidecar, both devices should use the same Apple Account with two-factor authentication. Wireless Sidecar also needs Wi-Fi, Bluetooth, and Handoff; USB Sidecar needs the iPad to trust the Mac.
 

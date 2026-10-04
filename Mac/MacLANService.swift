@@ -32,6 +32,7 @@ final class MacLANService {
     var onConnectionChanged: ((Bool, String?) -> Void)?
     var onLocalNetworkStateChanged: ((LocalNetworkAccessState) -> Void)?
     var onListenerStateChanged: ((Bool, String) -> Void)?
+    var onListenerPortChanged: ((UInt16?) -> Void)?
 
     private let queue = DispatchQueue(
         label: "SidecarBridge.MacLAN",
@@ -43,6 +44,40 @@ final class MacLANService {
     )
     private var listener: NWListener?
     private var listenerRestartWorkItem: DispatchWorkItem?
+#if SIDECARBRIDGE_FORK
+    private lazy var forkListenerLifecycle = ForkHostListenerLifecycle(
+        queue: queue,
+        makeParameters: { [weak self] in
+            guard let self else {
+                return NWParameters(tls: nil, tcp: NWProtocolTCP.Options())
+            }
+            return self.lowLatencyParameters()
+        },
+        configureListener: { [weak self] listener, port in
+            self?.configureForkListener(listener, requestedPort: port)
+        },
+        onNewConnection: { [weak self] connection in
+            guard let self else { connection.cancel(); return }
+            self.accept(connection)
+        },
+        onEvent: { [weak self] event in self?.handleForkListenerEvent(event) }
+    )
+    private lazy var forkBonjourPublisher: ForkBonjourAliasPublisher = {
+        let publisher = ForkBonjourAliasPublisher()
+        publisher.onEvent = { event in
+            switch event {
+            case .published(let port, let name):
+                print("[ScreenDock/Bonjour] Published \(name) on TCP \(port).")
+            case .failed(let port, let error):
+                print("[ScreenDock/Bonjour] Could not publish TCP \(port): \(error.localizedDescription)")
+            case .stopped:
+                break
+            }
+        }
+        return publisher
+    }()
+    private var forkListenerIsRunning = false
+#endif
     private var connection: NWConnection?
     private var secureSession: SecurePacketSession?
     private final class Candidate {
@@ -166,8 +201,14 @@ final class MacLANService {
         queue.async { [weak self] in
             self?.listenerRestartWorkItem?.cancel()
             self?.listenerRestartWorkItem = nil
+#if SIDECARBRIDGE_FORK
+            self?.forkListenerIsRunning = false
+            self?.forkBonjourPublisher.stop()
+            self?.forkListenerLifecycle.stop()
+#else
             self?.listener?.cancel()
             self?.listener = nil
+#endif
             self?.notifyListener(
                 ready: false,
                 detail: "Encrypted local listener stopped."
@@ -255,7 +296,137 @@ final class MacLANService {
         }
     }
 
+    #if SIDECARBRIDGE_FORK
+    private func configureForkListener(_ listener: NWListener, requestedPort: UInt16) {
+        let name = BridgeConstants.hostDisplayName(machineName: Host.current().localizedName)
+        var txtRecord = NWTXTRecord()
+        txtRecord[BridgeConstants.protocolTXTKey] = String(LANWire.securityProtocolVersion)
+        txtRecord[BridgeConstants.buildTXTKey] = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleVersion"
+        ) as? String ?? "unknown"
+        if let macID = ForkRuntimeProfile.userDefaults(for: .host).string(forKey: "macDeviceIdentifier"),
+           !macID.isEmpty {
+            txtRecord[BridgeConstants.macIDTXTKey] = macID
+        }
+        if let hosts = BridgeNetworkMetadata.encodedLocalPrivateIPv4Addresses() {
+            txtRecord[BridgeConstants.hostsTXTKey] = hosts
+        }
+        txtRecord[ForkRuntimeProfile.advertisedPortTXTKey] = String(requestedPort)
+        listener.service = NWListener.Service(
+            name: name,
+            type: ForkRuntimeProfile.legacyBonjourDirectServiceType,
+            txtRecord: txtRecord
+        )
+    }
+
+    private func handleForkListenerEvent(_ event: ForkHostListenerLifecycle.Event) {
+        switch event {
+        case .starting(let port, let retainingPort):
+            listenerRestartWorkItem?.cancel()
+            listenerRestartWorkItem = nil
+            if retainingPort == nil {
+                notifyListener(ready: false, detail: "Starting encrypted listener on TCP \(port)…")
+            }
+
+        case .waiting(let port, let retainingPort, let error):
+            let addressInUse = ForkRuntimeProfile.isAddressInUse(error)
+            if !addressInUse {
+                notifyLocalNetwork(accessState(for: error))
+            }
+            if retainingPort == nil {
+                forkBonjourPublisher.stop()
+                onListenerPortChanged?(nil)
+                notifyListener(
+                    ready: false,
+                    detail: "Listener on TCP \(port) is waiting: \(error.localizedDescription)"
+                )
+            }
+            if case .denied = accessState(for: error) {
+                listenerRestartWorkItem?.cancel()
+                listenerRestartWorkItem = nil
+            } else if !(addressInUse && port == ForkRuntimeProfile.primaryListenerPort) {
+                scheduleForkListenerRestart(after: 5)
+            }
+
+        case .listening(let port, _):
+            listenerRestartWorkItem?.cancel()
+            listenerRestartWorkItem = nil
+            notifyLocalNetwork(.granted)
+            notifyListener(
+                ready: true,
+                detail: "Listening on TCP \(port) for iPad/iPhone and ScreenDock Viewer."
+            )
+            onListenerPortChanged?(port)
+            forkBonjourPublisher.publish(
+                machineName: Host.current().localizedName,
+                port: port,
+                txtRecord: forkHostTXTRecord(port: port)
+            )
+
+        case .failed(let port, let retainingPort, let error):
+            let addressInUse = ForkRuntimeProfile.isAddressInUse(error)
+            if !addressInUse {
+                notifyLocalNetwork(accessState(for: error))
+            }
+            if retainingPort == nil {
+                forkBonjourPublisher.stop()
+                onListenerPortChanged?(nil)
+                notifyListener(
+                    ready: false,
+                    detail: "Listener on TCP \(port) failed: \(error.localizedDescription)"
+                )
+            }
+            if case .denied = accessState(for: error) {
+                listenerRestartWorkItem?.cancel()
+                listenerRestartWorkItem = nil
+            } else if !(addressInUse && port == ForkRuntimeProfile.primaryListenerPort) {
+                scheduleForkListenerRestart(after: 1)
+            }
+
+        case .stopped:
+            guard !forkListenerIsRunning else { return }
+            forkBonjourPublisher.stop()
+            notifyListener(ready: false, detail: "Encrypted local listener stopped.")
+        }
+    }
+
+    private func forkHostTXTRecord(port: UInt16) -> [String: String] {
+        var record = [
+            BridgeConstants.protocolTXTKey: String(LANWire.securityProtocolVersion),
+            BridgeConstants.buildTXTKey: Bundle.main.object(
+                forInfoDictionaryKey: "CFBundleVersion"
+            ) as? String ?? "unknown",
+            ForkRuntimeProfile.advertisedPortTXTKey: String(port)
+        ]
+        if let macID = ForkRuntimeProfile.userDefaults(for: .host).string(forKey: "macDeviceIdentifier"),
+           !macID.isEmpty {
+            record[BridgeConstants.macIDTXTKey] = macID
+        }
+        if let hosts = BridgeNetworkMetadata.encodedLocalPrivateIPv4Addresses() {
+            record[BridgeConstants.hostsTXTKey] = hosts
+        }
+        return record
+    }
+
+    private func scheduleForkListenerRestart(after delay: TimeInterval) {
+        listenerRestartWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.forkListenerIsRunning else { return }
+            self.listenerRestartWorkItem = nil
+            self.forkListenerLifecycle.retry()
+        }
+        listenerRestartWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+    #endif
+
     private func startListener() {
+#if SIDECARBRIDGE_FORK
+        guard !forkListenerIsRunning else { return }
+        forkListenerIsRunning = true
+        forkListenerLifecycle.start()
+        return
+#endif
         guard listener == nil else { return }
         do {
             let parameters = lowLatencyParameters()
@@ -478,7 +649,7 @@ final class MacLANService {
                     candidate.serverPublicKey = serverPublicKey
                     let response = LANHandshake(
                         protocolVersion: LANWire.securityProtocolVersion,
-                        deviceName: Host.current().localizedName ?? "Mac",
+                        deviceName: BridgeConstants.hostDisplayName(machineName: Host.current().localizedName),
                         publicKey: serverPublicKey,
                         deviceID: nil,
                         deviceKind: "Mac",
