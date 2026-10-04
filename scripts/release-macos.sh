@@ -20,11 +20,14 @@ Options:
 Authentication:
   The shared Codex config is ~/.config/codex/notarization.env.
   A SidecarBridge-specific fallback is ~/.config/sidecarbridge/release.env.
-  Either config may define:
-    SIDECARBRIDGE_NOTARY_PROFILE=notarytool-profile
-  or the shared generic name MACOS_NOTARY_PROFILE.
-  Signing and notarization credentials remain in macOS Keychain profiles.
-  The config file is never read from Git and should contain only profile names.
+  Either config may define all three generic API-key settings:
+    MACOS_NOTARY_KEY_PATH, MACOS_NOTARY_KEY_ID, MACOS_NOTARY_ISSUER
+  The API key file must be outside the repository and have mode 600.
+  Otherwise, notarization uses SIDECARBRIDGE_NOTARY_PROFILE, then
+  MACOS_NOTARY_PROFILE, then the default profile notarytool-profile.
+  Signing identities remain in macOS Keychain. API-key auth uses the private
+  key file above; profile auth uses a macOS Keychain profile.
+  The config file is never read from Git and must have mode 600.
 Use --notarize only after explicitly authorizing the Apple upload.
 EOF
 }
@@ -52,17 +55,61 @@ else
   CONFIG_PATH="$HOME/.config/sidecarbridge/release.env"
 fi
 if [[ -f "$CONFIG_PATH" ]]; then
-  if [[ $(stat -f '%Lp' "$CONFIG_PATH") != 600 ]]; then
-    echo "Release config must have mode 600: $CONFIG_PATH" >&2
+  CONFIG_MODE=$(stat -f '%Lp' "$CONFIG_PATH" 2>/dev/null || true)
+  if [[ "$CONFIG_MODE" != 600 ]]; then
+    echo "Release config must have mode 600." >&2
     exit 2
   fi
   # shellcheck disable=SC1090
-  source "$CONFIG_PATH"
+  if ! source "$CONFIG_PATH" >/dev/null 2>&1; then
+    echo "Could not load release config." >&2
+    exit 2
+  fi
 fi
 
-# Keep the repository-specific names as the internal interface while allowing
-# the same owner-only config to be reused by other macOS projects.
-SIDECARBRIDGE_NOTARY_PROFILE="${SIDECARBRIDGE_NOTARY_PROFILE:-${MACOS_NOTARY_PROFILE:-}}"
+NOTARY_AUTH_MODE="keychain-profile"
+NOTARY_PROFILE="${SIDECARBRIDGE_NOTARY_PROFILE:-${MACOS_NOTARY_PROFILE:-notarytool-profile}}"
+NOTARY_API_KEY_PATH=""
+if [[ -n "${MACOS_NOTARY_KEY_PATH+x}" || \
+      -n "${MACOS_NOTARY_KEY_ID+x}" || \
+      -n "${MACOS_NOTARY_ISSUER+x}" ]]; then
+  if [[ -z "${MACOS_NOTARY_KEY_PATH:-}" || \
+        -z "${MACOS_NOTARY_KEY_ID:-}" || \
+        -z "${MACOS_NOTARY_ISSUER:-}" ]]; then
+    echo "Generic notarization API-key configuration is incomplete. Set all three" \
+      "MACOS_NOTARY_KEY_PATH, MACOS_NOTARY_KEY_ID, and MACOS_NOTARY_ISSUER values," \
+      "or leave all three unset." >&2
+    exit 2
+  fi
+  if [[ ! -f "$MACOS_NOTARY_KEY_PATH" ]]; then
+    echo "Configured notarization API key file is missing or is not a regular file." >&2
+    exit 2
+  fi
+  if ! NOTARY_API_KEY_PATH=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \
+      "$MACOS_NOTARY_KEY_PATH" 2>/dev/null); then
+    echo "Could not resolve the configured notarization API key file." >&2
+    exit 2
+  fi
+  if [[ $(stat -f '%Lp' "$NOTARY_API_KEY_PATH" 2>/dev/null || true) != 600 ]]; then
+    echo "Configured notarization API key file must have mode 600." >&2
+    exit 2
+  fi
+  if ! python3 - "$ROOT" "$NOTARY_API_KEY_PATH" >/dev/null 2>&1 <<'PY'
+import os, sys
+
+repo_root, key_path = map(os.path.realpath, sys.argv[1:])
+try:
+    is_inside_repository = os.path.commonpath([repo_root, key_path]) == repo_root
+except ValueError:
+    is_inside_repository = False
+raise SystemExit(1 if is_inside_repository else 0)
+PY
+  then
+    echo "Configured notarization API key file must resolve outside the repository." >&2
+    exit 2
+  fi
+  NOTARY_AUTH_MODE="api-key"
+fi
 
 BUILD_NUMBER=$(awk -F '"' '/^[[:space:]]*CURRENT_PROJECT_VERSION:/ { print $2; exit }' project.yml)
 MARKETING_VERSION=$(awk -F '"' '/^[[:space:]]*MARKETING_VERSION:/ { print $2; exit }' project.yml)
@@ -72,10 +119,6 @@ if [[ ! "$BUILD_NUMBER" =~ ^[0-9]+$ || -z "$MARKETING_VERSION" ]]; then
 fi
 
 RELEASE_ROOT="$ROOT/.build/Release$BUILD_NUMBER"
-if (( CLEAN )); then
-  rm -rf -- "$RELEASE_ROOT"
-fi
-mkdir -p "$RELEASE_ROOT"
 
 DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 if [[ ! -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]]; then
@@ -98,12 +141,17 @@ if [[ -z "$SIGNING_IDENTITY" ]]; then
 fi
 
 if (( CHECK_ONLY )); then
-  echo "Notarization Keychain profile: ${SIDECARBRIDGE_NOTARY_PROFILE:-notarytool-profile}"
+  echo "Notarization authentication mode: $NOTARY_AUTH_MODE"
   echo "Xcode: $DEVELOPER_DIR"
   echo "Signing identity: $SIGNING_IDENTITY"
   echo "Project version: $MARKETING_VERSION ($BUILD_NUMBER)"
   exit 0
 fi
+
+if (( CLEAN )); then
+  rm -rf -- "$RELEASE_ROOT"
+fi
+mkdir -p "$RELEASE_ROOT"
 
 HOST_DERIVED="$RELEASE_ROOT/HostDerivedData"
 VIEWER_DERIVED="$RELEASE_ROOT/ViewerDerivedData"
@@ -230,7 +278,12 @@ if (( ! NOTARIZE )); then
   HOST_NOTARY_STATUS="not-submitted"
   VIEWER_NOTARY_STATUS="not-submitted"
 else
-  notary_args=(--keychain-profile "${SIDECARBRIDGE_NOTARY_PROFILE:-notarytool-profile}")
+  if [[ "$NOTARY_AUTH_MODE" == "api-key" ]]; then
+    notary_args=(--key "$NOTARY_API_KEY_PATH" \
+      --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER")
+  else
+    notary_args=(--keychain-profile "$NOTARY_PROFILE")
+  fi
   submit() {
     local zip="$1"
     xcrun notarytool submit "$zip" "${notary_args[@]}" \

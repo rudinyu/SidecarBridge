@@ -33,6 +33,14 @@ enum MacViewerDeviceAvailability: Equatable {
     case pairedOnline
     case pairedOffline
     case discovered
+
+    var pickerLabel: String {
+        switch self {
+        case .pairedOnline: return "Paired · Discovered"
+        case .pairedOffline: return "Paired · Not discovered"
+        case .discovered: return "Discovered"
+        }
+    }
 }
 
 struct MacViewerDevice: Equatable, Identifiable {
@@ -170,10 +178,13 @@ final class MacViewerConnectionModel: ObservableObject {
     private var videoHealthTimer: Timer?
     private var lastVideoAckSequence: UInt64?
     private var videoAckBatchCount = 0
+    private var didReportVisibleImageForSession = false
     private var pendingFileURLs: [URL] = []
     private var queuedFileCount = 0
     private var lastRemoteMacName: String?
     private var discoveryRecords: [MacDiscoveryRecord] = []
+    private var suppressedMacIDs = Set<String>()
+    private var suppressedMacNames: [String: String] = [:]
     private var selectedDeviceID: String?
 
     private static let rememberedMacNamesKey = "macViewer.rememberedMacNames"
@@ -239,6 +250,10 @@ final class MacViewerConnectionModel: ObservableObject {
             if visible {
                 self.lastPresentedContentAt = ProcessInfo.processInfo.systemUptime
                 self.videoPresentationStatus = "Image visible"
+                if self.isConnected, !self.didReportVisibleImageForSession {
+                    self.didReportVisibleImageForSession = true
+                    self.peers.send(ControlMessage(.status, detail: "viewer-image-presented"))
+                }
                 self.updateStreamPresentation(
                     width: self.lastVideoWidth,
                     height: self.lastVideoHeight,
@@ -295,11 +310,23 @@ final class MacViewerConnectionModel: ObservableObject {
                 guard let self else { return }
                 // Discovery is transient; saved devices must remain selectable
                 // when Bonjour is quiet so the transport can reuse their route.
-                self.discoveryRecords = names.map {
-                    MacDiscoveryRecord(macID: nil, discoveryID: "legacy:" + $0, name: $0, hosts: [])
+                let stableRecordsByName = Dictionary(
+                    grouping: self.discoveryRecords.filter { $0.macID != nil },
+                    by: \.name
+                )
+                self.discoveryRecords = names.flatMap { name -> [MacDiscoveryRecord] in
+                    if let stableRecords = stableRecordsByName[name], !stableRecords.isEmpty {
+                        return stableRecords
+                    }
+                    return [MacDiscoveryRecord(
+                        macID: nil,
+                        discoveryID: "legacy:" + name,
+                        name: name,
+                        hosts: []
+                    )]
                 }
                 self.refreshDevices()
-                if !self.isConnected, !self.userRequestedConnection, !names.isEmpty {
+                if !self.isConnected, !self.userRequestedConnection, !self.devices.isEmpty {
                     self.status = "Macs found on the local network"
                     self.detail = "Select a Mac, then press Connect. Discovery never connects automatically."
                 }
@@ -311,7 +338,7 @@ final class MacViewerConnectionModel: ObservableObject {
                 guard let self else { return }
                 self.discoveryRecords = devices
                 self.refreshDevices()
-                if !self.isConnected, !self.userRequestedConnection, !devices.isEmpty {
+                if !self.isConnected, !self.userRequestedConnection, !self.devices.isEmpty {
                     self.status = "Macs found on the local network"
                     self.detail = "Select a Mac, then press Connect. Discovery never connects automatically."
                 }
@@ -564,6 +591,7 @@ final class MacViewerConnectionModel: ObservableObject {
         userRequestedConnection = false
         isConnecting = false
         isConnected = false
+        didReportVisibleImageForSession = false
         isStreaming = false
         pairingRequired = false
         resetVideoMetrics()
@@ -584,6 +612,12 @@ final class MacViewerConnectionModel: ObservableObject {
     }
 
     func retry() {
+        if !suppressedMacIDs.isEmpty {
+            suppressedMacIDs.removeAll()
+            suppressedMacNames.removeAll()
+            discoveryRecords.removeAll()
+            refreshDevices()
+        }
         guard started else { start(); return }
         isConnecting = false
         userRequestedConnection = false
@@ -763,6 +797,8 @@ final class MacViewerConnectionModel: ObservableObject {
             detail = "Unlock this Mac and try Forget again; the saved route was kept."
             return
         }
+        suppressedMacIDs.insert(macID)
+        suppressedMacNames[macID] = discoveryRecords.first(where: { $0.macID == macID })?.name ?? name
         _ = SavedMacRouteStore.remove(macID: macID, defaults: defaults)
 
         var names = Set(defaults.stringArray(forKey: Self.rememberedMacNamesKey) ?? [])
@@ -809,6 +845,8 @@ final class MacViewerConnectionModel: ObservableObject {
         selectedMacName = nil
         selectedMacID = nil
         selectedDeviceID = nil
+        suppressedMacIDs.removeAll()
+        suppressedMacNames.removeAll()
         discoveryRecords.removeAll()
         refreshDevices()
         pairingCode = ""
@@ -852,6 +890,7 @@ final class MacViewerConnectionModel: ObservableObject {
             peers.send(ControlMessage(.startFallback))
         } else {
             isConnected = false
+            didReportVisibleImageForSession = false
             isStreaming = false
             remoteInputAuthorized = true
             connectionLatencyMS = nil
@@ -1103,14 +1142,28 @@ final class MacViewerConnectionModel: ObservableObject {
 
     private func refreshDevices() {
         let routes = SavedMacRouteStore.routes(defaults: defaults)
+            .filter { !suppressedMacIDs.contains($0.macID) }
+        let visibleStableNames = Set(discoveryRecords.compactMap { record -> String? in
+            guard let macID = record.macID, !suppressedMacIDs.contains(macID) else { return nil }
+            return record.name
+        })
+        let suppressedNames = Set(suppressedMacNames.values)
+        let visibleDiscoveries = discoveryRecords.filter { record in
+            if let macID = record.macID {
+                return !suppressedMacIDs.contains(macID)
+            }
+            return !suppressedNames.contains(record.name) || visibleStableNames.contains(record.name)
+        }
         let localHosts = Set(BridgeNetworkMetadata.localPrivateIPv4Addresses())
-        devices = MacViewerDeviceCatalog.make(routes: routes, discoveries: discoveryRecords, localHosts: localHosts)
+        devices = MacViewerDeviceCatalog.make(routes: routes, discoveries: visibleDiscoveries, localHosts: localHosts)
         if let selectedDeviceID, let selected = devices.first(where: { $0.id == selectedDeviceID }) {
             selectedMacID = selected.macID
             selectedMacName = selected.name
         }
-        let legacyNames = defaults.stringArray(forKey: Self.rememberedMacNamesKey) ?? []
-        discoveredMacs = Array(Set(routes.map(\.name) + discoveryRecords.map(\.name) + legacyNames)).sorted()
+        let visibleNames = Set(routes.map(\.name) + visibleDiscoveries.map(\.name))
+        let legacyNames = (defaults.stringArray(forKey: Self.rememberedMacNamesKey) ?? [])
+            .filter { !suppressedNames.contains($0) || visibleNames.contains($0) }
+        discoveredMacs = Array(visibleNames.union(legacyNames)).sorted()
     }
 
     private static func peerName(from value: String?) -> String? {

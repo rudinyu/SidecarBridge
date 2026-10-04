@@ -8,8 +8,8 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "1.4"
-    # macOS build 119 fixes Viewer output sampling and signs UI test bundles.
-    CURRENT_PROJECT_VERSION: "119"
+    # macOS build 122 minimizes the Host window after the Viewer displays an image.
+    CURRENT_PROJECT_VERSION: "122"
     DEVELOPMENT_TEAM: LYK4LV2859
 targets:
   SidecarBridgeMac:

@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 struct MacContentView: View {
     @ObservedObject var model: MacConnectionModel
     @Environment(\.openWindow) private var openWindow
+    @State private var hostMainWindowReference = HostMainWindowReference()
     @State private var section = "Connect"
     @State private var showingForgetPairingConfirmation = false
 
@@ -62,6 +63,16 @@ struct MacContentView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .background {
+            HostMainWindowAccessor { window in
+                hostMainWindowReference.window = window
+            }
+            .allowsHitTesting(false)
+        }
+        .onChange(of: model.shouldMinimizeMainWindowForPresentedImage) { _, shouldMinimize in
+            guard shouldMinimize else { return }
+            hostMainWindowReference.window?.miniaturize(nil)
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.refreshPermissions()
         }
@@ -889,6 +900,37 @@ struct MacContentView: View {
             Spacer()
         }
         .padding(16)
+    }
+}
+
+@MainActor
+private final class HostMainWindowReference {
+    weak var window: NSWindow?
+}
+
+@MainActor
+private final class HostMainWindowObservingView: NSView {
+    var onWindowChange: ((NSWindow?) -> Void)?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        onWindowChange?(window)
+    }
+}
+
+@MainActor
+private struct HostMainWindowAccessor: NSViewRepresentable {
+    let onWindowChange: (NSWindow?) -> Void
+
+    func makeNSView(context: Context) -> HostMainWindowObservingView {
+        let view = HostMainWindowObservingView()
+        view.onWindowChange = onWindowChange
+        return view
+    }
+
+    func updateNSView(_ view: HostMainWindowObservingView, context: Context) {
+        view.onWindowChange = onWindowChange
+        onWindowChange(view.window)
     }
 }
 

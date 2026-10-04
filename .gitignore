@@ -10,6 +10,11 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 
+# Local agent context, Claude artifacts, and chat handoff notes
+AGENTS.md
+*[Cc][Ll][Aa][Uu][Dd][Ee]*
+SIDECARBRIDGE_CHAT_HANDOFF.md
+
 # Local build and discovery diagnostics
 *.log
 .dns-*.txt

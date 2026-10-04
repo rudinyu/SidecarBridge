@@ -9,6 +9,7 @@ final class MacConnectionModel: ObservableObject {
     @Published var detail = "Looking for a remote viewer."
     @Published var isStreaming = false
     @Published var hasPadPeer = false
+    @Published private(set) var shouldMinimizeMainWindowForPresentedImage = false
     @Published var showingNativeSidecarSetup = false
     @Published var nativeSidecarRoute: NativeSidecarRoute = .nearby
     @Published private(set) var nativeSidecarProgress = NativeSidecarSetupProgress()
@@ -115,6 +116,7 @@ final class MacConnectionModel: ObservableObject {
     }
     private var started = false
     private var isStartingFallback = false
+    private var didRequestMainWindowMinimizeForViewerImage = false
     private var accessibilityPollTask: Task<Void, Never>?
     private var screenRecordingPollTask: Task<Void, Never>?
     private var streamResumeRetentionTask: Task<Void, Never>?
@@ -233,6 +235,10 @@ final class MacConnectionModel: ObservableObject {
 
         peers.onConnectionChanged = { [weak self] connected, peerOrError in
             guard let self else { return }
+            if !connected {
+                self.didRequestMainWindowMinimizeForViewerImage = false
+                self.shouldMinimizeMainWindowForPresentedImage = false
+            }
             self.hasPadPeer = connected
             if !connected {
                 self.cancelCaptureRefreshRetry(resetFailureCount: true)
@@ -1291,6 +1297,10 @@ final class MacConnectionModel: ObservableObject {
                         // short presentation-only refresh.
                         streamer.refreshCaptureAfterForeground(force: true)
                     }
+                } else if detail == "viewer-image-presented" {
+                    guard hasPadPeer, !didRequestMainWindowMinimizeForViewerImage else { return }
+                    didRequestMainWindowMinimizeForViewerImage = true
+                    shouldMinimizeMainWindowForPresentedImage = true
                 } else if detail == "video-keyframe-needed" {
                     // The iPad detected a sequence gap or a decoder queue
                     // reset. Recover immediately instead of waiting for the

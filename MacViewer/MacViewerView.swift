@@ -496,12 +496,7 @@ struct MacViewerView: View {
         let identitySuffix = duplicateName
             ? " · " + String((device.macID == nil ? identity.suffix(6) : identity.prefix(6)))
             : ""
-        let availability: String
-        switch device.availability {
-        case .pairedOnline: availability = "Paired · Online"
-        case .pairedOffline: availability = "Paired · Offline"
-        case .discovered: availability = "Discovered"
-        }
+        let availability = device.availability.pickerLabel
         return device.name + identitySuffix + " · " + availability + (device.isLocal ? " · This Mac" : "")
     }
 
