@@ -6,7 +6,7 @@ name: SidecarBridgeFork
 settings:
   base:
     MARKETING_VERSION: "1.5"
-    CURRENT_PROJECT_VERSION: "124"
+    CURRENT_PROJECT_VERSION: "127"
 
 targets:
   SidecarBridgeMac:
@@ -43,7 +43,7 @@ targets:
         PRODUCT_NAME: ScreenDock Host
         ASSETCATALOG_COMPILER_APPICON_NAME: ScreenDockAppIcon
         MARKETING_VERSION: "1.5"
-        CURRENT_PROJECT_VERSION: "124"
+        CURRENT_PROJECT_VERSION: "127"
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SIDECARBRIDGE_FORK"
       configs:
         Debug:
@@ -104,7 +104,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.screendock.viewer
         PRODUCT_NAME: ScreenDock Viewer
         MARKETING_VERSION: "1.5"
-        CURRENT_PROJECT_VERSION: "124"
+        CURRENT_PROJECT_VERSION: "127"
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SIDECARBRIDGE_FORK"
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_ENTITLEMENTS: MacViewer/SidecarBridgeViewer.entitlements

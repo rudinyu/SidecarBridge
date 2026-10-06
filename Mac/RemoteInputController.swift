@@ -1,6 +1,5 @@
 import ApplicationServices
 import AppKit
-import Carbon
 import CoreGraphics
 import Foundation
 import OSLog
@@ -84,22 +83,8 @@ final class RemoteInputController {
         let gate = AuthorizationGeneration.shared
         guard isAuthorized else { return false }
         switch input.kind {
-        case .inputMode, .cycleInputMode:
+        case .inputMode, .cycleInputMode, .toggleChineseEnglishInputMode:
             return gate.onMain(ifCurrent: generation) { self.handle(input) } ?? false
-        case .toggleChineseEnglishInputMode:
-            guard let expectation = gate.onMain(ifCurrent: generation, {
-                self.inputSourceController.chineseEnglishToggleExpectation()
-            }) else { return false }
-            var posted = false
-            guard gate.perform(ifCurrent: generation, {
-                posted = self.postInputSourceSwitchShortcut()
-            }) else { return false }
-            if posted && inputSourceController.waitForChineseEnglishToggle(expectation, generation: generation) {
-                return true
-            }
-            return gate.onMain(ifCurrent: generation) {
-                self.inputSourceController.toggleChineseEnglish()
-            } ?? false
         case .text:
             guard let text = input.text else { return false }
             return type(text, generation: generation)
@@ -243,14 +228,6 @@ final class RemoteInputController {
         case .cycleInputMode:
             return inputSourceController.cycle()
         case .toggleChineseEnglishInputMode:
-            let expectation = inputSourceController.chineseEnglishToggleExpectation()
-            if postInputSourceSwitchShortcut(),
-               inputSourceController.waitForChineseEnglishToggle(expectation) {
-                return true
-            }
-            remoteInputLog.notice(
-                "System input-source shortcut did not confirm a change; trying direct TIS fallback"
-            )
             return inputSourceController.toggleChineseEnglish()
         }
         return true
@@ -832,14 +809,6 @@ final class RemoteInputController {
         controlUp.flags = []
         controlUp.post(tap: .cghidEventTap)
         return true
-    }
-
-    private func postInputSourceSwitchShortcut() -> Bool {
-        // A real Control-Space action is applied to the focused application's
-        // text-input context. TISSelectInputSource can return noErr yet be
-        // ignored by WindowServer for a sandboxed app, especially when the
-        // focused app restores a per-document input source.
-        return pressQuartz(code: 49, modifiers: .maskControl)
     }
 
     private func releaseModifierKeys(

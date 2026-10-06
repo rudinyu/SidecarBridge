@@ -78,20 +78,16 @@ struct MacViewerInputSurface: NSViewRepresentable {
     }
 }
 
-final class MacViewerInputView: NSView, NSTextInputClient {
+final class MacViewerInputView: NSView {
     var contentAspectRatio: CGFloat
     var isEnabled: Bool
     var onInput: (RemoteInputEvent) -> Void
     var onLocalShortcut: (NSEvent) -> Bool = { _ in false }
+    var inputModeManager: MacViewerInputModeManaging
 
     private var primaryButtonIsDown = false
-    private var markedText = NSAttributedString(string: "")
-    private var markedSelection = NSRange(location: 0, length: 0)
-    private var pendingKeyEvent: NSEvent?
-    private var lastPointerLocation = CGPoint.zero
     private var capsLockState: Bool?
     private var lastLanguageSwitchEvent: (timestamp: TimeInterval, source: LanguageSwitchEventSource)?
-    var inputModeManager: MacViewerInputModeManaging
 
     private enum LanguageSwitchEventSource {
         case flagsChanged
@@ -145,14 +141,12 @@ final class MacViewerInputView: NSView, NSTextInputClient {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        rememberPointerLocation(for: event)
         guard isEnabled, let point = normalizedPoint(for: event) else { return }
         onInput(.pointer(x: point.x, y: point.y))
     }
 
     override func mouseDown(with event: NSEvent) {
         guard isEnabled else { return }
-        rememberPointerLocation(for: event)
         window?.makeFirstResponder(self)
         guard let point = normalizedPoint(for: event) else { return }
         primaryButtonIsDown = true
@@ -165,7 +159,6 @@ final class MacViewerInputView: NSView, NSTextInputClient {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        rememberPointerLocation(for: event)
         guard isEnabled, primaryButtonIsDown,
               let point = normalizedPoint(for: event) else { return }
         onInput(.primaryDrag(
@@ -219,10 +212,6 @@ final class MacViewerInputView: NSView, NSTextInputClient {
             sendNextInputMode()
             return
         }
-        if hasMarkedText() || isTextInputCandidate(event) {
-            interpretRemoteTextInput(event)
-            return
-        }
         if !forwardKeyEvent(event) { NSSound.beep() }
     }
 
@@ -246,7 +235,6 @@ final class MacViewerInputView: NSView, NSTextInputClient {
             return
         }
 
-        capsLockState = newCapsLockState
         lastLanguageSwitchEvent = (event.timestamp, .flagsChanged)
         applyChineseEnglishToggle()
     }
@@ -284,15 +272,6 @@ final class MacViewerInputView: NSView, NSTextInputClient {
         guard let usage = Self.hidUsageByKeyCode[event.keyCode] else { return false }
         onInput(.hardwareKey(hidUsage: usage, modifiers: modifiers))
         return true
-    }
-
-    private func isTextInputCandidate(_ event: NSEvent) -> Bool {
-        let flags = event.modifierFlags
-        return !flags.contains(.command)
-            && !flags.contains(.control)
-            && !flags.contains(.option)
-            && !flags.contains(.shift)
-            && !keyIsSpecial(event)
     }
 
     private func hasHardwareShortcutModifier(_ event: NSEvent) -> Bool {
@@ -335,119 +314,6 @@ final class MacViewerInputView: NSView, NSTextInputClient {
         onInput(.inputMode(language: language))
     }
 
-    private func interpretRemoteTextInput(_ event: NSEvent) {
-        let previousEvent = pendingKeyEvent
-        pendingKeyEvent = event
-        defer { pendingKeyEvent = previousEvent }
-        interpretKeyEvents([event])
-    }
-
-    private func rememberPointerLocation(for event: NSEvent) {
-        let newLocation = convert(event.locationInWindow, from: nil)
-        guard newLocation != lastPointerLocation else { return }
-        lastPointerLocation = newLocation
-        inputContext?.invalidateCharacterCoordinates()
-    }
-
-    // NSTextInputClient: let the local macOS input method compose text, but
-    // send only committed text to the remote Host. Marked text is drawn near
-    // the remote pointer so the composition remains visible over the stream.
-    func insertText(_ string: Any, replacementRange: NSRange) {
-        let committedText = (string as? NSAttributedString)?.string ?? (string as? String) ?? ""
-        markedText = NSAttributedString(string: "")
-        markedSelection = NSRange(location: 0, length: 0)
-        needsDisplay = true
-        inputContext?.invalidateCharacterCoordinates()
-        guard isEnabled, !committedText.isEmpty else { return }
-        onInput(.text(committedText))
-    }
-
-    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
-        if let attributed = string as? NSAttributedString {
-            markedText = attributed
-        } else {
-            markedText = NSAttributedString(string: string as? String ?? "")
-        }
-        markedSelection = selectedRange
-        needsDisplay = true
-        inputContext?.invalidateCharacterCoordinates()
-    }
-
-    func unmarkText() {
-        markedText = NSAttributedString(string: "")
-        markedSelection = NSRange(location: 0, length: 0)
-        needsDisplay = true
-        inputContext?.invalidateCharacterCoordinates()
-    }
-
-    func selectedRange() -> NSRange {
-        hasMarkedText() ? markedSelection : NSRange(location: 0, length: 0)
-    }
-
-    func markedRange() -> NSRange {
-        hasMarkedText()
-            ? NSRange(location: 0, length: markedText.length)
-            : NSRange(location: NSNotFound, length: 0)
-    }
-
-    func hasMarkedText() -> Bool {
-        !markedText.string.isEmpty
-    }
-
-    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
-        actualRange?.pointee = NSRange(location: NSNotFound, length: 0)
-        return nil
-    }
-
-    func validAttributesForMarkedText() -> [NSAttributedString.Key] {
-        [.underlineStyle, .underlineColor, .foregroundColor, .backgroundColor]
-    }
-
-    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
-        actualRange?.pointee = markedRange()
-        let caret = NSRect(x: lastPointerLocation.x, y: lastPointerLocation.y, width: 1, height: 20)
-        guard let window else { return .zero }
-        return window.convertToScreen(convert(caret, to: nil))
-    }
-
-    func characterIndex(for point: NSPoint) -> Int {
-        hasMarkedText() ? markedSelection.location : 0
-    }
-
-    override func doCommand(by selector: Selector) {
-        guard isEnabled, let event = pendingKeyEvent else { return }
-        if selector == #selector(cancelOperation(_:)) {
-            unmarkText()
-            return
-        }
-        if !forwardKeyEvent(event) { NSSound.beep() }
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        guard hasMarkedText() else { return }
-
-        let font = NSFont.systemFont(ofSize: min(24, max(14, bounds.width / 80)), weight: .medium)
-        let styledText = NSMutableAttributedString(attributedString: markedText)
-        styledText.addAttributes(
-            [
-                .font: font,
-                .foregroundColor: NSColor.white,
-                .underlineStyle: NSUnderlineStyle.single.rawValue
-            ],
-            range: NSRange(location: 0, length: styledText.length)
-        )
-        let textSize = styledText.size()
-        let boxSize = NSSize(width: textSize.width + 20, height: max(textSize.height + 12, font.pointSize + 12))
-        let x = min(max(8, lastPointerLocation.x + 14), max(8, bounds.width - boxSize.width - 8))
-        let y = min(max(8, lastPointerLocation.y + 14), max(8, bounds.height - boxSize.height - 8))
-        let box = NSRect(origin: NSPoint(x: x, y: y), size: boxSize)
-
-        NSColor.black.withAlphaComponent(0.78).setFill()
-        NSBezierPath(roundedRect: box, xRadius: 7, yRadius: 7).fill()
-        styledText.draw(at: NSPoint(x: box.minX + 10, y: box.minY + 6))
-    }
-
     override func resignFirstResponder() -> Bool {
         if primaryButtonIsDown {
             primaryButtonIsDown = false
@@ -485,14 +351,4 @@ final class MacViewerInputView: NSView, NSTextInputClient {
         return nil
     }
 
-    private func keyIsSpecial(_ event: NSEvent) -> Bool {
-        switch event.keyCode {
-        case 36, 48, 49, 51, 53, 57, 71, 76, 96, 97, 98, 99, 100, 101,
-             103, 109, 111, 114, 115, 116, 117, 118, 119, 120, 121, 122,
-             123, 124, 125, 126:
-            return true
-        default:
-            return false
-        }
-    }
 }

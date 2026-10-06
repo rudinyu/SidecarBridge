@@ -2,6 +2,18 @@ import AppKit
 import Combine
 import XCTest
 
+private final class RegressionInputModeManager: MacViewerInputModeManaging {
+    var cycleLanguage: String?
+    private(set) var cycleCount = 0
+
+    func cycleAndReturnLanguage() -> String? {
+        cycleCount += 1
+        return cycleLanguage
+    }
+
+    func toggleChineseEnglishAndReturnLanguage() -> String? { nil }
+}
+
 final class MacViewerRegressionTests: XCTestCase {
     @MainActor
     private func keyEvent(code: UInt16, characters: String, modifiers: NSEvent.ModifierFlags = []) throws -> NSEvent {
@@ -37,13 +49,75 @@ final class MacViewerRegressionTests: XCTestCase {
     }
 
     @MainActor
-    func testPlainTextAndSpecialKeysRetainTheirInputKinds() throws {
+    func testPlainPrintableAndSpecialKeysUseTheHostHardwareRoute() throws {
         var events: [RemoteInputEvent] = []
         let view = MacViewerInputView(contentAspectRatio: 16 / 9, isEnabled: true) { events.append($0) }
         view.keyDown(with: try keyEvent(code: 0, characters: "a"))
         view.keyDown(with: try keyEvent(code: 36, characters: "\r"))
         view.keyDown(with: try keyEvent(code: 123, characters: "\u{F702}", modifiers: .shift))
-        XCTAssertEqual(events, [.text("a"), .hardwareKey(hidUsage: 40), .hardwareKey(hidUsage: 80, modifiers: ["shift"])])
+        XCTAssertEqual(events, [
+            .hardwareKey(hidUsage: 4),
+            .hardwareKey(hidUsage: 40),
+            .hardwareKey(hidUsage: 80, modifiers: ["shift"])
+        ])
+    }
+
+    @MainActor
+    func testCompositionCandidateSelectionAndCancellationKeysReachTheHost() throws {
+        var events: [RemoteInputEvent] = []
+        let view = MacViewerInputView(contentAspectRatio: 16 / 9, isEnabled: true) { events.append($0) }
+
+        // Pinyin letters, Space/arrow/Return candidate controls, and Escape
+        // are all physical keys interpreted by the Host's active input method.
+        for (code, characters) in [
+            (UInt16(45), "n"),
+            (34, "i"),
+            (49, " "),
+            (125, "\u{F701}"),
+            (36, "\r"),
+            (53, "\u{1b}")
+        ] {
+            view.keyDown(with: try keyEvent(code: code, characters: characters))
+        }
+
+        XCTAssertEqual(events, [
+            .hardwareKey(hidUsage: 17),
+            .hardwareKey(hidUsage: 12),
+            .hardwareKey(hidUsage: 44),
+            .hardwareKey(hidUsage: 81),
+            .hardwareKey(hidUsage: 40),
+            .hardwareKey(hidUsage: 41)
+        ])
+    }
+
+    @MainActor
+    func testControlSpaceKeyEquivalentSendsSelectedLanguageExactlyOnce() throws {
+        _ = NSApplication.shared
+        var events: [RemoteInputEvent] = []
+        let modeManager = RegressionInputModeManager()
+        modeManager.cycleLanguage = "zh-Hant"
+        let view = MacViewerInputView(
+            contentAspectRatio: 16 / 9,
+            isEnabled: true,
+            onInput: { events.append($0) },
+            inputModeManager: modeManager
+        )
+        let window = ViewerTestWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 360),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        defer { window.close() }
+        XCTAssertTrue(window.makeFirstResponder(view))
+
+        let event = try keyEvent(code: 49, characters: " ", modifiers: .control)
+        XCTAssertTrue(view.performKeyEquivalent(with: event))
+
+        XCTAssertEqual(modeManager.cycleCount, 1)
+        XCTAssertEqual(events, [.inputMode(language: "zh-Hant")])
     }
 
     @MainActor

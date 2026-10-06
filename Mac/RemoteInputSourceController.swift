@@ -7,11 +7,6 @@ private let remoteInputLog = Logger(
     category: "RemoteInput"
 )
 
-struct ChineseEnglishToggleExpectation {
-    let previousSourceID: String?
-    let wantsChinese: Bool
-}
-
 final class RemoteInputSourceController {
     private var lastChineseSourceID: String?
     private var lastEnglishSourceID: String?
@@ -50,68 +45,6 @@ final class RemoteInputSourceController {
             ?? languages.first(where: isEnglishLanguage)
             ?? languages.first
         return selectedLanguage.map(RemoteKeyboardInput.normalizedLanguage)
-    }
-
-    func chineseEnglishToggleExpectation() -> ChineseEnglishToggleExpectation {
-        MainQueueExecutor.sync {
-            dispatchPrecondition(condition: .onQueue(.main))
-            let current = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
-            return ChineseEnglishToggleExpectation(
-                previousSourceID: stringProperty(
-                    current,
-                    key: kTISPropertyInputSourceID
-                ),
-                wantsChinese: !languagesProperty(current)
-                    .contains(where: isChineseLanguage)
-            )
-        }
-    }
-
-    func waitForChineseEnglishToggle(
-        _ expectation: ChineseEnglishToggleExpectation,
-        generation: UUID? = nil,
-        timeout: TimeInterval = 0.8
-    ) -> Bool {
-        // This method runs on the serial remote-input queue. Waiting here is
-        // deliberate: the next physical key must not overtake the Mac input
-        // source change or it will be interpreted as English.
-        let deadline = ProcessInfo.processInfo.systemUptime + timeout
-        repeat {
-            let check = { [self] in
-                dispatchPrecondition(condition: .onQueue(.main))
-                let current = TISCopyCurrentKeyboardInputSource()
-                    .takeRetainedValue()
-                let currentID = stringProperty(
-                    current,
-                    key: kTISPropertyInputSourceID
-                )
-                let languages = languagesProperty(current)
-                let targetMatches = expectation.wantsChinese
-                    ? languages.contains(where: isChineseLanguage)
-                    : languages.contains(where: isEnglishLanguage)
-                guard targetMatches,
-                      currentID != expectation.previousSourceID else {
-                    return false
-                }
-                remember(current)
-                remoteInputLog.notice(
-                    "Confirmed focused macOS input source id=\(currentID ?? "unknown", privacy: .public)"
-                )
-                return true
-            }
-            let matched: Bool
-            if let generation {
-                guard let result = AuthorizationGeneration.shared.onMain(ifCurrent: generation, check) else { return false }
-                matched = result
-            } else {
-                matched = MainQueueExecutor.sync(check)
-            }
-            if matched {
-                return true
-            }
-            Thread.sleep(forTimeInterval: 0.025)
-        } while ProcessInfo.processInfo.systemUptime < deadline
-        return false
     }
 
     func select(language: String) -> Bool {
