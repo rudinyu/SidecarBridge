@@ -2,18 +2,6 @@ import AppKit
 import Combine
 import XCTest
 
-private final class RegressionInputModeManager: MacViewerInputModeManaging {
-    var cycleLanguage: String?
-    private(set) var cycleCount = 0
-
-    func cycleAndReturnLanguage() -> String? {
-        cycleCount += 1
-        return cycleLanguage
-    }
-
-    func toggleChineseEnglishAndReturnLanguage() -> String? { nil }
-}
-
 final class MacViewerRegressionTests: XCTestCase {
     @MainActor
     private func keyEvent(code: UInt16, characters: String, modifiers: NSEvent.ModifierFlags = []) throws -> NSEvent {
@@ -49,26 +37,26 @@ final class MacViewerRegressionTests: XCTestCase {
     }
 
     @MainActor
-    func testPlainPrintableAndSpecialKeysUseTheHostHardwareRoute() throws {
+    func testPrintableAndSpecialKeysUseTheHostHardwareRoute() throws {
         var events: [RemoteInputEvent] = []
         let view = MacViewerInputView(contentAspectRatio: 16 / 9, isEnabled: true) { events.append($0) }
-        view.keyDown(with: try keyEvent(code: 0, characters: "a"))
+        view.keyDown(with: try keyEvent(code: 45, characters: "n"))
         view.keyDown(with: try keyEvent(code: 36, characters: "\r"))
         view.keyDown(with: try keyEvent(code: 123, characters: "\u{F702}", modifiers: .shift))
         XCTAssertEqual(events, [
-            .hardwareKey(hidUsage: 4),
+            .hardwareKey(hidUsage: 17),
             .hardwareKey(hidUsage: 40),
             .hardwareKey(hidUsage: 80, modifiers: ["shift"])
         ])
     }
 
     @MainActor
-    func testCompositionCandidateSelectionAndCancellationKeysReachTheHost() throws {
+    func testPinyinAndCandidateKeysUseTheHostHardwareRoute() throws {
         var events: [RemoteInputEvent] = []
         let view = MacViewerInputView(contentAspectRatio: 16 / 9, isEnabled: true) { events.append($0) }
 
-        // Pinyin letters, Space/arrow/Return candidate controls, and Escape
-        // are all physical keys interpreted by the Host's active input method.
+        // The Viewer does not compose text. The Host receives the physical
+        // sequence and its native input method handles composition/candidates.
         for (code, characters) in [
             (UInt16(45), "n"),
             (34, "i"),
@@ -91,16 +79,13 @@ final class MacViewerRegressionTests: XCTestCase {
     }
 
     @MainActor
-    func testControlSpaceKeyEquivalentSendsSelectedLanguageExactlyOnce() throws {
+    func testControlSpaceIsLeftForNativeInputSourceHandling() throws {
         _ = NSApplication.shared
         var events: [RemoteInputEvent] = []
-        let modeManager = RegressionInputModeManager()
-        modeManager.cycleLanguage = "zh-Hant"
         let view = MacViewerInputView(
             contentAspectRatio: 16 / 9,
             isEnabled: true,
-            onInput: { events.append($0) },
-            inputModeManager: modeManager
+            onInput: { events.append($0) }
         )
         let window = ViewerTestWindow(
             contentRect: NSRect(x: 0, y: 0, width: 640, height: 360),
@@ -114,10 +99,10 @@ final class MacViewerRegressionTests: XCTestCase {
         XCTAssertTrue(window.makeFirstResponder(view))
 
         let event = try keyEvent(code: 49, characters: " ", modifiers: .control)
-        XCTAssertTrue(view.performKeyEquivalent(with: event))
+        XCTAssertFalse(view.performKeyEquivalent(with: event))
+        view.keyDown(with: event)
 
-        XCTAssertEqual(modeManager.cycleCount, 1)
-        XCTAssertEqual(events, [.inputMode(language: "zh-Hant")])
+        XCTAssertTrue(events.isEmpty, "Control-Space must not send a blind Host toggle or raw Space key")
     }
 
     @MainActor
@@ -265,8 +250,116 @@ final class MacViewerRegressionTests: XCTestCase {
         await fulfillment(of: [handled], timeout: 2)
         XCTAssertFalse(model.lastInputAccepted)
         XCTAssertTrue(model.remoteInputAuthorized)
+        XCTAssertNil(model.inputSourceFailure, "An ordinary rejected key must not be reported as an input-source failure")
         model.sendInput(.hardwareKey(hidUsage: 4))
         XCTAssertEqual(peer.inputs.count, 1)
+    }
+
+    @MainActor
+    func testInputSourceFailurePersistsThroughOrdinaryACKAndClearsAfterSuccessfulRetry() async throws {
+        let (model, peer, _) = try fixture()
+        model.isConnected = true
+        model.remoteInputAuthorized = true
+        let failure = "The Host couldn't change its input source. Please try switching languages again."
+
+        model.sendInput(.toggleChineseEnglishInputMode())
+        XCTAssertEqual(peer.inputs.last?.sequence, 1)
+        await awaitViewerChange(model.$inputSourceFailure, matching: { $0 != nil }) {
+            peer.onCommand?(ControlMessage(.status, detail: "input-ack:1:0"))
+        }
+        XCTAssertEqual(model.inputSourceFailure, failure)
+        XCTAssertTrue(model.remoteInputAuthorized)
+
+        model.sendInput(.hardwareKey(hidUsage: 4))
+        XCTAssertEqual(peer.inputs.last?.sequence, 2, "A source-mode failure must not prevent retry input from being sent")
+        model.sendInput(.pointer(x: 0.4, y: 0.6))
+        XCTAssertEqual(peer.inputs.last?.sequence, 3)
+        await awaitViewerChange(model.$lastInputAccepted, matching: { $0 }) {
+            peer.onCommand?(ControlMessage(.status, detail: "input-ack:3:1"))
+        }
+        XCTAssertEqual(model.inputSourceFailure, failure, "An ordinary pointer ACK must not clear the source-mode failure")
+
+        model.sendInput(.cycleInputMode())
+        XCTAssertEqual(peer.inputs.last?.sequence, 4)
+        await awaitViewerChange(model.$inputSourceFailure, matching: { $0 == nil }) {
+            peer.onCommand?(ControlMessage(.status, detail: "input-ack:4:1"))
+        }
+        XCTAssertNil(model.inputSourceFailure)
+        XCTAssertTrue(model.remoteInputAuthorized)
+    }
+
+    @MainActor
+    func testOnlyLatestInputSourceSequenceCanUpdateFeedback() async throws {
+        let (model, peer, _) = try fixture()
+        model.isConnected = true
+        model.remoteInputAuthorized = true
+        let failure = "The Host couldn't change its input source. Please try switching languages again."
+
+        model.sendInput(.inputMode(language: "zh-Hant"))
+        model.sendInput(.toggleChineseEnglishInputMode())
+        XCTAssertEqual(peer.inputs[0].sequence, 1)
+        XCTAssertEqual(peer.inputs[1].sequence, 2)
+
+        await awaitViewerChange(model.$lastInputAccepted, matching: { !$0 }) {
+            peer.onCommand?(ControlMessage(.status, detail: "input-ack:1:0"))
+        }
+        XCTAssertNil(model.inputSourceFailure, "An older mode ACK must not update the latest mode result")
+
+        await awaitViewerChange(model.$inputSourceFailure, matching: { $0 != nil }) {
+            peer.onCommand?(ControlMessage(.status, detail: "input-ack:2:0"))
+        }
+        XCTAssertEqual(model.inputSourceFailure, failure, "The latest source-mode ACK must remain authoritative")
+
+        model.sendInput(.cycleInputMode())
+        XCTAssertEqual(peer.inputs.last?.sequence, 3)
+        await awaitViewerChange(model.$inputSourceFailure, matching: { $0 == nil }) {
+            peer.onCommand?(ControlMessage(.status, detail: "input-ack:3:1"))
+        }
+        XCTAssertNil(model.inputSourceFailure)
+
+        await awaitViewerChange(model.$lastInputAccepted, matching: { !$0 }) {
+            peer.onCommand?(ControlMessage(.status, detail: "input-ack:1:0"))
+        }
+        XCTAssertNil(model.inputSourceFailure, "A duplicate older rejection must not reintroduce cleared feedback")
+    }
+
+    @MainActor
+    func testUnmatchedAndStaleSourceACKsAreIgnoredAcrossSessionReset() async throws {
+        let (model, peer, _) = try fixture()
+        model.isConnected = true
+        model.remoteInputAuthorized = true
+
+        await awaitViewerChange(model.$lastInputAccepted, matching: { !$0 }) {
+            peer.onCommand?(ControlMessage(.status, detail: "input-ack:99:0"))
+        }
+        XCTAssertNil(model.inputSourceFailure, "An unmatched rejection must not be treated as a source-mode result")
+
+        model.sendInput(.toggleChineseEnglishInputMode())
+        await awaitViewerChange(model.$inputSourceFailure, matching: { $0 != nil }) {
+            peer.onCommand?(ControlMessage(.status, detail: "input-ack:1:0"))
+        }
+        let failure = try XCTUnwrap(model.inputSourceFailure)
+
+        await awaitViewerChange(model.$lastInputAccepted, matching: { $0 }) {
+            peer.onCommand?(ControlMessage(.status, detail: "input-ack:1:1"))
+        }
+        XCTAssertEqual(model.inputSourceFailure, failure, "A duplicate ACK must not clear an already-reported failure")
+
+        model.sendInput(.cycleInputMode())
+        XCTAssertEqual(peer.inputs.last?.sequence, 2)
+        await awaitViewerChange(model.$isConnected, matching: { !$0 }) {
+            peer.onConnectionChanged?(false, "Test session ended")
+        }
+        XCTAssertNil(model.inputSourceFailure)
+
+        await awaitViewerChange(model.$isConnected, matching: { $0 }) {
+            peer.onConnectionChanged?(true, "LAN: Test Mac")
+        }
+        await awaitViewerChange(model.$lastInputAccepted, matching: { !$0 }) {
+            peer.onCommand?(ControlMessage(.status, detail: "input-ack:2:0"))
+        }
+        XCTAssertNil(model.inputSourceFailure, "An ACK from the previous session must not restore stale feedback")
+        XCTAssertFalse(model.remoteInputAuthorized, "Input ACKs must not grant Host accessibility permission")
     }
 
     @MainActor

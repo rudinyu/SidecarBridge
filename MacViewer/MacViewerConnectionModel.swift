@@ -51,6 +51,29 @@ struct MacViewerDevice: Equatable, Identifiable {
     let isLocal: Bool
 }
 
+enum MacViewerHostDesktopAction: CaseIterable {
+    case previousDesktop
+    case nextDesktop
+    case missionControl
+
+    var hidUsage: Int {
+        switch self {
+        case .previousDesktop: return 0x50 // Left Arrow
+        case .nextDesktop: return 0x4F // Right Arrow
+        case .missionControl: return 0x52 // Up Arrow
+        }
+    }
+
+    static func shortcut(forKeyCode keyCode: UInt16) -> Self? {
+        switch keyCode {
+        case 123: return .previousDesktop
+        case 124: return .nextDesktop
+        case 126: return .missionControl
+        default: return nil
+        }
+    }
+}
+
 enum MacViewerDeviceCatalog {
     static func make(
         routes: [SavedMacRoute],
@@ -118,6 +141,8 @@ final class MacViewerConnectionModel: ObservableObject {
     @Published var connectionLatencyMS: Int?
     @Published var remoteInputAuthorized = false
     @Published var lastInputAccepted = true
+    @Published private(set) var inputSourceFailure: String?
+    @Published private(set) var hostInputSource: HostInputSourceStatus?
     @Published var streamAspectRatio: CGFloat = 16.0 / 9.0
     @Published var streamDimensions = "Waiting for video"
     /// `streamFPS` remains as a compatibility alias for submitted-to-renderer FPS.
@@ -154,6 +179,24 @@ final class MacViewerConnectionModel: ObservableObject {
         return false
     }
 
+    var canControlHostDesktop: Bool {
+        isConnected && remoteInputAuthorized
+    }
+
+    var hostInputSourceLabel: String? {
+        guard let hostInputSource else { return nil }
+        let languageCode = RemoteKeyboardInput.normalizedLanguage(hostInputSource.language).lowercased()
+        let languageLabel: String
+        if languageCode.hasPrefix("zh") {
+            languageLabel = "中文"
+        } else if languageCode.hasPrefix("en") {
+            languageLabel = "English"
+        } else {
+            languageLabel = hostInputSource.language
+        }
+        return "\(languageLabel) · \(hostInputSource.name)"
+    }
+
     private let peers: MacViewerPeerService
     private let pasteboard: NSPasteboard
     private let defaults: UserDefaults
@@ -165,6 +208,7 @@ final class MacViewerConnectionModel: ObservableObject {
     private var userRequestedConnection = false
     private var inputSequence: UInt64 = 0
     private var inputSentAt: [UInt64: TimeInterval] = [:]
+    private var pendingInputSourceSequence: UInt64?
     private var frameWindowStart = ProcessInfo.processInfo.systemUptime
     private var receivedFrameWindowCount = 0
     private var submittedFrameWindowCount = 0
@@ -591,6 +635,7 @@ final class MacViewerConnectionModel: ObservableObject {
     }
 
     func cancelConnection() {
+        resetInputSourceFeedback()
         peers.restart()
         userRequestedConnection = false
         isConnecting = false
@@ -601,6 +646,7 @@ final class MacViewerConnectionModel: ObservableObject {
     }
 
     func disconnect() {
+        resetInputSourceFeedback()
         peers.restart()
         userRequestedConnection = false
         isConnecting = false
@@ -651,6 +697,12 @@ final class MacViewerConnectionModel: ObservableObject {
         inputSequence &+= 1
         var sequenced = input
         sequenced.sequence = inputSequence
+        switch sequenced.kind {
+        case .inputMode, .cycleInputMode, .toggleChineseEnglishInputMode:
+            pendingInputSourceSequence = inputSequence
+        default:
+            break
+        }
         if sequenced.shouldAcknowledge {
             inputSentAt[inputSequence] = ProcessInfo.processInfo.systemUptime
             if inputSentAt.count > 48 {
@@ -658,6 +710,23 @@ final class MacViewerConnectionModel: ObservableObject {
             }
         }
         peers.sendInput(sequenced)
+    }
+
+    func performHostDesktopAction(_ action: MacViewerHostDesktopAction) {
+        guard canControlHostDesktop else { return }
+        sendInput(.hardwareKey(hidUsage: action.hidUsage, modifiers: ["control"]))
+    }
+
+    /// Consume these app-local equivalents before AppKit or the remote-input
+    /// fallback can forward their Command modifier to the Host. The actual
+    /// remote action remains gated by the same connection authorization path.
+    func handleHostDesktopShortcut(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown,
+              event.modifierFlags.intersection([.command, .control, .option, .shift]) == [.command, .control],
+              let action = MacViewerHostDesktopAction.shortcut(forKeyCode: event.keyCode)
+        else { return false }
+        performHostDesktopAction(action)
+        return true
     }
 
     func requestRemoteClipboard() {
@@ -884,6 +953,7 @@ final class MacViewerConnectionModel: ObservableObject {
 
     private func handleConnectionChanged(_ connected: Bool, peerOrError: String?) {
         if connected {
+            resetInputSourceFeedback()
             isConnected = true
             isConnecting = false
             pairingRequired = false
@@ -904,6 +974,7 @@ final class MacViewerConnectionModel: ObservableObject {
             peers.send(ControlMessage(.status, detail: "viewer-foreground"))
             peers.send(ControlMessage(.startFallback))
         } else {
+            resetInputSourceFeedback()
             isConnected = false
             didReportVisibleImageForSession = false
             isStreaming = false
@@ -964,6 +1035,12 @@ final class MacViewerConnectionModel: ObservableObject {
                 detail = "Enable SidecarBridge under macOS Privacy & Security → Accessibility, then reconnect."
             } else if value.hasPrefix("input-ack:") {
                 handleInputAcknowledgement(value)
+            } else if let inputSource = HostInputSourceStatus.parse(detail: value) {
+                // Control messages reach this handler through the currently
+                // authenticated peer session. Ignore metadata while that
+                // session is down so an old status cannot repopulate UI state.
+                guard isConnected else { return }
+                hostInputSource = inputSource
             } else if value == "fallback-active" {
                 status = "Connected to " + (lastRemoteMacName ?? "Mac")
             } else if value.hasPrefix("fallback-error:") {
@@ -982,12 +1059,28 @@ final class MacViewerConnectionModel: ObservableObject {
     private func handleInputAcknowledgement(_ detail: String) {
         let parts = detail.split(separator: ":")
         guard parts.count >= 3, let sequence = UInt64(parts[1]) else { return }
+        let isCurrentInputSourceAcknowledgement = pendingInputSourceSequence == sequence
+        if isCurrentInputSourceAcknowledgement {
+            pendingInputSourceSequence = nil
+        }
         if let sentAt = inputSentAt.removeValue(forKey: sequence) {
             connectionLatencyMS = max(0, Int((ProcessInfo.processInfo.systemUptime - sentAt) * 1_000))
         }
-        lastInputAccepted = parts[2] == "1"
+        let accepted = parts[2] == "1"
+        lastInputAccepted = accepted
+        if isCurrentInputSourceAcknowledgement {
+            inputSourceFailure = accepted
+                ? nil
+                : "The Host couldn't change its input source. Please try switching languages again."
+        }
         // An unsupported/rejected event is not a TCC permission decision.
         // Only the Host's explicit permission status enables/disables input.
+    }
+
+    private func resetInputSourceFeedback() {
+        pendingInputSourceSequence = nil
+        inputSourceFailure = nil
+        hostInputSource = nil
     }
 
     private func sendViewerCapabilities() {

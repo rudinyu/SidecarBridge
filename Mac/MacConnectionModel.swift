@@ -2,6 +2,9 @@ import AppKit
 import CoreGraphics
 import ServiceManagement
 import SwiftUI
+#if SIDECARBRIDGE_FORK
+import Carbon
+#endif
 
 @MainActor
 final class MacConnectionModel: ObservableObject {
@@ -147,6 +150,8 @@ final class MacConnectionModel: ObservableObject {
     private var screenDockLastEnvironmentRecoveryUptime = -Double.infinity
     private var screenDockLastInputRecoveryUptime = -Double.infinity
     private var screenDockWorkspaceObservers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
+    private var hostInputSourceStatusWorkItem: DispatchWorkItem?
+    private var lastPublishedHostInputSourceStatus: HostInputSourceStatus?
 #endif
     private var remoteViewerIsBackgrounded = false
     private var pendingFileURLs: [URL] = []
@@ -345,6 +350,7 @@ final class MacConnectionModel: ObservableObject {
 
         peers.onConnectionChanged = { [weak self] connected, peerOrError in
             guard let self else { return }
+            self.remoteInput.resetInputSourceState()
             if !connected {
 #if SIDECARBRIDGE_FORK
                 self.screenDockHostWindowBehavior.viewerDisconnected()
@@ -357,10 +363,16 @@ final class MacConnectionModel: ObservableObject {
             self.hasPadPeer = connected
 #if SIDECARBRIDGE_FORK
             if connected {
+                self.hostInputSourceStatusWorkItem?.cancel()
+                self.hostInputSourceStatusWorkItem = nil
+                self.lastPublishedHostInputSourceStatus = nil
                 self.viewerPresentationDetail = "No Viewer presentation signal received."
                 self.screenDockRemoteActivity.beginAuthenticatedSession()
                 self.screenDockCaptureRecoveryBudget.resetForNewAuthenticatedSession()
             } else {
+                self.hostInputSourceStatusWorkItem?.cancel()
+                self.hostInputSourceStatusWorkItem = nil
+                self.lastPublishedHostInputSourceStatus = nil
                 self.screenDockRemoteActivity.endAuthenticatedSession()
                 self.cancelScreenDockCaptureRecovery(preserveRequest: self.isStreaming)
             }
@@ -394,6 +406,12 @@ final class MacConnectionModel: ObservableObject {
                 self.detail = "Encrypted app link ready; waiting for the viewer's stream request. Native Sidecar setup is separate."
                 self.pairedPeer = MacAuthorizedDeviceStore.shared.displaySummary
                 self.sendRemoteInputPermissionStatus()
+#if SIDECARBRIDGE_FORK
+                self.publishCurrentHostInputSourceStatus(
+                    sessionToken: self.remoteInput.sessionToken,
+                    authorizationToken: AuthorizationGeneration.shared.token
+                )
+#endif
                 self.exchangeSystemInformation()
                 self.reconcileClipboardAfterConnection()
             } else if let peerOrError {
@@ -429,32 +447,52 @@ final class MacConnectionModel: ObservableObject {
             }
         }
         let inputPipeline = remoteInput
-        let peerService = peers
-        peers.onInput = { [weak self] event in
-            inputPipeline.submit(event) { [weak self] accepted, pointer in
-                if event.shouldAcknowledge, let sequence = event.sequence {
-                    peerService.send(ControlMessage(
-                        .status,
-                        detail: Self.inputAcknowledgementDetail(
-                            sequence: sequence,
-                            accepted: accepted,
-                            pointer: pointer
-                        )
-                    ))
+        peers.onInput = { [weak self] event, acknowledgementSender in
+            let submittedSessionToken = inputPipeline.sessionToken
+            let submittedAuthorizationToken = AuthorizationGeneration.shared.token
+            inputPipeline.submit(event, sessionToken: submittedSessionToken) { [weak self] accepted, pointer in
+                let completionIsCurrent = inputPipeline.performIfCurrent(sessionToken: submittedSessionToken) {
+                    if event.shouldAcknowledge, let sequence = event.sequence {
+                        acknowledgementSender(ControlMessage(
+                            .status,
+                            detail: Self.inputAcknowledgementDetail(
+                                sequence: sequence,
+                                accepted: accepted,
+                                pointer: pointer
+                            )
+                        ))
+                    }
                 }
+                guard completionIsCurrent else { return }
+#if SIDECARBRIDGE_FORK
+                if Self.isHostInputSourceChange(event) {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.publishCurrentHostInputSourceStatus(
+                            sessionToken: submittedSessionToken,
+                            authorizationToken: submittedAuthorizationToken,
+                            acknowledgementSender: acknowledgementSender
+                        )
+                    }
+                }
+#endif
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
+                    inputPipeline.performIfCurrent(sessionToken: submittedSessionToken) {
 #if SIDECARBRIDGE_FORK
-                    if accepted {
-                        self.screenDockRemoteActivity.noteAcceptedRemoteInput()
-                        self.rearmScreenDockCaptureRecoveryAfterInput()
-                    }
+                        if accepted {
+                            self.screenDockRemoteActivity.noteAcceptedRemoteInput()
+                            self.rearmScreenDockCaptureRecoveryAfterInput()
+                        }
 #endif
-                    self.refreshRemoteInputPermissionStatus()
+                        self.refreshRemoteInputPermissionStatus()
+                    }
                 }
             }
         }
-        peers.onCommand = { [weak self] command in self?.handle(command) }
+        peers.onCommand = { [weak self] command, acknowledgementSender in
+            self?.handle(command, acknowledgementSender: acknowledgementSender)
+        }
         peers.onFilePacket = { [weak self] transfer in self?.fileTransfer.handle(transfer) }
         streamer.onFrame = { [weak peers] frame in peers?.sendVideoFrame(frame) }
         peers.onKeyFrameNeeded = { [weak self] in self?.streamer.requestKeyFrame() }
@@ -472,6 +510,7 @@ final class MacConnectionModel: ObservableObject {
 
 #if SIDECARBRIDGE_FORK
     deinit {
+        hostInputSourceStatusWorkItem?.cancel()
         screenDockWorkspaceObservers.forEach { $0.center.removeObserver($0.token) }
     }
 
@@ -501,6 +540,115 @@ final class MacConnectionModel: ObservableObject {
             }
         }
         screenDockWorkspaceObservers.append((applicationCenter, screenToken))
+
+        let inputSourceCenter = DistributedNotificationCenter.default()
+        let inputSourceToken = inputSourceCenter.addObserver(
+            forName: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.scheduleHostInputSourceStatusRefresh()
+            }
+        }
+        screenDockWorkspaceObservers.append((inputSourceCenter, inputSourceToken))
+    }
+
+    private nonisolated static func isHostInputSourceChange(_ event: RemoteInputEvent) -> Bool {
+        switch event.kind {
+        case .inputMode, .cycleInputMode, .toggleChineseEnglishInputMode:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func scheduleHostInputSourceStatusRefresh() {
+        guard hasPadPeer else { return }
+
+        hostInputSourceStatusWorkItem?.cancel()
+        let sessionToken = remoteInput.sessionToken
+        let authorizationToken = AuthorizationGeneration.shared.token
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.hasPadPeer else { return }
+            self.publishCurrentHostInputSourceStatus(
+                sessionToken: sessionToken,
+                authorizationToken: authorizationToken
+            )
+        }
+        hostInputSourceStatusWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
+    }
+
+    private func publishCurrentHostInputSourceStatus(
+        sessionToken: UUID,
+        authorizationToken: UUID,
+        acknowledgementSender: InputAcknowledgementSender? = nil
+    ) {
+        if let acknowledgementSender {
+            requestHostInputSourceSnapshot(
+                sessionToken: sessionToken,
+                authorizationToken: authorizationToken,
+                sender: acknowledgementSender,
+                deduplicate: false
+            )
+            return
+        }
+
+        // Capture the authenticated route before reading the source. The
+        // returned sender stays bound to this transport if it is replaced
+        // while TIS work is queued.
+        peers.currentControlSender { [weak self] sender in
+            guard let self, let sender else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.hasPadPeer,
+                      AuthorizationGeneration.shared.token == authorizationToken,
+                      self.remoteInput.isCurrent(sessionToken: sessionToken) else { return }
+                self.requestHostInputSourceSnapshot(
+                    sessionToken: sessionToken,
+                    authorizationToken: authorizationToken,
+                    sender: sender,
+                    deduplicate: true
+                )
+            }
+        }
+    }
+
+    private func requestHostInputSourceSnapshot(
+        sessionToken: UUID,
+        authorizationToken: UUID,
+        sender: @escaping InputAcknowledgementSender,
+        deduplicate: Bool
+    ) {
+        remoteInput.inputSourceSnapshot { [weak self] snapshot in
+            guard let snapshot else { return }
+            let status = HostInputSourceStatus(
+                id: snapshot.id,
+                language: snapshot.language,
+                name: snapshot.name
+            )
+            let detail = status.detail
+            guard detail != HostInputSourceStatus.prefix else { return }
+
+            // Snapshot completions may run on the input queue. Queue the main
+            // hop before acquiring either generation gate so revocation and
+            // session invalidation cannot deadlock the main thread.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                AuthorizationGeneration.shared.perform(ifCurrent: authorizationToken) {
+                    self.remoteInput.performIfCurrent(sessionToken: sessionToken) {
+                        guard self.hasPadPeer else { return }
+                        if deduplicate {
+                            guard self.lastPublishedHostInputSourceStatus != status else { return }
+                            self.lastPublishedHostInputSourceStatus = status
+                        }
+                        let message = ControlMessage(.status, detail: detail)
+                        sender(message)
+                    }
+                }
+            }
+        }
     }
 
     private func handleScreenDockEnvironmentChange(reason: String) {
@@ -1677,7 +1825,10 @@ final class MacConnectionModel: ObservableObject {
         }
     }
 
-    private func handle(_ command: ControlMessage) {
+    private func handle(
+        _ command: ControlMessage,
+        acknowledgementSender: InputAcknowledgementSender? = nil
+    ) {
         switch command.kind {
         case .hello:
             if let detail = command.detail {
@@ -1760,27 +1911,46 @@ final class MacConnectionModel: ObservableObject {
             }
         case .input:
             guard let event = command.remoteInputEvent else { return }
-            let peerService = peers
-            remoteInput.submit(event) { [weak self] accepted, pointer in
-                if event.shouldAcknowledge, let sequence = event.sequence {
-                    peerService.send(ControlMessage(
-                        .status,
-                        detail: Self.inputAcknowledgementDetail(
-                            sequence: sequence,
-                            accepted: accepted,
-                            pointer: pointer
-                        )
-                    ))
+            let inputPipeline = remoteInput
+            let submittedSessionToken = inputPipeline.sessionToken
+            let submittedAuthorizationToken = AuthorizationGeneration.shared.token
+            inputPipeline.submit(event, sessionToken: submittedSessionToken) { [weak self] accepted, pointer in
+                let completionIsCurrent = inputPipeline.performIfCurrent(sessionToken: submittedSessionToken) {
+                    if event.shouldAcknowledge,
+                       let sequence = event.sequence,
+                       let acknowledgementSender {
+                        acknowledgementSender(ControlMessage(
+                            .status,
+                            detail: Self.inputAcknowledgementDetail(
+                                sequence: sequence,
+                                accepted: accepted,
+                                pointer: pointer
+                            )
+                        ))
+                    }
                 }
+                guard completionIsCurrent else { return }
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
 #if SIDECARBRIDGE_FORK
-                    if accepted {
-                        self.screenDockRemoteActivity.noteAcceptedRemoteInput()
-                        self.rearmScreenDockCaptureRecoveryAfterInput()
+                    if Self.isHostInputSourceChange(event),
+                       let acknowledgementSender {
+                        self.publishCurrentHostInputSourceStatus(
+                            sessionToken: submittedSessionToken,
+                            authorizationToken: submittedAuthorizationToken,
+                            acknowledgementSender: acknowledgementSender
+                        )
                     }
 #endif
-                    self.refreshRemoteInputPermissionStatus()
+                    inputPipeline.performIfCurrent(sessionToken: submittedSessionToken) {
+#if SIDECARBRIDGE_FORK
+                        if accepted {
+                            self.screenDockRemoteActivity.noteAcceptedRemoteInput()
+                            self.rearmScreenDockCaptureRecoveryAfterInput()
+                        }
+#endif
+                        self.refreshRemoteInputPermissionStatus()
+                    }
                 }
             }
         case .requestSystemInformation:
@@ -1811,12 +1981,20 @@ final class MacConnectionModel: ObservableObject {
                 // The clipboard replacement and the paste shortcut stay in
                 // this receive path, so Command-V cannot race the clipboard
                 // write across the network or input queues.
-                remoteInput.submit(.key("v", modifiers: ["command"])) { [weak self] accepted, _ in
-                    guard let self else { return }
+                let inputPipeline = remoteInput
+                let submittedSessionToken = inputPipeline.sessionToken
+                inputPipeline.submit(
+                    .key("v", modifiers: ["command"]),
+                    sessionToken: submittedSessionToken
+                ) { [weak self] accepted, _ in
+                    guard inputPipeline.isCurrent(sessionToken: submittedSessionToken) else { return }
                     DispatchQueue.main.async {
-                        self.refreshRemoteInputPermissionStatus()
-                        if !accepted {
-                            self.clipboardTransferStatus = "Clipboard copied; Mac input permission is required to paste."
+                        guard let self else { return }
+                        inputPipeline.performIfCurrent(sessionToken: submittedSessionToken) {
+                            self.refreshRemoteInputPermissionStatus()
+                            if !accepted {
+                                self.clipboardTransferStatus = "Clipboard copied; Mac input permission is required to paste."
+                            }
                         }
                     }
                 }

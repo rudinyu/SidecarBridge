@@ -20,8 +20,8 @@ final class MacPeerService: NSObject {
         let data: Data
     }
 
-    var onCommand: ((ControlMessage) -> Void)?
-    var onInput: ((RemoteInputEvent) -> Void)?
+    var onCommand: ((ControlMessage, @escaping InputAcknowledgementSender) -> Void)?
+    var onInput: ((RemoteInputEvent, @escaping InputAcknowledgementSender) -> Void)?
     var onFilePacket: ((FileTransferPacket) -> Void)?
     var onKeyFrameNeeded: (() -> Void)?
     var onVideoBackpressureChanged: ((StreamBackpressureLevel) -> Void)?
@@ -45,6 +45,8 @@ final class MacPeerService: NSObject {
     private var mcConnected = false
     private var lanConnected = false
     private var mcPeerName: String?
+    private var mcPeerID: MCPeerID?
+    private var mcAuthorizationToken: UUID?
     private var pendingMCIdentity: BridgePeerIdentity?
     private var pendingMCNonce: Data?
     private var pendingMCChannelBinding: Data?
@@ -89,8 +91,12 @@ final class MacPeerService: NSObject {
         )
         super.init()
         session.delegate = self
-        lan.onCommand = { [weak self] command in self?.route(command) }
-        lan.onInput = { [weak self] input in self?.dispatchInput(input) }
+        lan.onCommand = { [weak self] command, acknowledgementSender in
+            self?.route(command, acknowledgementSender: acknowledgementSender)
+        }
+        lan.onInput = { [weak self] input, acknowledgementSender in
+            self?.dispatchInput(input, acknowledgementSender: acknowledgementSender)
+        }
         lan.onFilePacket = { [weak self] transfer in
             self?.notePeerActivity()
             self?.onFilePacket?(transfer)
@@ -174,6 +180,42 @@ final class MacPeerService: NSObject {
                   let data = try? PacketCodec.encode(.control(message)) {
             sendMultipeerPacket(data, to: session.connectedPeers, mode: .reliable)
         }
+    }
+
+    /// Returns a sender bound to the authenticated transport that is active
+    /// for this Host session. LAN state is resolved on its own queue; all
+    /// Multipeer state is captured on main, with no synchronous queue hop.
+    @MainActor
+    func currentControlSender(completion: @escaping (InputAcknowledgementSender?) -> Void) {
+        if lanConnected {
+            lan.currentControlSender { [weak self] sender in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.lanConnected else {
+                        completion(nil)
+                        return
+                    }
+                    completion(sender)
+                }
+            }
+        } else {
+            completion(currentMultipeerControlSender())
+        }
+    }
+
+    @MainActor
+    private func currentMultipeerControlSender() -> InputAcknowledgementSender? {
+        guard mcConnected,
+              let authorizationToken = mcAuthorizationToken,
+              authorizationToken == AuthorizationGeneration.shared.token,
+              let peerID = mcPeerID,
+              session.connectedPeers.contains(peerID),
+              let secureSession = mcSecureSession else { return nil }
+        return inputAcknowledgementSender(
+            for: session,
+            peerID: peerID,
+            secureSession: secureSession,
+            authorizationToken: authorizationToken
+        )
     }
 
     func sendFrame(_ jpeg: Data) {
@@ -332,7 +374,10 @@ final class MacPeerService: NSObject {
         }
     }
 
-    private func route(_ command: ControlMessage) {
+    private func route(
+        _ command: ControlMessage,
+        acknowledgementSender: @escaping InputAcknowledgementSender
+    ) {
         notePeerActivity()
         if command.kind == .hello, command.detail == "video-ack", mcConnected {
             // Only enable this gate for Multipeer. Direct LAN has its own
@@ -347,7 +392,7 @@ final class MacPeerService: NSObject {
         guard command.kind == .status,
               let detail = command.detail,
               detail.hasPrefix("heartbeat-") else {
-            onCommand?(command)
+            onCommand?(command, acknowledgementSender)
             return
         }
         if detail.hasPrefix("heartbeat-ping:") {
@@ -364,11 +409,42 @@ final class MacPeerService: NSObject {
         }
     }
 
-    private func dispatchInput(_ input: RemoteInputEvent) {
+    private func dispatchInput(
+        _ input: RemoteInputEvent,
+        acknowledgementSender: @escaping InputAcknowledgementSender
+    ) {
         DispatchQueue.main.async { [weak self] in
             self?.notePeerActivity()
         }
-        onInput?(input)
+        onInput?(input, acknowledgementSender)
+    }
+
+    private func inputAcknowledgementSender(
+        for originSession: MCSession,
+        peerID: MCPeerID,
+        secureSession: SecurePacketSession,
+        authorizationToken: UUID
+    ) -> InputAcknowledgementSender {
+        let route = OriginBoundInputAcknowledgement(origin: originSession)
+        return { [weak self] message in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                _ = AuthorizationGeneration.shared.perform(ifCurrent: authorizationToken) {
+                    _ = route.performIfCurrent(activeOrigin: self.session) { session in
+                        guard self.mcConnected,
+                              self.mcSecureSession === secureSession,
+                              session.connectedPeers.contains(peerID),
+                              let packet = try? PacketCodec.encode(.control(message)),
+                              let encrypted = try? secureSession.seal(packet) else { return }
+                        do {
+                            try session.send(encrypted, toPeers: [peerID], with: .reliable)
+                        } catch {
+                            print("[SidecarBridge/P2P] input acknowledgement send failed: \(error.localizedDescription)")
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private func updateHeartbeatState() {
@@ -438,6 +514,8 @@ final class MacPeerService: NSObject {
             session.disconnect()
             mcConnected = false
             mcPeerName = nil
+            mcPeerID = nil
+            mcAuthorizationToken = nil
             resetMCVideoQueue()
             restartMultipeerAdvertisingAfterDisconnect()
             reportConnection(error: reason)
@@ -503,6 +581,8 @@ final class MacPeerService: NSObject {
         rebuildMultipeerSession()
         mcConnected = false
         mcPeerName = nil
+        mcPeerID = nil
+        mcAuthorizationToken = nil
         clearPendingMultipeerAuthentication()
     }
 
@@ -639,6 +719,8 @@ final class MacPeerService: NSObject {
         mcConnectionWatchdog = nil
         mcConnected = true
         mcPeerName = remotePeer.displayName
+        mcPeerID = remotePeer
+        mcAuthorizationToken = AuthorizationGeneration.shared.token
         clearPendingMultipeerAuthentication()
         onP2PStateChanged?(.connected(remotePeer.displayName))
         reportConnection()
@@ -667,6 +749,8 @@ final class MacPeerService: NSObject {
         pendingMCClientPublicKey = nil
         if !mcConnected {
             mcSecureSession = nil
+            mcPeerID = nil
+            mcAuthorizationToken = nil
         }
     }
 
@@ -780,6 +864,8 @@ extension MacPeerService: MCSessionDelegate {
             if state == .connected {
                 self.mcConnected = false
                 self.mcPeerName = nil
+                self.mcPeerID = nil
+                self.mcAuthorizationToken = nil
                 self.onP2PStateChanged?(.connecting(peerID.displayName))
                 self.beginMultipeerAuthentication(with: peerID)
             } else if state == .connecting {
@@ -788,6 +874,8 @@ extension MacPeerService: MCSessionDelegate {
             } else {
                 self.mcConnected = false
                 self.mcPeerName = nil
+                self.mcPeerID = nil
+                self.mcAuthorizationToken = nil
                 self.clearPendingMultipeerAuthentication()
                 self.onP2PStateChanged?(
                     self.lanConnected
@@ -808,19 +896,26 @@ extension MacPeerService: MCSessionDelegate {
         guard session === self.session else { return }
         let generation = AuthorizationGeneration.shared.token
         guard mcConnected || data.count <= 4096 else { session.disconnect(); return }
+        let originSecureSession = mcSecureSession
         guard data.count <= LANWire.maximumPayloadSize + SecurePacketSession.envelopeOverhead,
               SecurePacketSession.isEnvelope(data),
-              let mcSecureSession else {
+              let originSecureSession else {
             session.disconnect()
             return
         }
         let packet: BridgePacket
         do {
-            packet = try PacketCodec.decode(mcSecureSession.open(data))
+            packet = try PacketCodec.decode(originSecureSession.open(data))
         } catch {
             session.disconnect()
             return
         }
+        let acknowledgementSender = inputAcknowledgementSender(
+            for: session,
+            peerID: peerID,
+            secureSession: originSecureSession,
+            authorizationToken: generation
+        )
         if case .authentication(let message) = packet {
             DispatchQueue.main.async {
                 guard session === self.session, generation == AuthorizationGeneration.shared.token else { return }
@@ -833,13 +928,18 @@ extension MacPeerService: MCSessionDelegate {
         case .control(let command):
             if let input = command.remoteInputEvent {
                 AuthorizationGeneration.shared.perform(ifCurrent: generation) {
-                    guard session === self.session, mcConnected else { return }
-                    dispatchInput(input)
+                    guard session === self.session,
+                          mcConnected,
+                          mcSecureSession === originSecureSession,
+                          session.connectedPeers.contains(peerID) else { return }
+                    dispatchInput(input, acknowledgementSender: acknowledgementSender)
                 }
             } else {
                 DispatchQueue.main.async {
                     guard session === self.session else { return }
-                    AuthorizationGeneration.shared.perform(ifCurrent: generation) { self.route(command) }
+                    AuthorizationGeneration.shared.perform(ifCurrent: generation) {
+                        self.route(command, acknowledgementSender: acknowledgementSender)
+                    }
                 }
             }
         case .file(let transfer):

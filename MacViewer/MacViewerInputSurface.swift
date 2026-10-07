@@ -1,18 +1,13 @@
 import AppKit
 import SwiftUI
 
-protocol MacViewerInputModeManaging: AnyObject {
-    func cycleAndReturnLanguage() -> String?
-    func toggleChineseEnglishAndReturnLanguage() -> String?
-}
-
 struct MacViewerInputOverlay: View {
     let isConnected: Bool
     let isEnabled: Bool
     let isStreaming: Bool
     let contentAspectRatio: CGFloat
     let onInput: (RemoteInputEvent) -> Void
-    var inputModeManager: MacViewerInputModeManaging = NoOpMacViewerInputModeManager()
+    var inputSourceManager: MacViewerInputSourceManaging = NoOpMacViewerInputSourceManager()
     var onLocalShortcut: (NSEvent) -> Bool = { _ in false }
 
     var body: some View {
@@ -35,7 +30,7 @@ struct MacViewerInputOverlay: View {
                     contentAspectRatio: contentAspectRatio,
                     isEnabled: isConnected && isEnabled,
                     onInput: onInput,
-                    inputModeManager: inputModeManager,
+                    inputSourceManager: inputSourceManager,
                     onLocalShortcut: onLocalShortcut
                 )
             }
@@ -44,16 +39,11 @@ struct MacViewerInputOverlay: View {
     }
 }
 
-final class NoOpMacViewerInputModeManager: MacViewerInputModeManaging {
-    func cycleAndReturnLanguage() -> String? { nil }
-    func toggleChineseEnglishAndReturnLanguage() -> String? { nil }
-}
-
 struct MacViewerInputSurface: NSViewRepresentable {
     let contentAspectRatio: CGFloat
     let isEnabled: Bool
     let onInput: (RemoteInputEvent) -> Void
-    var inputModeManager: MacViewerInputModeManaging = NoOpMacViewerInputModeManager()
+    var inputSourceManager: MacViewerInputSourceManaging = NoOpMacViewerInputSourceManager()
     var onLocalShortcut: (NSEvent) -> Bool = { _ in false }
 
     func makeNSView(context: Context) -> MacViewerInputView {
@@ -61,7 +51,7 @@ struct MacViewerInputSurface: NSViewRepresentable {
             contentAspectRatio: contentAspectRatio,
             isEnabled: isEnabled,
             onInput: onInput,
-            inputModeManager: inputModeManager
+            inputSourceManager: inputSourceManager
         )
         view.onLocalShortcut = onLocalShortcut
         return view
@@ -72,7 +62,7 @@ struct MacViewerInputSurface: NSViewRepresentable {
             contentAspectRatio: contentAspectRatio,
             isEnabled: isEnabled,
             onInput: onInput,
-            inputModeManager: inputModeManager,
+            inputSourceManager: inputSourceManager,
             onLocalShortcut: onLocalShortcut
         )
     }
@@ -82,17 +72,15 @@ final class MacViewerInputView: NSView {
     var contentAspectRatio: CGFloat
     var isEnabled: Bool
     var onInput: (RemoteInputEvent) -> Void
+    var inputSourceManager: MacViewerInputSourceManaging
     var onLocalShortcut: (NSEvent) -> Bool = { _ in false }
-    var inputModeManager: MacViewerInputModeManaging
 
     private var primaryButtonIsDown = false
-    private var capsLockState: Bool?
-    private var lastLanguageSwitchEvent: (timestamp: TimeInterval, source: LanguageSwitchEventSource)?
-
-    private enum LanguageSwitchEventSource {
-        case flagsChanged
-        case keyDown
-    }
+    private var inputSourceObservationActive = false
+    private var inputSourceObservationGeneration: UInt64 = 0
+    private var lastReportedInputLanguage: String?
+    private var windowFocusObservers: [NSObjectProtocol] = []
+    private var pendingNativeSourceRefresh: DispatchWorkItem?
 
     // Invert the Host's supported HID mapping once, rather than deriving a
     // physical key from charactersIgnoringModifiers (which retains Shift).
@@ -106,12 +94,12 @@ final class MacViewerInputView: NSView {
         contentAspectRatio: CGFloat,
         isEnabled: Bool,
         onInput: @escaping (RemoteInputEvent) -> Void,
-        inputModeManager: MacViewerInputModeManaging = NoOpMacViewerInputModeManager()
+        inputSourceManager: MacViewerInputSourceManaging = NoOpMacViewerInputSourceManager()
     ) {
         self.contentAspectRatio = contentAspectRatio
         self.isEnabled = isEnabled
         self.onInput = onInput
-        self.inputModeManager = inputModeManager
+        self.inputSourceManager = inputSourceManager
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
@@ -119,25 +107,47 @@ final class MacViewerInputView: NSView {
 
     required init?(coder: NSCoder) { nil }
 
+    deinit {
+        inputSourceManager.stopObservingSelectionChanges()
+        pendingNativeSourceRefresh?.cancel()
+        windowFocusObservers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
     override var acceptsFirstResponder: Bool { true }
+
+    override func becomeFirstResponder() -> Bool {
+        let didBecome = super.becomeFirstResponder()
+        if didBecome {
+            DispatchQueue.main.async { [weak self] in
+                self?.reconcileInputSourceObservation()
+            }
+        }
+        return didBecome
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true
+        observeWindowFocusChanges()
+        reconcileInputSourceObservation()
     }
 
     func update(
         contentAspectRatio: CGFloat,
         isEnabled: Bool,
         onInput: @escaping (RemoteInputEvent) -> Void,
-        inputModeManager: MacViewerInputModeManaging,
+        inputSourceManager: MacViewerInputSourceManaging,
         onLocalShortcut: @escaping (NSEvent) -> Bool
     ) {
+        if self.inputSourceManager !== inputSourceManager {
+            stopInputSourceObservation()
+            self.inputSourceManager = inputSourceManager
+        }
         self.contentAspectRatio = contentAspectRatio
         self.isEnabled = isEnabled
         self.onInput = onInput
-        self.inputModeManager = inputModeManager
         self.onLocalShortcut = onLocalShortcut
+        reconcileInputSourceObservation()
     }
 
     override func mouseMoved(with event: NSEvent) {
@@ -148,6 +158,7 @@ final class MacViewerInputView: NSView {
     override func mouseDown(with event: NSEvent) {
         guard isEnabled else { return }
         window?.makeFirstResponder(self)
+        synchronizeCurrentInputSourceIfNeeded()
         guard let point = normalizedPoint(for: event) else { return }
         primaryButtonIsDown = true
         onInput(.primaryDown(
@@ -205,38 +216,31 @@ final class MacViewerInputView: NSView {
         if ownsKeyboardFocus, onLocalShortcut(event) { return }
         guard isEnabled else { return }
         if event.keyCode == 57 {
-            sendChineseEnglishToggle(for: event)
+            // The Viewer Mac may apply its own native input-source change
+            // asynchronously. Observe that selected source; never toggle it
+            // again locally or ask the Host to toggle blindly.
+            synchronizeCurrentInputSourceIfNeeded()
+            scheduleNativeInputSourceRefresh()
+            super.keyDown(with: event)
             return
         }
         if isRemoteInputModeSwitch(event) {
-            sendNextInputMode()
+            // Control-Space belongs to macOS input-source handling. Observe
+            // the resulting selected source instead of selecting a second time.
+            synchronizeCurrentInputSourceIfNeeded()
+            scheduleNativeInputSourceRefresh()
+            super.keyDown(with: event)
             return
         }
         if !forwardKeyEvent(event) { NSSound.beep() }
     }
 
     override func flagsChanged(with event: NSEvent) {
-        guard event.keyCode == 57 else {
-            super.flagsChanged(with: event)
-            return
+        if event.keyCode == 57, isEnabled {
+            synchronizeCurrentInputSourceIfNeeded()
+            scheduleNativeInputSourceRefresh()
         }
-        guard isEnabled else {
-            super.flagsChanged(with: event)
-            return
-        }
-
-        let newCapsLockState = event.modifierFlags.contains(.capsLock)
-        defer { capsLockState = newCapsLockState }
-        guard capsLockState != newCapsLockState else { return }
-
-        if let lastLanguageSwitchEvent,
-           lastLanguageSwitchEvent.source == .keyDown,
-           abs(event.timestamp - lastLanguageSwitchEvent.timestamp) < 0.15 {
-            return
-        }
-
-        lastLanguageSwitchEvent = (event.timestamp, .flagsChanged)
-        applyChineseEnglishToggle()
+        super.flagsChanged(with: event)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -249,12 +253,14 @@ final class MacViewerInputView: NSView {
         if onLocalShortcut(event) { return true }
         guard isEnabled else { return super.performKeyEquivalent(with: event) }
         if event.keyCode == 57 {
-            sendChineseEnglishToggle(for: event)
-            return true
+            synchronizeCurrentInputSourceIfNeeded()
+            scheduleNativeInputSourceRefresh()
+            return super.performKeyEquivalent(with: event)
         }
         if isRemoteInputModeSwitch(event) {
-            sendNextInputMode()
-            return true
+            // Let the native shortcut run. The selection notification and
+            // bounded reread below will synchronize its confirmed language.
+            return super.performKeyEquivalent(with: event)
         }
         guard hasHardwareShortcutModifier(event) else {
             return super.performKeyEquivalent(with: event)
@@ -262,14 +268,10 @@ final class MacViewerInputView: NSView {
         return forwardKeyEvent(event) || super.performKeyEquivalent(with: event)
     }
 
-    private var ownsKeyboardFocus: Bool {
-        guard let window else { return false }
-        return window.isKeyWindow && window.firstResponder === self
-    }
-
     private func forwardKeyEvent(_ event: NSEvent) -> Bool {
         let modifiers = modifiers(for: event)
         guard let usage = Self.hidUsageByKeyCode[event.keyCode] else { return false }
+        synchronizeCurrentInputSourceIfNeeded()
         onInput(.hardwareKey(hidUsage: usage, modifiers: modifiers))
         return true
     }
@@ -288,30 +290,104 @@ final class MacViewerInputView: NSView {
         )
     }
 
-    private func sendChineseEnglishToggle(for event: NSEvent) {
-        if let lastLanguageSwitchEvent,
-           lastLanguageSwitchEvent.source == .flagsChanged,
-           abs(event.timestamp - lastLanguageSwitchEvent.timestamp) < 0.15 {
-            return
-        }
-        lastLanguageSwitchEvent = (event.timestamp, .keyDown)
-        applyChineseEnglishToggle()
+    private var ownsKeyboardFocus: Bool {
+        guard let window else { return false }
+        return window.isKeyWindow && window.firstResponder === self
     }
 
-    private func applyChineseEnglishToggle() {
-        guard let language = inputModeManager.toggleChineseEnglishAndReturnLanguage() else {
-            NSSound.beep()
+    private func observeWindowFocusChanges() {
+        windowFocusObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        windowFocusObservers.removeAll()
+        guard let window else { return }
+
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            let observer = NotificationCenter.default.addObserver(
+                forName: name,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                self?.reconcileInputSourceObservation()
+            }
+            windowFocusObservers.append(observer)
+        }
+    }
+
+    private func reconcileInputSourceObservation() {
+        guard isEnabled, ownsKeyboardFocus else {
+            stopInputSourceObservation()
             return
         }
+        guard !inputSourceObservationActive else { return }
+
+        inputSourceObservationActive = true
+        inputSourceObservationGeneration &+= 1
+        lastReportedInputLanguage = nil
+        let generation = inputSourceObservationGeneration
+        inputSourceManager.startObservingSelectionChanges { [weak self] in
+            guard let self,
+                  self.inputSourceObservationActive,
+                  self.inputSourceObservationGeneration == generation else { return }
+            self.synchronizeCurrentInputSourceIfNeeded()
+            self.scheduleNativeInputSourceRefresh()
+        }
+        synchronizeCurrentInputSourceIfNeeded()
+    }
+
+    private func stopInputSourceObservation() {
+        guard inputSourceObservationActive else { return }
+        inputSourceObservationActive = false
+        inputSourceObservationGeneration &+= 1
+        pendingNativeSourceRefresh?.cancel()
+        pendingNativeSourceRefresh = nil
+        lastReportedInputLanguage = nil
+        inputSourceManager.stopObservingSelectionChanges()
+    }
+
+    private func synchronizeCurrentInputSourceIfNeeded() {
+        if !inputSourceObservationActive {
+            reconcileInputSourceObservation()
+        }
+        guard isEnabled,
+              ownsKeyboardFocus,
+              inputSourceObservationActive,
+              let source = inputSourceManager.currentSource() else { return }
+        let language = RemoteKeyboardInput.normalizedLanguage(source.language)
+        guard !language.isEmpty,
+              language.lowercased() != "unknown",
+              lastReportedInputLanguage != language else { return }
+
+        // Send the absolute local language before the following raw key or
+        // pointer action enters the same ordered remote-input queue.
+        lastReportedInputLanguage = language
         onInput(.inputMode(language: language))
     }
 
-    private func sendNextInputMode() {
-        guard let language = inputModeManager.cycleAndReturnLanguage() else {
-            NSSound.beep()
+    private func scheduleNativeInputSourceRefresh() {
+        guard inputSourceObservationActive, ownsKeyboardFocus else { return }
+        pendingNativeSourceRefresh?.cancel()
+        let generation = inputSourceObservationGeneration
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.35
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.refreshNativeInputSource(generation: generation, deadline: deadline)
+        }
+        pendingNativeSourceRefresh = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.025, execute: workItem)
+    }
+
+    private func refreshNativeInputSource(generation: UInt64, deadline: TimeInterval) {
+        guard inputSourceObservationActive,
+              inputSourceObservationGeneration == generation,
+              ownsKeyboardFocus else { return }
+        synchronizeCurrentInputSourceIfNeeded()
+        guard ProcessInfo.processInfo.systemUptime < deadline else {
+            pendingNativeSourceRefresh = nil
             return
         }
-        onInput(.inputMode(language: language))
+        let nextRead = DispatchWorkItem { [weak self] in
+            self?.refreshNativeInputSource(generation: generation, deadline: deadline)
+        }
+        pendingNativeSourceRefresh = nextRead
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.025, execute: nextRead)
     }
 
     override func resignFirstResponder() -> Bool {
@@ -319,7 +395,9 @@ final class MacViewerInputView: NSView {
             primaryButtonIsDown = false
             onInput(.releaseButtons())
         }
-        return super.resignFirstResponder()
+        let didResign = super.resignFirstResponder()
+        if didResign { stopInputSourceObservation() }
+        return didResign
     }
 
     private func normalizedPoint(for event: NSEvent) -> CGPoint? {

@@ -11,17 +11,17 @@ struct MacViewerView: View {
 
     @ObservedObject var model: MacViewerConnectionModel
     @StateObject private var presentation: MacViewerPresentation
+    private let inputSourceManager: MacViewerInputSourceManaging
     @State private var pendingForgetTarget: ForgetTarget?
-    private let inputModeManager: MacViewerInputModeManaging
 
     init(
         model: MacViewerConnectionModel,
         presentation: MacViewerPresentation? = nil,
-        inputModeManager: MacViewerInputModeManaging = NoOpMacViewerInputModeManager()
+        inputSourceManager: MacViewerInputSourceManaging = NoOpMacViewerInputSourceManager()
     ) {
         self.model = model
         _presentation = StateObject(wrappedValue: presentation ?? MacViewerPresentation())
-        self.inputModeManager = inputModeManager
+        self.inputSourceManager = inputSourceManager
     }
 
     private var showsChrome: Bool { !model.isConnected || presentation.controlsVisible }
@@ -287,8 +287,11 @@ struct MacViewerView: View {
                     isStreaming: model.isStreaming,
                     contentAspectRatio: model.streamAspectRatio,
                     onInput: model.sendInput,
-                    inputModeManager: inputModeManager,
-                    onLocalShortcut: presentation.handleLocalShortcut
+                    inputSourceManager: inputSourceManager,
+                    onLocalShortcut: { event in
+                        presentation.handleLocalShortcut(event)
+                            || model.handleHostDesktopShortcut(event)
+                    }
                 )
             }
             .frame(minHeight: showsChrome ? 300 : 0, maxHeight: .infinity)
@@ -351,6 +354,15 @@ struct MacViewerView: View {
             HStack(spacing: 12) {
                 Label(model.remoteInputAuthorized ? "Remote input ready" : "Remote input unavailable", systemImage: model.remoteInputAuthorized ? "keyboard" : "keyboard.badge.exclamationmark")
                     .foregroundStyle(model.remoteInputAuthorized ? .green : .orange)
+                if let hostInputSourceLabel = model.hostInputSourceLabel {
+                    Text("Host input: \(hostInputSourceLabel)")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.82))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .accessibilityIdentifier("macViewer.hostInputSource")
+                        .help("The Host's currently selected input source.")
+                }
                 Text(model.connectionHealthDetail)
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.52))
@@ -367,6 +379,13 @@ struct MacViewerView: View {
                     .accessibilityIdentifier("macViewer.disconnect")
                     .buttonStyle(.bordered)
                     .tint(.orange)
+            }
+            if let inputSourceFailure = model.inputSourceFailure {
+                Text(inputSourceFailure)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("macViewer.inputSource.failure")
             }
 
             HStack(alignment: .top, spacing: 20) {

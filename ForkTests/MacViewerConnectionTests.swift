@@ -449,33 +449,91 @@ final class MacViewerConnectionTests: XCTestCase {
         let f = try makeViewerFixture()
         XCTAssertFalse(f.model.remoteInputAuthorized)
         f.model.isStreaming = false
-        f.model.sendInput(.text("ignored"))
+        f.model.sendInput(.hardwareKey(hidUsage: 4))
         XCTAssertTrue(f.peer.inputs.isEmpty)
 
         f.model.isConnected = true
-        f.model.sendInput(.text("ignored"))
+        f.model.sendInput(.hardwareKey(hidUsage: 4))
         XCTAssertTrue(f.peer.inputs.isEmpty, "Connection alone is not Host event-posting authorization")
 
         await awaitViewerChange(f.model.$remoteInputAuthorized) {
             f.peer.onCommand?(ControlMessage(.status, detail: "accessibility-passed"))
         }
         XCTAssertFalse(f.model.isStreaming, "The pre-image case must remain unstreamed")
-        f.model.sendInput(.text("first"))
+        f.model.sendInput(.hardwareKey(hidUsage: 4))
         f.model.sendInput(.hardwareKey(hidUsage: 4, modifiers: ["command"]))
         XCTAssertEqual(f.peer.inputs.map(\.sequence), [1, 2])
-        XCTAssertEqual(f.peer.inputs.map(\.kind), [.text, .key])
+        XCTAssertEqual(f.peer.inputs.map(\.kind), [.key, .key])
         await awaitViewerChange(f.model.$lastInputAccepted) {
             f.peer.onCommand?(ControlMessage(.status, detail: "input-ack:2:1"))
         }
         XCTAssertGreaterThanOrEqual(try XCTUnwrap(f.model.connectionLatencyMS), 0)
         f.model.remoteInputAuthorized = false
-        f.model.sendInput(.text("revoked"))
+        f.model.sendInput(.hardwareKey(hidUsage: 4))
         XCTAssertEqual(f.peer.inputs.count, 2)
         f.model.disconnect()
-        f.model.sendInput(.text("ignored"))
+        f.model.sendInput(.hardwareKey(hidUsage: 4))
         XCTAssertEqual(f.peer.inputs.count, 2)
         XCTAssertFalse(f.model.remoteInputAuthorized)
         XCTAssertEqual(f.peer.restartCount, 1)
+    }
+
+    @MainActor
+    func testHostInputSourceStatusUsesActualSelectionAndClearsAcrossReconnect() async throws {
+        let f = try makeViewerFixture()
+        f.model.isConnected = true
+        let inputSource = HostInputSourceStatus(
+            id: "com.apple.inputmethod.SCIM.Zhuyin",
+            language: "zh-Hant",
+            name: "Plain Bopomofo"
+        )
+
+        await awaitViewerChange(f.model.$hostInputSource, matching: { $0 != nil }) {
+            f.peer.onCommand?(ControlMessage(.status, detail: inputSource.detail))
+        }
+        XCTAssertEqual(f.model.hostInputSource, inputSource)
+        XCTAssertEqual(f.model.hostInputSourceLabel, "中文 · Plain Bopomofo")
+
+        await awaitViewerChange(f.model.$isConnected, matching: { !$0 }) {
+            f.peer.onConnectionChanged?(false, "Test session ended")
+        }
+        XCTAssertNil(f.model.hostInputSource)
+        XCTAssertNil(f.model.hostInputSourceLabel)
+
+        await awaitViewerChange(f.model.$isConnected, matching: { $0 }) {
+            f.peer.onConnectionChanged?(true, "LAN: Test Mac")
+        }
+        XCTAssertNil(f.model.hostInputSource, "A new connection must wait for its own Host source status")
+    }
+
+    @MainActor
+    func testHostDesktopActionsSendOnlyControlArrowsThroughAuthorizedInput() throws {
+        let f = try makeViewerFixture()
+        f.model.isConnected = true
+        f.model.remoteInputAuthorized = true
+
+        XCTAssertTrue(f.model.canControlHostDesktop)
+        for action in MacViewerHostDesktopAction.allCases {
+            f.model.performHostDesktopAction(action)
+        }
+
+        XCTAssertEqual(f.peer.inputs.map(\.kind), [.key, .key, .key])
+        XCTAssertEqual(f.peer.inputs.map(\.hidUsage), [0x50, 0x4F, 0x52])
+        XCTAssertEqual(f.peer.inputs.map(\.modifiers), [["control"], ["control"], ["control"]])
+        XCTAssertEqual(f.peer.inputs.map(\.sequence), [1, 2, 3])
+    }
+
+    @MainActor
+    func testHostDesktopActionsRequireConnectionAndRemoteInputAuthorization() throws {
+        for (connected, authorized) in [(false, false), (false, true), (true, false)] {
+            let f = try makeViewerFixture()
+            f.model.isConnected = connected
+            f.model.remoteInputAuthorized = authorized
+
+            XCTAssertFalse(f.model.canControlHostDesktop)
+            f.model.performHostDesktopAction(.previousDesktop)
+            XCTAssertTrue(f.peer.inputs.isEmpty)
+        }
     }
 
     @MainActor

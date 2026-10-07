@@ -27,7 +27,7 @@ The fork builds two macOS products: **ScreenDock Host** and **ScreenDock Viewer*
 
 ScreenDock Host remains compatible with the existing SidecarBridge iPhone and iPad apps. It advertises both the original SidecarBridge Bonjour services and ScreenDock's fork-specific services; the Viewer searches only for ScreenDock services. ScreenDock uses TCP port `45454` by default, the same port as the author app. It selects `45455` only when the original SidecarBridge Host is already running or port `45454` is occupied. ScreenDock has its own pairing-trust namespace, so pair each Viewer with a Mac once; that first pairing does not replace the SidecarBridge apps' saved trust.
 
-The fork products are version `1.5` build `124`, with bundle identifiers `com.screendock.host` and `com.screendock.viewer` (Debug builds add `.debug`). The author-owned iPad target remains version `1.4` build `6` with its existing identity. Build ScreenDock Host with the `SidecarBridgeMac` scheme and ScreenDock Viewer with `SidecarBridgeViewerMac`; `SidecarBridgePad` remains the original iPad app target.
+The fork products are version `1.5` build `133`, with bundle identifiers `com.screendock.host` and `com.screendock.viewer` (Debug builds add `.debug`). The author-owned iPad target remains version `1.4` build `6` with its existing identity. Build ScreenDock Host with the `SidecarBridgeMac` scheme and ScreenDock Viewer with `SidecarBridgeViewerMac`; `SidecarBridgePad` remains the original iPad app target.
 
 For safe removal of the ScreenDock apps and their current-user data, see [the uninstall guide](docs/UNINSTALL.md) and `scripts/uninstall-screendock.sh` (dry-run by default).
 
@@ -48,9 +48,22 @@ overlay. CI and release builds generate this fork project first and build only
 the macOS apps; the author-owned project and iPad target retain their original
 settings.
 
-Text composition uses the Viewer Mac's active macOS input method; only committed
-text is sent to the remote Mac. The Magic Keyboard 中/英 key toggles the remote
-Mac's Chinese/English input source, and Control-Space cycles its input sources.
+The Viewer mirrors the language of its selected macOS input source to the Host.
+While remote input is authorized and the Viewer surface has focus, it observes
+the local source and sends an absolute language request when that source
+changes, and when focus or authorization returns. Caps/中/英 and Control-Space
+follow the Viewer Mac's macOS input-source behavior; ScreenDock observes the
+result rather than toggling the Host or selecting a local source. The Host
+treats requests idempotently: if its current source already matches the
+requested language, it does nothing. Otherwise it cycles through enabled
+sources until it sees a stable language match; if the bounded cycle cannot
+reach one, it reports failure and attempts to restore the original source.
+ScreenDock does not install or enable input sources. Keyboard events still go
+to the Host, where the focused app performs native composition and displays its
+candidates. TIS reports the selected source but cannot prove that each focused
+app has adopted it as its active text-input context, so native composition,
+candidate placement, and the Viewer Mac's input-source behavior still need
+physical two-Mac acceptance.
 
 Use native macOS **Full Screen** (Control-Command-F, or the green window button)
 for an edge-to-edge viewing area. Full screen hides Viewer controls. Use the
@@ -58,6 +71,12 @@ for an edge-to-edge viewing area. Full screen hides Viewer controls. Use the
 (Control-Command-H) to bring them back or hide them. Exiting full screen restores
 the previous windowed layout and its saved control visibility. These shortcuts
 stay local; plain Escape and other remote shortcuts still go to the host.
+
+To switch the Host's desktops while Viewer is full screen, use the **Host Desktop**
+menu or **Control-Command-Left/Right Arrow**. **Control-Command-Up Arrow** opens
+the Host's Mission Control. These commands require an active connection with
+authorized remote input and send Control-arrow to the Host. Move the pointer to
+the top edge in full screen to access the menu bar.
 
 Successful pairing saves the trust credential in Keychain and remembers the
 last authenticated Mac, including code-first/manual-IP connections. Temporary

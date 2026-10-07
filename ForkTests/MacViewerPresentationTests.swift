@@ -198,6 +198,7 @@ final class MacViewerPresentationTests: XCTestCase {
     func testHostedViewerLayoutRespondsToSimulatedFullScreenNotifications() throws {
         let f = try makeViewerFixture()
         f.model.isConnected = true
+        f.model.remoteInputAuthorized = true
         f.model.isStreaming = true
         let presentation = MacViewerPresentation(defaults: f.defaults)
         let window = window()
@@ -235,6 +236,24 @@ final class MacViewerPresentationTests: XCTestCase {
             "Hidden full-screen chrome must not leave buttons over remote input")
         XCTAssertEqual(video.bounds.height, hosting.bounds.height, accuracy: 1,
             "Full screen should hide the header and control panel to maximize video")
+
+        XCTAssertTrue(window.makeFirstResponder(input))
+        XCTAssertTrue(input.performKeyEquivalent(with: try key(123, "\u{F702}")),
+            "The production Viewer callback must claim Control-Command-Left in full screen")
+        let hostDesktopInput = try XCTUnwrap(f.peer.inputs.first)
+        XCTAssertEqual(f.peer.inputs.count, 1, "A Host Desktop shortcut must be sent exactly once")
+        XCTAssertEqual(hostDesktopInput.kind, .key)
+        XCTAssertEqual(hostDesktopInput.hidUsage, 0x50)
+        XCTAssertEqual(hostDesktopInput.modifiers, ["control"],
+            "Do not leak the local Command modifier to the Host")
+        XCTAssertEqual(hostDesktopInput.sequence, 1)
+
+        f.model.remoteInputAuthorized = false
+        hosting.rootView = root
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertTrue(input.performKeyEquivalent(with: try key(124, "\u{F703}")),
+            "Recognize the shortcut while gated so AppKit cannot forward Command to the Host")
+        XCTAssertEqual(f.peer.inputs.count, 1, "A denied action must not reach the transport")
 
         // This is the same state transition exposed through the View menu.
         presentation.toggleControls()

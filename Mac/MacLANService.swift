@@ -23,8 +23,8 @@ struct MacVideoSendTelemetry: Equatable {
 }
 
 final class MacLANService {
-    var onCommand: ((ControlMessage) -> Void)?
-    var onInput: ((RemoteInputEvent) -> Void)?
+    var onCommand: ((ControlMessage, @escaping InputAcknowledgementSender) -> Void)?
+    var onInput: ((RemoteInputEvent, @escaping InputAcknowledgementSender) -> Void)?
     var onFilePacket: ((FileTransferPacket) -> Void)?
     var onKeyFrameNeeded: (() -> Void)?
     var onVideoBackpressureChanged: ((StreamBackpressureLevel) -> Void)?
@@ -102,6 +102,7 @@ final class MacLANService {
         }
     }
     private var candidates: [ObjectIdentifier: Candidate] = [:]
+    private var activeCandidate: Candidate?
     private let maximumPendingCandidates = 8
     private struct PendingVideo {
         let sequence: UInt64
@@ -231,6 +232,26 @@ final class MacLANService {
     func send(_ message: ControlMessage) {
         guard let data = try? PacketCodec.encode(.control(message)) else { return }
         sendPacket(data, isFrame: false)
+    }
+
+    /// Captures the current authenticated LAN route on its owning queue. The
+    /// returned sender remains bound to that candidate if the active peer is
+    /// replaced before its caller finishes asynchronous work.
+    func currentControlSender(completion: @escaping (InputAcknowledgementSender?) -> Void) {
+        queue.async { [weak self] in
+            guard let self,
+                  let candidate = self.activeCandidate,
+                  self.isConnected,
+                  candidate.isAuthenticated,
+                  candidate.authorizationToken == AuthorizationGeneration.shared.token,
+                  candidate.connection === self.connection,
+                  let secureSession = candidate.secureSession,
+                  secureSession === self.secureSession else {
+                completion(nil)
+                return
+            }
+            completion(self.inputAcknowledgementSender(for: candidate))
+        }
     }
 
     func sendFilePacket(_ transfer: FileTransferPacket) {
@@ -600,11 +621,16 @@ final class MacLANService {
         case .control(let command):
             guard candidate.isAuthenticated,
                   connection === candidate.connection else { return }
+            let acknowledgementSender = inputAcknowledgementSender(for: candidate)
             if let input = command.remoteInputEvent {
-                AuthorizationGeneration.shared.perform(ifCurrent: candidate.authorizationToken) { onInput?(input) }
+                AuthorizationGeneration.shared.perform(ifCurrent: candidate.authorizationToken) {
+                    onInput?(input, acknowledgementSender)
+                }
             } else {
                 DispatchQueue.main.async {
-                    AuthorizationGeneration.shared.perform(ifCurrent: candidate.authorizationToken) { self.onCommand?(command) }
+                    AuthorizationGeneration.shared.perform(ifCurrent: candidate.authorizationToken) {
+                        self.onCommand?(command, acknowledgementSender)
+                    }
                 }
             }
         case .file(let transfer):
@@ -729,6 +755,7 @@ final class MacLANService {
                     candidate.isAuthenticated = true
                     self.connection = candidate.connection
                     self.secureSession = candidate.secureSession
+                    self.activeCandidate = candidate
                     self.isConnected = true
                     self.startVideoTelemetryTimer()
                     self.notify(connected: true, value: "LAN:\(identity.deviceName)")
@@ -771,6 +798,44 @@ final class MacLANService {
                 })
             } catch {
                 self.clearConnection(notify: true, error: error.localizedDescription)
+            }
+        }
+    }
+
+    private func inputAcknowledgementSender(for candidate: Candidate) -> InputAcknowledgementSender {
+        let route = OriginBoundInputAcknowledgement(origin: candidate)
+        return { [weak self] message in
+            self?.sendInputAcknowledgement(message, route: route)
+        }
+    }
+
+    private func sendInputAcknowledgement(
+        _ message: ControlMessage,
+        route: OriginBoundInputAcknowledgement<Candidate>
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            _ = route.performIfCurrent(activeOrigin: self.activeCandidate) { candidate in
+                guard self.isConnected,
+                      candidate.isAuthenticated,
+                      candidate.authorizationToken == AuthorizationGeneration.shared.token,
+                      candidate.connection === self.connection,
+                      let secureSession = candidate.secureSession,
+                      secureSession === self.secureSession,
+                      let packet = try? PacketCodec.encode(.control(message)),
+                      let encrypted = try? LANWire.encrypted(packet, session: secureSession) else { return }
+
+                candidate.connection.send(
+                    content: encrypted,
+                    completion: .contentProcessed { [weak self, weak candidate] error in
+                        guard let self, let candidate, let error else { return }
+                        self.queue.async {
+                            guard self.activeCandidate === candidate,
+                                  self.connection === candidate.connection else { return }
+                            self.clearConnection(notify: true, error: error.localizedDescription)
+                        }
+                    }
+                )
             }
         }
     }
@@ -1013,6 +1078,7 @@ final class MacLANService {
         }
         connection = nil
         secureSession = nil
+        activeCandidate = nil
         stopVideoTelemetryTimer()
         sendingFrame = false
         waitingForKeyFrame = false

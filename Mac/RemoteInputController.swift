@@ -9,12 +9,41 @@ private let remoteInputLog = Logger(
     category: "RemoteInput"
 )
 
+typealias InputAcknowledgementSender = (ControlMessage) -> Void
+
+/// Holds the transport object that received an input until its ACK is sent.
+/// Call this on the transport's send queue with its current origin so a queued
+/// completion cannot be redirected onto a replacement connection.
+struct OriginBoundInputAcknowledgement<Origin: AnyObject> {
+    private let origin: Origin
+
+    init(origin: Origin) {
+        self.origin = origin
+    }
+
+    @discardableResult
+    func performIfCurrent(activeOrigin: Origin?, _ send: (Origin) -> Void) -> Bool {
+        guard let activeOrigin, activeOrigin === origin else { return false }
+        send(origin)
+        return true
+    }
+}
+
 final class RemoteInputPipeline {
-    private let controller = RemoteInputController()
+    private let controller: RemoteInputController
+    private let authorization: AuthorizationGeneration
     private let queue = DispatchQueue(
         label: "SidecarBridge.RemoteInput",
         qos: .userInteractive
     )
+
+    init(
+        controller: RemoteInputController? = nil
+    ) {
+        let controller = controller ?? RemoteInputController()
+        self.controller = controller
+        self.authorization = controller.authorization
+    }
 
     var isAuthorized: Bool { controller.isAuthorized }
 
@@ -44,9 +73,32 @@ final class RemoteInputPipeline {
         _ input: RemoteInputEvent,
         completion: @escaping (Bool, CGPoint?) -> Void
     ) {
-        let generation = AuthorizationGeneration.shared.token
+        submit(input, sessionToken: sessionToken, completion: completion)
+    }
+
+    var sessionToken: UUID { controller.sessionGeneration.token }
+
+    func isCurrent(sessionToken: UUID) -> Bool {
+        controller.sessionGeneration.token == sessionToken
+    }
+
+    @discardableResult
+    func performIfCurrent(sessionToken: UUID, _ work: () -> Void) -> Bool {
+        controller.sessionGeneration.perform(ifCurrent: sessionToken, work)
+    }
+
+    func submit(
+        _ input: RemoteInputEvent,
+        sessionToken: UUID,
+        completion: @escaping (Bool, CGPoint?) -> Void
+    ) {
+        let generation = authorization.token
         queue.async { [controller] in
-            let accepted = controller.handleAuthorized(input, generation: generation)
+            let accepted = controller.handleAuthorized(
+                input,
+                generation: generation,
+                sessionToken: sessionToken
+            )
             let pointerPosition: CGPoint?
             switch input.kind {
             case .pointerMove, .pointerDelta, .primaryDown, .primaryDrag,
@@ -74,23 +126,127 @@ final class RemoteInputPipeline {
             controller.releaseButtons()
         }
     }
+
+    func resetInputSourceState(completion: (() -> Void)? = nil) {
+        let sessionToken = controller.sessionGeneration.invalidate()
+        queue.async { [controller] in
+            controller.resetInputSourceState(for: sessionToken)
+            completion?()
+        }
+    }
+
+    /// Reads the Host's current TIS source on main, fenced by the authorization
+    /// and peer-session tokens captured when the request entered the queue.
+    /// Completion always runs on the input queue and never while either gate
+    /// is held; a stale request completes with nil.
+    func inputSourceSnapshot(
+        completion: @escaping (RemoteInputSourceSnapshot?) -> Void
+    ) {
+        let generation = authorization.token
+        let sessionToken = controller.sessionGeneration.token
+        queue.async { [controller, authorization] in
+            var snapshot: RemoteInputSourceSnapshot?
+            let readWasCurrent = authorization.onMain(ifCurrent: generation) {
+                controller.sessionGeneration.perform(ifCurrent: sessionToken) {
+                    snapshot = controller.inputSourceSnapshotOnMain()
+                }
+            } ?? false
+            var sessionStillCurrent = false
+            let authorizationStillCurrent = authorization.perform(ifCurrent: generation) {
+                sessionStillCurrent = controller.sessionGeneration.perform(ifCurrent: sessionToken) {}
+            }
+            completion(readWasCurrent && authorizationStillCurrent && sessionStillCurrent ? snapshot : nil)
+        }
+    }
 }
 
 final class RemoteInputController {
     /// Keep main-thread TIS/AX work outside a background-held authorization
     /// lock. Each actual side effect is still gated against revocation.
-    func handleAuthorized(_ input: RemoteInputEvent, generation: UUID) -> Bool {
-        let gate = AuthorizationGeneration.shared
+    let authorization: AuthorizationGeneration
+    let sessionGeneration: RemoteInputSessionGeneration
+    private let accessCheck: () -> Bool
+    private let injectedKeyHandler: ((RemoteInputEvent) -> Bool)?
+    private let injectedTextHandler: ((String, UUID) -> Bool)?
+    init(
+        authorization: AuthorizationGeneration = .shared,
+        sessionGeneration: RemoteInputSessionGeneration = RemoteInputSessionGeneration(),
+        accessCheck: @escaping () -> Bool = { CGPreflightPostEventAccess() },
+        keyHandler: ((RemoteInputEvent) -> Bool)? = nil,
+        textHandler: ((String, UUID) -> Bool)? = nil,
+        inputSourceController: RemoteInputSourceController = RemoteInputSourceController()
+    ) {
+        self.authorization = authorization
+        self.sessionGeneration = sessionGeneration
+        self.accessCheck = accessCheck
+        self.injectedKeyHandler = keyHandler
+        self.injectedTextHandler = textHandler
+        self.inputSourceController = inputSourceController
+    }
+
+    func handleAuthorized(
+        _ input: RemoteInputEvent,
+        generation: UUID,
+        sessionToken: UUID
+    ) -> Bool {
+        let gate = authorization
         guard isAuthorized else { return false }
+        guard gate.token == generation,
+              sessionGeneration.token == sessionToken else { return false }
         switch input.kind {
-        case .inputMode, .cycleInputMode, .toggleChineseEnglishInputMode:
-            return gate.onMain(ifCurrent: generation) { self.handle(input) } ?? false
+        case .inputMode:
+            guard let language = input.text else { return false }
+            return inputSourceController.select(
+                language: language,
+                generation: generation,
+                sessionGeneration: sessionGeneration,
+                sessionToken: sessionToken,
+                requestSequence: input.sequence
+            )
+        case .cycleInputMode:
+            return inputSourceController.cycle(
+                generation: generation,
+                sessionGeneration: sessionGeneration,
+                sessionToken: sessionToken,
+                requestSequence: input.sequence
+            )
+        case .toggleChineseEnglishInputMode:
+            return inputSourceController.toggleChineseEnglish(
+                generation: generation,
+                sessionGeneration: sessionGeneration,
+                sessionToken: sessionToken,
+                requestSequence: input.sequence
+            )
         case .text:
             guard let text = input.text else { return false }
-            return type(text, generation: generation)
+            if let injectedTextHandler {
+                var accepted = false
+                let current = performIfCurrent(generation: generation, sessionToken: sessionToken) {
+                    accepted = injectedTextHandler(text, generation)
+                }
+                guard current else { return false }
+                return accepted
+            }
+            return type(
+                text,
+                generation: generation,
+                sessionToken: sessionToken
+            )
+        case .key:
+            let code = input.hidUsage.flatMap(keyCode(forHIDUsage:))
+                ?? input.key.flatMap(keyCode(for:))
+            guard code != nil else { return false }
+            var accepted = false
+            let current = performIfCurrent(generation: generation, sessionToken: sessionToken) {
+                accepted = injectedKeyHandler?(input) ?? self.handle(input)
+            }
+            guard current else { return false }
+            return accepted
         default:
             var accepted = false
-            gate.perform(ifCurrent: generation) { accepted = self.handle(input) }
+            _ = performIfCurrent(generation: generation, sessionToken: sessionToken) {
+                accepted = self.handle(input)
+            }
             return accepted
         }
     }
@@ -99,7 +255,7 @@ final class RemoteInputController {
     /// The PostEvent grant is the permission that controls whether WindowServer
     /// accepts remote keyboard, pointer, and scroll events. Accessibility is
     /// optional here and is used only for the best-effort focused-text route.
-    var isAuthorized: Bool { CGPreflightPostEventAccess() }
+    var isAuthorized: Bool { accessCheck() }
     private let eventSource = CGEventSource(stateID: .privateState)
     // Keep a dedicated private keyboard source. Passing a nil source made
     // normal Command/Option/Control shortcuts depend on whatever physical
@@ -118,7 +274,42 @@ final class RemoteInputController {
     private var activePrimaryButtonFlags: CGEventFlags = []
     private var scrollRemainderX = 0.0
     private var scrollRemainderY = 0.0
-    private let inputSourceController = RemoteInputSourceController()
+    private let inputSourceController: RemoteInputSourceController
+
+    func resetInputSourceState(for sessionToken: UUID) {
+        guard sessionGeneration.token == sessionToken else { return }
+        inputSourceController.releasePressedEvents()
+    }
+
+    func inputSourceSnapshotOnMain() -> RemoteInputSourceSnapshot? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        return inputSourceController.currentSourceSnapshotOnMain()
+    }
+
+    /// Always acquire the shared authorization gate before the session gate.
+    /// Neither helper hops to main while holding the session lock.
+    private func performIfCurrent(
+        generation: UUID,
+        sessionToken: UUID,
+        _ work: () -> Void
+    ) -> Bool {
+        var sessionCurrent = false
+        let authorizationCurrent = authorization.perform(ifCurrent: generation) {
+            sessionCurrent = sessionGeneration.perform(ifCurrent: sessionToken, work)
+        }
+        return authorizationCurrent && sessionCurrent
+    }
+
+    private func onMainIfCurrent(
+        generation: UUID,
+        sessionToken: UUID,
+        _ work: () -> Void
+    ) -> Bool {
+        guard let sessionCurrent = authorization.onMain(ifCurrent: generation, {
+            sessionGeneration.perform(ifCurrent: sessionToken, work)
+        }) else { return false }
+        return sessionCurrent
+    }
 
     @discardableResult
     func requestAccess() -> Bool {
@@ -223,12 +414,11 @@ final class RemoteInputController {
             guard let code else { return false }
             return press(code: code, modifiers: flags(for: input.modifiers ?? []))
         case .inputMode:
-            guard let language = input.text else { return false }
-            return inputSourceController.select(language: language)
-        case .cycleInputMode:
-            return inputSourceController.cycle()
-        case .toggleChineseEnglishInputMode:
-            return inputSourceController.toggleChineseEnglish()
+            // Native mode requests must enter through handleAuthorized so the
+            // configured system shortcut is posted under both generation gates.
+            return false
+        case .cycleInputMode, .toggleChineseEnglishInputMode:
+            return false
         }
         return true
     }
@@ -480,13 +670,19 @@ final class RemoteInputController {
     }
 
     @discardableResult
-    private func type(_ text: String, generation: UUID? = nil) -> Bool {
+    private func type(
+        _ text: String,
+        generation: UUID? = nil,
+        sessionToken: UUID? = nil
+    ) -> Bool {
         let preparation: TextInsertionPreparation
         if let generation {
-            guard let current = AuthorizationGeneration.shared.onMain(ifCurrent: generation, {
-                self.prepareTextInsertion(text)
-            }) else { return false }
-            preparation = current
+            guard let sessionToken else { return false }
+            var currentPreparation: TextInsertionPreparation?
+            guard onMainIfCurrent(generation: generation, sessionToken: sessionToken, {
+                currentPreparation = self.prepareTextInsertion(text)
+            }), let currentPreparation else { return false }
+            preparation = currentPreparation
         } else {
             preparation = MainQueueExecutor.sync { prepareTextInsertion(text) }
         }
@@ -503,7 +699,8 @@ final class RemoteInputController {
             accepted = self.postQuartzUnicode(text)
         }
         if let generation {
-            guard AuthorizationGeneration.shared.perform(ifCurrent: generation, fallback) else {
+            guard let sessionToken,
+                  performIfCurrent(generation: generation, sessionToken: sessionToken, fallback) else {
                 return false
             }
         } else {

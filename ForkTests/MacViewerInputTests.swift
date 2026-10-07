@@ -2,26 +2,46 @@ import AppKit
 import SwiftUI
 import XCTest
 
-private final class StubMacViewerInputModeManager: MacViewerInputModeManaging {
-    var cycleLanguages: [String] = []
-    var toggleLanguages: [String] = []
-    private(set) var cycleCount = 0
-    private(set) var toggleCount = 0
-
-    func cycleAndReturnLanguage() -> String? {
-        cycleCount += 1
-        guard !cycleLanguages.isEmpty else { return nil }
-        return cycleLanguages.removeFirst()
-    }
-
-    func toggleChineseEnglishAndReturnLanguage() -> String? {
-        toggleCount += 1
-        guard !toggleLanguages.isEmpty else { return nil }
-        return toggleLanguages.removeFirst()
-    }
-}
-
 final class MacViewerInputTests: XCTestCase {
+    private final class FakeInputSourceManager: MacViewerInputSourceManaging {
+        var current: MacViewerInputSourceSnapshot?
+        private var selectionChangeHandler: (() -> Void)?
+
+        init(current: MacViewerInputSourceSnapshot?) {
+            self.current = current
+        }
+
+        func currentSource() -> MacViewerInputSourceSnapshot? { current }
+
+        func startObservingSelectionChanges(_ handler: @escaping () -> Void) {
+            selectionChangeHandler = handler
+        }
+
+        func stopObservingSelectionChanges() {
+            selectionChangeHandler = nil
+        }
+
+        func setCurrent(_ source: MacViewerInputSourceSnapshot, notify: Bool = true) {
+            current = source
+            if notify { selectionChangeHandler?() }
+        }
+
+        func notifySelectionChange() {
+            selectionChangeHandler?()
+        }
+
+        func captureSelectionChangeHandler() -> (() -> Void)? {
+            selectionChangeHandler
+        }
+    }
+
+    private let englishSource = MacViewerInputSourceSnapshot(
+        id: "com.example.english", language: "en", name: "English"
+    )
+    private let chineseSource = MacViewerInputSourceSnapshot(
+        id: "com.example.chinese", language: "zh-Hant", name: "Traditional Chinese"
+    )
+
     @MainActor
     private func remoteInputView(in root: NSView) -> MacViewerInputView? {
         if let inputView = root as? MacViewerInputView { return inputView }
@@ -46,83 +66,216 @@ final class MacViewerInputTests: XCTestCase {
     private func key(
         _ keyCode: UInt16,
         characters: String,
-        modifiers: NSEvent.ModifierFlags = []
+        modifiers: NSEvent.ModifierFlags = [],
+        timestamp: TimeInterval = 1,
+        isARepeat: Bool = false
     ) throws -> NSEvent {
         try XCTUnwrap(NSEvent.keyEvent(
             with: .keyDown, location: .zero, modifierFlags: modifiers,
-            timestamp: 1, windowNumber: 0, context: nil,
+            timestamp: timestamp, windowNumber: 0, context: nil,
             characters: characters, charactersIgnoringModifiers: characters,
-            isARepeat: false, keyCode: keyCode
+            isARepeat: isARepeat, keyCode: keyCode
         ))
     }
 
     @MainActor
-    func testMagicKeyboardLanguageKeySynchronizesTwoExplicitViewerModes() throws {
-        var events: [RemoteInputEvent] = []
-        let modeManager = StubMacViewerInputModeManager()
-        modeManager.toggleLanguages = ["en", "zh-Hant"]
-        let view = MacViewerInputView(
-            contentAspectRatio: 16 / 9,
-            isEnabled: true,
-            onInput: { events.append($0) },
-            inputModeManager: modeManager
-        )
-
-        view.keyDown(with: try key(57, characters: ""))
-        view.keyDown(with: try key(57, characters: ""))
-
-        XCTAssertEqual(modeManager.toggleCount, 2)
-        XCTAssertEqual(events, [
-            .inputMode(language: "en"),
-            .inputMode(language: "zh-Hant")
-        ])
-        XCTAssertFalse(events.contains { $0.kind == .toggleChineseEnglishInputMode })
-    }
-
-    @MainActor
-    func testMagicKeyboardCapsLockModifierEventSynchronizesExplicitViewerMode() throws {
-        var events: [RemoteInputEvent] = []
-        let modeManager = StubMacViewerInputModeManager()
-        modeManager.toggleLanguages = ["zh-Hant"]
-        let view = MacViewerInputView(
-            contentAspectRatio: 16 / 9,
-            isEnabled: true,
-            onInput: { events.append($0) },
-            inputModeManager: modeManager
-        )
+    private func flagsChanged(keyCode: UInt16, flags: CGEventFlags = []) throws -> NSEvent {
         let quartzEvent = try XCTUnwrap(CGEvent(
             keyboardEventSource: nil,
-            virtualKey: 57,
+            virtualKey: keyCode,
             keyDown: true
         ))
         quartzEvent.type = .flagsChanged
-        quartzEvent.flags = .maskAlphaShift
-        let event = try XCTUnwrap(NSEvent(cgEvent: quartzEvent))
+        quartzEvent.flags = flags
+        return try XCTUnwrap(NSEvent(cgEvent: quartzEvent))
+    }
 
-        view.flagsChanged(with: event)
+    @MainActor
+    private func focusedInputView(
+        manager: FakeInputSourceManager,
+        isEnabled: Bool = true,
+        onInput: @escaping (RemoteInputEvent) -> Void
+    ) throws -> (ViewerTestWindow, MacViewerInputView) {
+        _ = NSApplication.shared
+        let view = MacViewerInputView(
+            contentAspectRatio: 16 / 9,
+            isEnabled: isEnabled,
+            onInput: onInput,
+            inputSourceManager: manager
+        )
+        let window = ViewerTestWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        XCTAssertTrue(window.makeFirstResponder(view))
+        return (window, view)
+    }
 
-        XCTAssertEqual(event.keyCode, 57)
-        XCTAssertEqual(modeManager.toggleCount, 1)
+    @MainActor
+    func testCapsKeyWaitsForNativeSelectionChangeAndDoesNotGuess() throws {
+        var events: [RemoteInputEvent] = []
+        let manager = FakeInputSourceManager(current: englishSource)
+        let (window, view) = try focusedInputView(manager: manager) { events.append($0) }
+        defer { window.close() }
+
+        view.keyDown(with: try key(45, characters: "n"))
+        events.removeAll()
+        view.keyDown(with: try key(57, characters: ""))
+        view.flagsChanged(with: try flagsChanged(keyCode: 57, flags: .maskAlphaShift))
+        XCTAssertTrue(events.isEmpty, "Caps events alone must not guess or toggle a language")
+
+        manager.setCurrent(chineseSource)
+        XCTAssertEqual(events, [.inputMode(language: "zh-Hant")])
+        events.removeAll()
+        view.keyDown(with: try key(57, characters: ""))
+        view.flagsChanged(with: try flagsChanged(keyCode: 57, flags: .maskAlphaShift))
+        XCTAssertTrue(events.isEmpty, "Caps events after a native source change must not cycle again")
+    }
+
+    @MainActor
+    func testControlSpaceNotificationBeforeShortcutDoesNotSendAnotherModeRequest() throws {
+        var events: [RemoteInputEvent] = []
+        let manager = FakeInputSourceManager(current: englishSource)
+        let (window, view) = try focusedInputView(manager: manager) { events.append($0) }
+        defer { window.close() }
+        view.keyDown(with: try key(45, characters: "n"))
+        events.removeAll()
+
+        // A native source change and its notification may be delivered before
+        // AppKit dispatches the corresponding Control-Space event.
+        let event = try key(49, characters: " ", modifiers: .control)
+        manager.setCurrent(chineseSource)
+        XCTAssertEqual(events, [.inputMode(language: "zh-Hant")])
+
+        XCTAssertFalse(view.performKeyEquivalent(with: event))
+        view.keyDown(with: event)
+
         XCTAssertEqual(events, [.inputMode(language: "zh-Hant")])
     }
 
     @MainActor
-    func testControlSpaceCyclesViewerLocallyAndSendsSelectedLanguage() throws {
+    func testControlSpaceNotificationAfterShortcutSynchronizesOnlyObservedLanguage() throws {
         var events: [RemoteInputEvent] = []
-        let modeManager = StubMacViewerInputModeManager()
-        modeManager.cycleLanguages = ["zh-Hant"]
-        let view = MacViewerInputView(
+        let manager = FakeInputSourceManager(current: englishSource)
+        let (window, view) = try focusedInputView(manager: manager) { events.append($0) }
+        defer { window.close() }
+        view.keyDown(with: try key(45, characters: "n"))
+        events.removeAll()
+
+        let event = try key(49, characters: " ", modifiers: .control)
+        XCTAssertFalse(view.performKeyEquivalent(with: event))
+        view.keyDown(with: event)
+        XCTAssertTrue(events.isEmpty, "No language request is sent before the local source actually changes")
+
+        manager.setCurrent(chineseSource)
+        XCTAssertEqual(events, [.inputMode(language: "zh-Hant")])
+    }
+
+    @MainActor
+    func testNativeInputSourceChangesEmitAbsoluteLanguageAndDeduplicateSameLanguage() throws {
+        var events: [RemoteInputEvent] = []
+        let manager = FakeInputSourceManager(current: englishSource)
+        let (window, view) = try focusedInputView(manager: manager) { events.append($0) }
+        defer { window.close() }
+
+        view.keyDown(with: try key(45, characters: "n"))
+        manager.setCurrent(chineseSource)
+        manager.setCurrent(MacViewerInputSourceSnapshot(
+            id: "com.example.chinese.variant", language: "zh-Hant", name: "Chinese Variant"
+        ))
+        manager.setCurrent(englishSource)
+
+        XCTAssertEqual(events.filter { $0.kind == .inputMode }, [
+            .inputMode(language: "en"),
+            .inputMode(language: "zh-Hant"),
+            .inputMode(language: "en")
+        ])
+    }
+
+    @MainActor
+    func testFocusAndEnableStateGateInputSourceNotifications() throws {
+        var events: [RemoteInputEvent] = []
+        let manager = FakeInputSourceManager(current: englishSource)
+        let (window, view) = try focusedInputView(manager: manager, isEnabled: false) { events.append($0) }
+        defer { window.close() }
+
+        manager.setCurrent(chineseSource)
+        XCTAssertTrue(events.isEmpty, "A disabled Viewer must not report its local source")
+
+        view.update(
             contentAspectRatio: 16 / 9,
             isEnabled: true,
             onInput: { events.append($0) },
-            inputModeManager: modeManager
+            inputSourceManager: manager,
+            onLocalShortcut: { _ in false }
+        )
+        XCTAssertEqual(events, [.inputMode(language: "zh-Hant")])
+
+        let callbackBeforeResign = try XCTUnwrap(manager.captureSelectionChangeHandler())
+        window.simulatedKeyWindow = false
+        XCTAssertTrue(view.resignFirstResponder())
+        manager.setCurrent(englishSource)
+        callbackBeforeResign()
+        XCTAssertEqual(events, [.inputMode(language: "zh-Hant")], "A delayed callback after focus loss must be ignored")
+
+        window.simulatedKeyWindow = true
+        XCTAssertTrue(window.makeFirstResponder(view))
+        view.keyDown(with: try key(45, characters: "n"))
+        XCTAssertEqual(events.filter { $0.kind == .inputMode }.last, .inputMode(language: "en"))
+
+        let callbackBeforeDisable = try XCTUnwrap(manager.captureSelectionChangeHandler())
+        let modeEventsBeforeDisable = events.filter { $0.kind == .inputMode }
+        view.update(
+            contentAspectRatio: 16 / 9,
+            isEnabled: false,
+            onInput: { events.append($0) },
+            inputSourceManager: manager,
+            onLocalShortcut: { _ in false }
+        )
+        manager.setCurrent(chineseSource)
+        callbackBeforeDisable()
+        XCTAssertEqual(
+            events.filter { $0.kind == .inputMode },
+            modeEventsBeforeDisable,
+            "A delayed callback after disable must be ignored"
         )
 
-        view.keyDown(with: try key(49, characters: " ", modifiers: .control))
+        view.update(
+            contentAspectRatio: 16 / 9,
+            isEnabled: true,
+            onInput: { events.append($0) },
+            inputSourceManager: manager,
+            onLocalShortcut: { _ in false }
+        )
+        XCTAssertEqual(events.filter { $0.kind == .inputMode }, [
+            .inputMode(language: "zh-Hant"),
+            .inputMode(language: "en"),
+            .inputMode(language: "zh-Hant")
+        ])
+    }
 
-        XCTAssertEqual(modeManager.cycleCount, 1)
-        XCTAssertEqual(events, [.inputMode(language: "zh-Hant")])
-        XCTAssertFalse(events.contains { $0.kind == .cycleInputMode })
+    @MainActor
+    func testRawKeySynchronouslyReportsChangedLanguageBeforeHardwareKey() throws {
+        var events: [RemoteInputEvent] = []
+        let manager = FakeInputSourceManager(current: englishSource)
+        let (window, view) = try focusedInputView(manager: manager) { events.append($0) }
+        defer { window.close() }
+
+        view.keyDown(with: try key(45, characters: "n"))
+        events.removeAll()
+        manager.setCurrent(chineseSource, notify: false)
+
+        view.keyDown(with: try key(0, characters: "a"))
+        manager.notifySelectionChange()
+
+        XCTAssertEqual(events, [
+            .inputMode(language: "zh-Hant"),
+            .hardwareKey(hidUsage: 4)
+        ])
     }
 
     @MainActor
@@ -214,6 +367,61 @@ final class MacViewerInputTests: XCTestCase {
         view.scrollWheel(with: event)
         XCTAssertEqual(events, [.scroll(x: event.scrollingDeltaX, y: event.scrollingDeltaY,
             phase: nil, continuous: event.hasPreciseScrollingDeltas)])
+    }
+
+    @MainActor
+    func testUnmodifiedAndShiftedTextKeysReachTheHostAsPhysicalKeys() throws {
+        var events: [RemoteInputEvent] = []
+        let view = MacViewerInputView(contentAspectRatio: 1, isEnabled: true) { events.append($0) }
+        view.keyDown(with: try key(45, characters: "n"))
+        view.keyDown(with: try key(0, characters: "A", modifiers: .shift))
+
+        XCTAssertEqual(events, [
+            .hardwareKey(hidUsage: 17),
+            .hardwareKey(hidUsage: 4, modifiers: ["shift"])
+        ])
+        XCTAssertFalse(events.contains { $0.kind == .text })
+    }
+
+    @MainActor
+    func testNavigationAndCommandModifiedKeysRemainHardwareInput() throws {
+        var events: [RemoteInputEvent] = []
+        let view = MacViewerInputView(contentAspectRatio: 1, isEnabled: true) { events.append($0) }
+
+        view.keyDown(with: try key(123, characters: "\u{F702}"))
+        view.keyDown(with: try key(13, characters: "w", modifiers: .command))
+
+        XCTAssertEqual(events, [
+            .hardwareKey(hidUsage: 0x50),
+            .hardwareKey(hidUsage: 0x1A, modifiers: ["command"])
+        ])
+    }
+
+    @MainActor
+    func testFocusedLocalShortcutIsConsumedBeforeRemoteKeyForwarding() throws {
+        _ = NSApplication.shared
+        var events: [RemoteInputEvent] = []
+        var localShortcutCount = 0
+        let view = MacViewerInputView(contentAspectRatio: 1, isEnabled: true) { events.append($0) }
+        view.onLocalShortcut = { _ in
+            localShortcutCount += 1
+            return true
+        }
+        let window = ViewerTestWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        defer { window.close() }
+        XCTAssertTrue(window.makeFirstResponder(view))
+
+        view.keyDown(with: try key(123, characters: "\u{F702}", modifiers: [.command, .control]))
+
+        XCTAssertEqual(localShortcutCount, 1)
+        XCTAssertTrue(events.isEmpty, "A local Host Desktop shortcut must not leak to ordinary remote-key forwarding")
     }
 
     @MainActor
