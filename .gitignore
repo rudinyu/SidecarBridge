@@ -1,5 +1,7 @@
 .DS_Store
 .build/
+/.tools/
+/dist/
 /SidecarBridgeFork.xcodeproj/
 .derived*/
 .signed-*/

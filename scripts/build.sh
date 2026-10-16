@@ -1,63 +1,61 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
-# Keep the toolchain selection and all generated output on /Volumes/D.
-#
-# Store builds must use the released Xcode 26.5 toolchain (17F42). Do not
-# honor a caller-provided DEVELOPER_DIR here: that made it too easy to
-# accidentally archive with Xcode-beta. The store archive workflow is kept in
-# /Volumes/D/xcode/ARCHIVE_AND_PUSH.md; it patches a beta host stamp in the
-# archive before export when this Mac is running a beta macOS. This debug/test
-# script intentionally does not produce a store archive.
-DEVELOPER_DIR=/Volumes/D/Xcode.app/Contents/Developer
-export DEVELOPER_DIR
+usage() {
+  echo "Usage: scripts/build.sh [--clean]"
+  echo "Builds the fork's macOS Host and Viewer without building iOS/iPadOS."
+}
 
-if [ ! -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]; then
-  echo "Stable Xcode 26.5 was not found at $DEVELOPER_DIR" >&2
-  exit 2
+CLEAN=0
+for arg in "$@"; do
+  case "$arg" in
+    --clean) CLEAN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [[ "${SIDECARBRIDGE_BUILD_LOCK_ROOT:-}" != "$ROOT" ]]; then
+  exec "$ROOT/scripts/with-build-lock.sh" "$0" "$@"
 fi
 
-XCODE_VERSION=$(
-  "$DEVELOPER_DIR/usr/bin/xcodebuild" -version |
-    awk 'NR == 1 { print $2 }'
-)
-XCODE_BUILD=$(
-  "$DEVELOPER_DIR/usr/bin/xcodebuild" -version |
-    awk 'NR == 2 { print $3 }'
-)
-if [ "$XCODE_VERSION" != "26.5" ] || [ "$XCODE_BUILD" != "17F42" ]; then
-  echo "Refusing to build: expected Xcode 26.5 (17F42), found Xcode $XCODE_VERSION ($XCODE_BUILD)." >&2
-  exit 2
+source "$ROOT/scripts/lib/environment.sh"
+sidecarbridge_resolve_developer_dir
+sidecarbridge_resolve_xcodegen
+sidecarbridge_check_xcodegen_version
+
+BUILD_ROOT="$ROOT/.build/Development"
+if (( CLEAN )); then
+  rm -rf -- "$BUILD_ROOT"
 fi
 
-xcodegen generate
-xcodebuild \
-  -project SidecarBridge.xcodeproj \
-  -scheme SidecarBridgeMac \
-  -configuration Debug \
-  -derivedDataPath .build/DerivedData \
-  CODE_SIGNING_ALLOWED=NO \
-  build
+"$ROOT/scripts/generate-fork-project.sh"
+
+HOST_DERIVED="$BUILD_ROOT/HostDerivedData"
+VIEWER_DERIVED="$BUILD_ROOT/ViewerDerivedData"
+mkdir -p "$BUILD_ROOT"
 
 xcodebuild \
-  -project SidecarBridge.xcodeproj \
-  -scheme SidecarBridgePad \
-  -configuration Debug \
-  -destination 'generic/platform=iOS' \
-  -derivedDataPath .build/DerivedDataPad \
-  CODE_SIGNING_ALLOWED=NO \
-  build
-
-xcodebuild \
-  -project SidecarBridge.xcodeproj \
+  -project "$ROOT/SidecarBridgeFork.xcodeproj" \
   -scheme SidecarBridgeMac \
+  -configuration Debug \
   -destination 'platform=macOS' \
-  -derivedDataPath .build/DerivedData \
+  -derivedDataPath "$HOST_DERIVED" \
   CODE_SIGNING_ALLOWED=NO \
-  test
+  build
 
-echo "Mac app: $ROOT/.build/DerivedData/Build/Products/Debug/SidecarBridge.app"
-echo "Open SidecarBridge.xcodeproj in Xcode to select your team and install SidecarBridgePad on the iPad."
+xcodebuild \
+  -project "$ROOT/SidecarBridgeFork.xcodeproj" \
+  -scheme SidecarBridgeViewerMac \
+  -configuration Debug \
+  -destination 'platform=macOS' \
+  -derivedDataPath "$VIEWER_DERIVED" \
+  CODE_SIGNING_ALLOWED=NO \
+  build
+
+echo "Host app: $HOST_DERIVED/Build/Products/Debug/ScreenDock Host.app"
+echo "Viewer app: $VIEWER_DERIVED/Build/Products/Debug/ScreenDock Viewer.app"
+echo "The upstream iPhone/iPad build remains available through scripts/build-upstream.sh."

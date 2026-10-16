@@ -17,15 +17,16 @@ for arg in "$@"; do
   esac
 done
 
-DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
-if [[ ! -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]]; then
-  DEVELOPER_DIR=$(xcode-select -p 2>/dev/null || true)
+if [[ "${SIDECARBRIDGE_BUILD_LOCK_ROOT:-}" != "$ROOT" ]]; then
+  exec "$ROOT/scripts/with-build-lock.sh" "$0" "$@"
 fi
-if [[ -z "$DEVELOPER_DIR" || ! -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]]; then
-  echo "No usable Xcode developer directory found" >&2
-  exit 2
-fi
-export DEVELOPER_DIR
+
+source "$ROOT/scripts/lib/environment.sh"
+source "$ROOT/scripts/lib/ui-test-preflight.sh"
+
+sidecarbridge_resolve_developer_dir
+sidecarbridge_resolve_xcodegen
+sidecarbridge_check_xcodegen_version
 
 "$ROOT/scripts/generate-fork-project.sh"
 
@@ -33,6 +34,16 @@ BUILD_ROOT="$ROOT/.build/CI"
 HOST_TEST_RESULT="$BUILD_ROOT/SidecarBridgeHostTests.xcresult"
 VIEWER_UI_RESULT="$BUILD_ROOT/SidecarBridgeViewerUITests.xcresult"
 mkdir -p "$BUILD_ROOT"
+ENVIRONMENT_REPORT="$BUILD_ROOT/environment.log"
+if ! "$ROOT/scripts/check-environment.sh" >"$ENVIRONMENT_REPORT" 2>&1; then
+  cat "$ENVIRONMENT_REPORT" >&2
+  exit 1
+fi
+cat "$ENVIRONMENT_REPORT"
+
+python3 "$ROOT/Tests/test_environment_scripts.py"
+python3 "$ROOT/Tests/test_release_macos_adapter.py"
+
 rm -rf -- "$HOST_TEST_RESULT" "$VIEWER_UI_RESULT"
 
 if ! xcodebuild -quiet \
@@ -50,7 +61,18 @@ if ! xcodebuild -quiet \
   exit 1
 fi
 
-if (( ! SKIP_VIEWER_UI_TESTS )); then
+UI_TEST_STATUS="skipped"
+UI_TEST_SKIP_REASON=""
+if (( SKIP_VIEWER_UI_TESTS )); then
+  UI_TEST_SKIP_REASON="explicitly requested with --skip-viewer-ui-tests"
+  echo "Viewer UI tests skipped: $UI_TEST_SKIP_REASON."
+elif sidecarbridge_ui_test_preflight; then
+  UI_TEST_STATUS="ready"
+else
+  UI_TEST_SKIP_REASON="$UI_TEST_PREFLIGHT_REASON"
+fi
+
+if [[ "$UI_TEST_STATUS" == "ready" ]]; then
   if ! xcodebuild -quiet \
     -project SidecarBridgeFork.xcodeproj \
     -scheme SidecarBridgeViewerUI \
@@ -67,8 +89,9 @@ if (( ! SKIP_VIEWER_UI_TESTS )); then
     xcrun xcresulttool get test-results summary --path "$VIEWER_UI_RESULT" || true
     exit 1
   fi
+  UI_TEST_STATUS="passed"
 else
-  echo "Viewer UI tests skipped by explicit request."
+  rm -rf -- "$VIEWER_UI_RESULT"
 fi
 
 xcodebuild -quiet \
@@ -89,8 +112,11 @@ xcodebuild -quiet \
   CODE_SIGNING_ALLOWED=NO \
   build
 
-if (( SKIP_VIEWER_UI_TESTS )); then
-  echo "Host unit tests passed; Viewer UI tests were skipped; both Release apps built."
+if [[ "$UI_TEST_STATUS" == "skipped" ]]; then
+  echo "Non-UI Host tests and both Release builds passed; Viewer UI tests skipped ($UI_TEST_SKIP_REASON); full CI gate is incomplete."
+  if (( ! SKIP_VIEWER_UI_TESTS )); then
+    exit 3
+  fi
 else
   echo "macOS Host unit tests and Viewer UI tests passed; both Release apps built."
 fi

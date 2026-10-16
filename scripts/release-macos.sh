@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set +x
 set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -11,24 +12,29 @@ Usage: scripts/release-macos.sh [options]
 Builds and signs the two macOS applications only. iPadOS is never built.
 
 Options:
-  --clean       Remove only this release's project-local .build/Release<build>
+  --clean       Remove only this release's .build/ReleaseBuildCache<build>
   --check       Validate local Xcode, signing, and notarization configuration
-  --skip-viewer-ui-tests  Skip only the Viewer UI suite when its runner cannot start
+  --skip-viewer-ui-tests  Explicitly skip the Viewer UI suite; release validation is partial
   --notarize    Submit both ZIPs, staple tickets, and run Gatekeeper checks
   -h, --help    Show this help
 
 Authentication:
   The shared Codex config is ~/.config/codex/notarization.env.
-  A SidecarBridge-specific fallback is ~/.config/sidecarbridge/release.env.
+  An explicit SIDECARBRIDGE_RELEASE_CONFIG is parsed literally as a
+  SidecarBridge override. Otherwise ~/.config/sidecarbridge/release.env is
+  used only when the shared config is absent. Config files must be owner-only.
   Either config may define all three generic API-key settings:
     MACOS_NOTARY_KEY_PATH, MACOS_NOTARY_KEY_ID, MACOS_NOTARY_ISSUER
-  The API key file must be outside the repository and have mode 600.
-  Otherwise, notarization uses SIDECARBRIDGE_NOTARY_PROFILE, then
-  MACOS_NOTARY_PROFILE, then the default profile notarytool-profile.
-  Signing identities remain in macOS Keychain. API-key auth uses the private
-  key file above; profile auth uses a macOS Keychain profile.
-  The config file is never read from Git and must have mode 600.
-Use --notarize only after explicitly authorizing the Apple upload.
+  The API key file must be owner-only and outside this repository.
+  A configured Keychain profile takes precedence over API-key settings.
+  Otherwise a complete API-key tuple is selected; if no auth is configured,
+  notarytool-profile is the final profile fallback. The shared helper parses
+  literal settings and never sources a config as shell code.
+  Within a config/environment source, SIDECARBRIDGE_NOTARY_PROFILE overrides
+  MACOS_NOTARY_PROFILE; SIDECARBRIDGE_SIGNING_IDENTITY overrides
+  MACOS_SIGNING_IDENTITY. The selected certificate label is public, while
+  private signing material stays in Keychain.
+Use --notarize only when the current release task authorizes Apple uploads.
 EOF
 }
 
@@ -43,92 +49,65 @@ for arg in "$@"; do
     --skip-viewer-ui-tests) SKIP_VIEWER_UI_TESTS=1 ;;
     --notarize) NOTARIZE=1 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
+    *) echo "Unknown option." >&2; usage >&2; exit 2 ;;
   esac
 done
 
-if [[ -n "${SIDECARBRIDGE_RELEASE_CONFIG:-}" ]]; then
-  CONFIG_PATH="$SIDECARBRIDGE_RELEASE_CONFIG"
-elif [[ -f "$HOME/.config/codex/notarization.env" ]]; then
-  CONFIG_PATH="$HOME/.config/codex/notarization.env"
-else
-  CONFIG_PATH="$HOME/.config/sidecarbridge/release.env"
-fi
-if [[ -f "$CONFIG_PATH" ]]; then
-  CONFIG_MODE=$(stat -f '%Lp' "$CONFIG_PATH" 2>/dev/null || true)
-  if [[ "$CONFIG_MODE" != 600 ]]; then
-    echo "Release config must have mode 600." >&2
-    exit 2
-  fi
-  # shellcheck disable=SC1090
-  if ! source "$CONFIG_PATH" >/dev/null 2>&1; then
-    echo "Could not load release config." >&2
-    exit 2
-  fi
+if [[ "${SIDECARBRIDGE_BUILD_LOCK_ROOT:-}" != "$ROOT" ]]; then
+  exec "$ROOT/scripts/with-build-lock.sh" "$0" "$@"
 fi
 
-NOTARY_AUTH_MODE="keychain-profile"
-NOTARY_PROFILE="${SIDECARBRIDGE_NOTARY_PROFILE:-${MACOS_NOTARY_PROFILE:-notarytool-profile}}"
-NOTARY_API_KEY_PATH=""
-if [[ -n "${MACOS_NOTARY_KEY_PATH+x}" || \
-      -n "${MACOS_NOTARY_KEY_ID+x}" || \
-      -n "${MACOS_NOTARY_ISSUER+x}" ]]; then
-  if [[ -z "${MACOS_NOTARY_KEY_PATH:-}" || \
-        -z "${MACOS_NOTARY_KEY_ID:-}" || \
-        -z "${MACOS_NOTARY_ISSUER:-}" ]]; then
-    echo "Generic notarization API-key configuration is incomplete. Set all three" \
-      "MACOS_NOTARY_KEY_PATH, MACOS_NOTARY_KEY_ID, and MACOS_NOTARY_ISSUER values," \
-      "or leave all three unset." >&2
-    exit 2
-  fi
-  if [[ ! -f "$MACOS_NOTARY_KEY_PATH" ]]; then
-    echo "Configured notarization API key file is missing or is not a regular file." >&2
-    exit 2
-  fi
-  if ! NOTARY_API_KEY_PATH=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \
-      "$MACOS_NOTARY_KEY_PATH" 2>/dev/null); then
-    echo "Could not resolve the configured notarization API key file." >&2
-    exit 2
-  fi
-  if [[ $(stat -f '%Lp' "$NOTARY_API_KEY_PATH" 2>/dev/null || true) != 600 ]]; then
-    echo "Configured notarization API key file must have mode 600." >&2
-    exit 2
-  fi
-  if ! python3 - "$ROOT" "$NOTARY_API_KEY_PATH" >/dev/null 2>&1 <<'PY'
-import os, sys
+source "$ROOT/scripts/lib/environment.sh"
+source "$ROOT/scripts/lib/ui-test-preflight.sh"
 
-repo_root, key_path = map(os.path.realpath, sys.argv[1:])
-try:
-    is_inside_repository = os.path.commonpath([repo_root, key_path]) == repo_root
-except ValueError:
-    is_inside_repository = False
-raise SystemExit(1 if is_inside_repository else 0)
-PY
-  then
-    echo "Configured notarization API key file must resolve outside the repository." >&2
-    exit 2
-  fi
-  NOTARY_AUTH_MODE="api-key"
-fi
-
-DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
-if [[ ! -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]]; then
-  DEVELOPER_DIR=$(xcode-select -p 2>/dev/null || true)
-fi
-if [[ -z "$DEVELOPER_DIR" || ! -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]]; then
-  echo "No usable Xcode developer directory found" >&2
+NOTARIZATION_HELPER="$HOME/.codex/skills/macos-notarization-release/scripts/macos_notarization.py"
+if [[ ! -f "$NOTARIZATION_HELPER" ]]; then
+  echo "Shared macOS notarization helper is unavailable." >&2
   exit 2
 fi
-export DEVELOPER_DIR
 
-"$ROOT/scripts/generate-fork-project.sh"
+# Preserve the adapter's legacy config selection while keeping parsing in the
+# shared helper. An explicit project config overrides shared settings; the
+# default project config remains a fallback only when shared config is absent.
+PROJECT_CONFIG_PATH=""
+if [[ -n "${SIDECARBRIDGE_RELEASE_CONFIG:-}" ]]; then
+  PROJECT_CONFIG_PATH="$SIDECARBRIDGE_RELEASE_CONFIG"
+elif [[ ! -e "$HOME/.config/codex/notarization.env" && \
+        -f "$HOME/.config/sidecarbridge/release.env" ]]; then
+  PROJECT_CONFIG_PATH="$HOME/.config/sidecarbridge/release.env"
+fi
+
+AUTH_ARGS=(resolve-auth --default-profile notarytool-profile --project-root "$ROOT")
+if [[ -n "${SIDECARBRIDGE_NOTARY_PROFILE:-}" ]]; then
+  AUTH_ARGS+=(--profile "$SIDECARBRIDGE_NOTARY_PROFILE")
+fi
+if [[ -n "$PROJECT_CONFIG_PATH" ]]; then
+  AUTH_ARGS+=(--project-config "$PROJECT_CONFIG_PATH")
+fi
+NOTARY_AUTH_MODE=$(python3 "$NOTARIZATION_HELPER" "${AUTH_ARGS[@]}")
+
+DEVELOPER_DIR="${DEVELOPER_DIR:-}"
+sidecarbridge_resolve_developer_dir
+
+run_release_tool() {
+  /usr/bin/env \
+    -u MACOS_NOTARY_PROFILE \
+    -u MACOS_NOTARY_KEY_PATH \
+    -u MACOS_NOTARY_KEY_ID \
+    -u MACOS_NOTARY_ISSUER \
+    -u SIDECARBRIDGE_NOTARY_PROFILE \
+    -u SIDECARBRIDGE_RELEASE_CONFIG \
+    "$@"
+}
+
+run_release_tool "$ROOT/scripts/generate-fork-project.sh"
 PROJECT_FILE="$ROOT/SidecarBridgeFork.xcodeproj"
 
 build_settings_for_target() {
   local target_name="$1"
   local scheme_name="$2"
   local scheme_settings
-  scheme_settings=$(xcodebuild \
+  scheme_settings=$(run_release_tool xcodebuild \
     -project "$PROJECT_FILE" \
     -scheme "$scheme_name" \
     -configuration Release \
@@ -184,17 +163,22 @@ HOST_APP_NAME="$HOST_PRODUCT_NAME.app"
 VIEWER_APP_NAME="$VIEWER_PRODUCT_NAME.app"
 HOST_ARTIFACT_STEM="${HOST_PRODUCT_NAME// /-}-$MARKETING_VERSION-$BUILD_NUMBER-macOS"
 VIEWER_ARTIFACT_STEM="${VIEWER_PRODUCT_NAME// /-}-$MARKETING_VERSION-$BUILD_NUMBER-macOS"
-RELEASE_ROOT="$ROOT/.build/Release$BUILD_NUMBER"
+RELEASE_CACHE_ROOT="$ROOT/.build/ReleaseBuildCache$BUILD_NUMBER"
+RELEASE_ARTIFACT_ROOT="$ROOT/dist/releases/Release$BUILD_NUMBER"
 
-SIGNING_IDENTITY="${SIDECARBRIDGE_SIGNING_IDENTITY:-}"
-if [[ -z "$SIGNING_IDENTITY" ]]; then
-  SIGNING_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null |
-    awk -F '"' '/Developer ID Application:/ { print $2; exit }')
+DEFAULT_SIGNING_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null |
+  awk -F '"' '/Developer ID Application:/ { print $2; exit }' || true)
+IDENTITY_ARGS=(resolve-signing-identity)
+if [[ -n "$DEFAULT_SIGNING_IDENTITY" ]]; then
+  IDENTITY_ARGS+=(--default-identity "$DEFAULT_SIGNING_IDENTITY")
 fi
-if [[ -z "$SIGNING_IDENTITY" ]]; then
-  echo "No Developer ID Application signing identity is available" >&2
-  exit 2
+if [[ -n "${SIDECARBRIDGE_SIGNING_IDENTITY:-}" ]]; then
+  IDENTITY_ARGS+=(--identity "$SIDECARBRIDGE_SIGNING_IDENTITY")
 fi
+if [[ -n "$PROJECT_CONFIG_PATH" ]]; then
+  IDENTITY_ARGS+=(--project-config "$PROJECT_CONFIG_PATH")
+fi
+SIGNING_IDENTITY=$(python3 "$NOTARIZATION_HELPER" "${IDENTITY_ARGS[@]}")
 
 if (( CHECK_ONLY )); then
   echo "Notarization authentication mode: $NOTARY_AUTH_MODE"
@@ -205,26 +189,26 @@ if (( CHECK_ONLY )); then
 fi
 
 if (( CLEAN )); then
-  rm -rf -- "$RELEASE_ROOT"
+  rm -rf -- "$RELEASE_CACHE_ROOT"
 fi
-mkdir -p "$RELEASE_ROOT"
+mkdir -p "$RELEASE_CACHE_ROOT" "$RELEASE_ARTIFACT_ROOT"
 
-HOST_DERIVED="$RELEASE_ROOT/HostDerivedData"
-VIEWER_DERIVED="$RELEASE_ROOT/ViewerDerivedData"
-TEST_DERIVED="$RELEASE_ROOT/TestDerivedData"
-VIEWER_UI_TEST_DERIVED="$RELEASE_ROOT/ViewerUITestDerivedData"
+HOST_DERIVED="$RELEASE_CACHE_ROOT/HostDerivedData"
+VIEWER_DERIVED="$RELEASE_CACHE_ROOT/ViewerDerivedData"
+TEST_DERIVED="$RELEASE_CACHE_ROOT/TestDerivedData"
+VIEWER_UI_TEST_DERIVED="$RELEASE_CACHE_ROOT/ViewerUITestDerivedData"
 HOST_APP="$HOST_DERIVED/Build/Products/Release/$HOST_APP_NAME"
 VIEWER_APP="$VIEWER_DERIVED/Build/Products/Release/$VIEWER_APP_NAME"
-HOST_TEST_RESULT="$RELEASE_ROOT/SidecarBridgeHostTests.xcresult"
-VIEWER_UI_RESULT="$RELEASE_ROOT/SidecarBridgeViewerUITests.xcresult"
-UPLOAD_DIR="$RELEASE_ROOT/notary-upload"
-SIGNED_DIR="$RELEASE_ROOT/signed"
-FINAL_DIR="$RELEASE_ROOT/notarized"
+HOST_TEST_RESULT="$RELEASE_CACHE_ROOT/SidecarBridgeHostTests.xcresult"
+VIEWER_UI_RESULT="$RELEASE_CACHE_ROOT/SidecarBridgeViewerUITests.xcresult"
+UPLOAD_DIR="$RELEASE_ARTIFACT_ROOT/notary-upload"
+SIGNED_DIR="$RELEASE_ARTIFACT_ROOT/signed"
+FINAL_DIR="$RELEASE_ARTIFACT_ROOT/notarized"
 
 mkdir -p "$UPLOAD_DIR"
 
 rm -rf -- "$HOST_TEST_RESULT" "$VIEWER_UI_RESULT"
-xcodebuild -quiet \
+run_release_tool xcodebuild -quiet \
   -project "$PROJECT_FILE" \
   -scheme SidecarBridgeMac \
   -configuration Debug \
@@ -235,10 +219,13 @@ xcodebuild -quiet \
   CODE_SIGNING_ALLOWED=NO \
   test
 
-VIEWER_UI_STATUS="passed"
+VIEWER_UI_STATUS="skipped"
 VIEWER_UI_SKIP_REASON=""
-if (( ! SKIP_VIEWER_UI_TESTS )); then
-  xcodebuild -quiet \
+if (( SKIP_VIEWER_UI_TESTS )); then
+  VIEWER_UI_SKIP_REASON="explicitly requested with --skip-viewer-ui-tests"
+  echo "Viewer UI tests skipped: $VIEWER_UI_SKIP_REASON."
+elif sidecarbridge_ui_test_preflight; then
+  run_release_tool xcodebuild -quiet \
     -project "$PROJECT_FILE" \
     -scheme SidecarBridgeViewerUI \
     -configuration Debug \
@@ -250,15 +237,16 @@ if (( ! SKIP_VIEWER_UI_TESTS )); then
     CODE_SIGN_IDENTITY=- \
     CODE_SIGNING_REQUIRED=YES \
     test
+  VIEWER_UI_STATUS="passed"
 else
-  VIEWER_UI_STATUS="skipped"
-  VIEWER_UI_SKIP_REASON="${SIDECARBRIDGE_UI_TEST_SKIP_REASON:-not specified}"
+  VIEWER_UI_SKIP_REASON="$UI_TEST_PREFLIGHT_REASON"
+  echo "Viewer UI tests skipped: $VIEWER_UI_SKIP_REASON."
   rm -rf -- "$VIEWER_UI_RESULT"
 fi
 
 TEST_STATUS="passed"
 
-xcodebuild -quiet \
+run_release_tool xcodebuild -quiet \
   -project "$PROJECT_FILE" \
   -scheme SidecarBridgeMac \
   -configuration Release \
@@ -267,7 +255,7 @@ xcodebuild -quiet \
   CODE_SIGNING_ALLOWED=NO \
   build
 
-xcodebuild -quiet \
+run_release_tool xcodebuild -quiet \
   -project "$PROJECT_FILE" \
   -scheme SidecarBridgeViewerMac \
   -configuration Release \
@@ -276,12 +264,17 @@ xcodebuild -quiet \
   CODE_SIGNING_ALLOWED=NO \
   build
 
-codesign --force --timestamp --options runtime --generate-entitlement-der \
-  --entitlements "$HOST_ENTITLEMENTS" \
-  --sign "$SIGNING_IDENTITY" "$HOST_APP"
-codesign --force --timestamp --options runtime --generate-entitlement-der \
-  --entitlements "$VIEWER_ENTITLEMENTS" \
-  --sign "$SIGNING_IDENTITY" "$VIEWER_APP"
+if [[ "$VIEWER_UI_STATUS" == "skipped" ]] && (( ! SKIP_VIEWER_UI_TESTS )); then
+  echo "Release validation is partial because Viewer UI readiness is unknown; stopping before signing or Apple submission." >&2
+  exit 3
+fi
+
+python3 "$NOTARIZATION_HELPER" sign "$HOST_APP" --authorized \
+  --identity "$SIGNING_IDENTITY" --entitlements "$HOST_ENTITLEMENTS" \
+  --generate-entitlement-der
+python3 "$NOTARIZATION_HELPER" sign "$VIEWER_APP" --authorized \
+  --identity "$SIGNING_IDENTITY" --entitlements "$VIEWER_ENTITLEMENTS" \
+  --generate-entitlement-der
 
 for app in "$HOST_APP" "$VIEWER_APP"; do
   codesign --verify --deep --strict --verbose=2 "$app"
@@ -297,6 +290,7 @@ validate_zip() {
   local app_name="$2"
   local bundle_id="$3"
   local verify_root="$4"
+  local require_ticket="${5:-0}"
   local app="$verify_root/$app_name"
   unzip -tq "$zip"
   mkdir -p "$verify_root"
@@ -310,13 +304,17 @@ validate_zip() {
     echo "Unexpected app metadata in $zip: $actual_bundle $actual_version ($actual_build)" >&2
     return 1
   }
-  codesign --verify --deep --strict --verbose=2 "$app"
+  if (( require_ticket )); then
+    python3 "$NOTARIZATION_HELPER" verify "$app"
+  else
+    codesign --verify --deep --strict --verbose=2 "$app"
+  fi
   echo "Verified ZIP: $zip ($actual_bundle $actual_version/$actual_build)"
 }
 
-rm -rf -- "$RELEASE_ROOT/VerifySigned"
-validate_zip "$HOST_ZIP" "$HOST_APP_NAME" "$HOST_BUNDLE_ID" "$RELEASE_ROOT/VerifySigned/Host"
-validate_zip "$VIEWER_ZIP" "$VIEWER_APP_NAME" "$VIEWER_BUNDLE_ID" "$RELEASE_ROOT/VerifySigned/Viewer"
+rm -rf -- "$RELEASE_CACHE_ROOT/VerifySigned"
+validate_zip "$HOST_ZIP" "$HOST_APP_NAME" "$HOST_BUNDLE_ID" "$RELEASE_CACHE_ROOT/VerifySigned/Host"
+validate_zip "$VIEWER_ZIP" "$VIEWER_APP_NAME" "$VIEWER_BUNDLE_ID" "$RELEASE_CACHE_ROOT/VerifySigned/Viewer"
 
 if (( ! NOTARIZE )); then
   mkdir -p "$SIGNED_DIR"
@@ -331,34 +329,76 @@ if (( ! NOTARIZE )); then
   HOST_NOTARY_STATUS="not-submitted"
   VIEWER_NOTARY_STATUS="not-submitted"
 else
-  if [[ "$NOTARY_AUTH_MODE" == "api-key" ]]; then
-    notary_args=(--key "$NOTARY_API_KEY_PATH" \
-      --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER")
-  else
-    notary_args=(--keychain-profile "$NOTARY_PROFILE")
-  fi
   submit() {
     local zip="$1"
-    xcrun notarytool submit "$zip" "${notary_args[@]}" \
-      --wait --output-format json --no-progress
+    local submit_args=(submit "$zip" --authorized --wait \
+      --auth "$NOTARY_AUTH_MODE" --default-profile notarytool-profile \
+      --project-root "$ROOT")
+    if [[ -n "${SIDECARBRIDGE_NOTARY_PROFILE:-}" ]]; then
+      submit_args+=(--profile "$SIDECARBRIDGE_NOTARY_PROFILE")
+    fi
+    if [[ -n "$PROJECT_CONFIG_PATH" ]]; then
+      submit_args+=(--project-config "$PROJECT_CONFIG_PATH")
+    fi
+    python3 "$NOTARIZATION_HELPER" "${submit_args[@]}"
   }
-  HOST_RESPONSE=$(submit "$HOST_ZIP")
-  printf '%s\n' "$HOST_RESPONSE"
-  HOST_NOTARY_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<< "$HOST_RESPONSE")
-  HOST_NOTARY_STATUS=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<< "$HOST_RESPONSE")
-  VIEWER_RESPONSE=$(submit "$VIEWER_ZIP")
-  printf '%s\n' "$VIEWER_RESPONSE"
-  VIEWER_NOTARY_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<< "$VIEWER_RESPONSE")
-  VIEWER_NOTARY_STATUS=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<< "$VIEWER_RESPONSE")
+  read_submission_result() {
+    python3 - "$1" <<'PY'
+import json
+import re
+import sys
+
+status = "Unknown"
+submission_id = ""
+allowed_statuses = {
+    "Accepted", "Invalid", "In Progress", "Uploaded", "Processing",
+    "Rejected", "Pending", "Error", "Completed", "Unknown",
+}
+for line in sys.argv[1].splitlines():
+    match = re.fullmatch(r"Apple submission status: ([A-Za-z ]+)", line)
+    if match and match.group(1) in allowed_statuses:
+        status = match.group(1)
+    match = re.fullmatch(
+        r"Apple submission ID: ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+        line,
+    )
+    if match:
+        submission_id = match.group(1)
+print(json.dumps({"id": submission_id, "status": status}))
+PY
+  }
+  extract_submission_field() {
+    python3 -c 'import json,sys; print(json.loads(sys.argv[1])[sys.argv[2]])' "$1" "$2"
+  }
+  submit_and_record() {
+    local zip="$1"
+    local response result status_code
+    if response=$(submit "$zip"); then
+      status_code=0
+    else
+      status_code=$?
+    fi
+    printf '%s\n' "$response"
+    result=$(read_submission_result "$response")
+    if [[ "$zip" == "$HOST_ZIP" ]]; then
+      HOST_NOTARY_ID=$(extract_submission_field "$result" id)
+      HOST_NOTARY_STATUS=$(extract_submission_field "$result" status)
+    else
+      VIEWER_NOTARY_ID=$(extract_submission_field "$result" id)
+      VIEWER_NOTARY_STATUS=$(extract_submission_field "$result" status)
+    fi
+    return "$status_code"
+  }
+  submit_and_record "$HOST_ZIP"
+  submit_and_record "$VIEWER_ZIP"
   [[ "$HOST_NOTARY_STATUS" == "Accepted" && "$VIEWER_NOTARY_STATUS" == "Accepted" ]] || {
     echo "Apple notarization did not accept both apps." >&2
     exit 1
   }
   mkdir -p "$FINAL_DIR"
   for app in "$HOST_APP" "$VIEWER_APP"; do
-    xcrun stapler staple "$app"
-    xcrun stapler validate -q "$app"
-    spctl --assess --type execute --verbose=4 "$app"
+    python3 "$NOTARIZATION_HELPER" staple "$app"
+    python3 "$NOTARIZATION_HELPER" verify "$app"
   done
   HOST_ARTIFACT="$FINAL_DIR/$HOST_ARTIFACT_STEM-Notarized.zip"
   VIEWER_ARTIFACT="$FINAL_DIR/$VIEWER_ARTIFACT_STEM-Notarized.zip"
@@ -368,19 +408,15 @@ else
     "$VIEWER_ARTIFACT"
   ARTIFACT_DIR="$FINAL_DIR"
   ARTIFACT_STATUS="notarized-and-stapled"
-  rm -rf -- "$RELEASE_ROOT/VerifyNotarized"
-  validate_zip "$HOST_ARTIFACT" "$HOST_APP_NAME" "$HOST_BUNDLE_ID" "$RELEASE_ROOT/VerifyNotarized/Host"
-  validate_zip "$VIEWER_ARTIFACT" "$VIEWER_APP_NAME" "$VIEWER_BUNDLE_ID" "$RELEASE_ROOT/VerifyNotarized/Viewer"
-  xcrun stapler validate -q "$RELEASE_ROOT/VerifyNotarized/Host/$HOST_APP_NAME"
-  xcrun stapler validate -q "$RELEASE_ROOT/VerifyNotarized/Viewer/$VIEWER_APP_NAME"
-  spctl --assess --type execute --verbose=4 "$RELEASE_ROOT/VerifyNotarized/Host/$HOST_APP_NAME"
-  spctl --assess --type execute --verbose=4 "$RELEASE_ROOT/VerifyNotarized/Viewer/$VIEWER_APP_NAME"
+  rm -rf -- "$RELEASE_CACHE_ROOT/VerifyNotarized"
+  validate_zip "$HOST_ARTIFACT" "$HOST_APP_NAME" "$HOST_BUNDLE_ID" "$RELEASE_CACHE_ROOT/VerifyNotarized/Host" 1
+  validate_zip "$VIEWER_ARTIFACT" "$VIEWER_APP_NAME" "$VIEWER_BUNDLE_ID" "$RELEASE_CACHE_ROOT/VerifyNotarized/Viewer" 1
 fi
 
 PROJECT_REVISION=$(git rev-parse HEAD)
 HOST_SHA=$(shasum -a 256 "$HOST_ARTIFACT" | awk '{print $1}')
 VIEWER_SHA=$(shasum -a 256 "$VIEWER_ARTIFACT" | awk '{print $1}')
-PROVENANCE="$RELEASE_ROOT/provenance.json"
+PROVENANCE="$RELEASE_ARTIFACT_ROOT/provenance.json"
 python3 - "$PROVENANCE" "$MARKETING_VERSION" "$BUILD_NUMBER" "$PROJECT_REVISION" \
   "$TEST_STATUS" "$HOST_TEST_RESULT" "$VIEWER_UI_STATUS" "$VIEWER_UI_RESULT" "$VIEWER_UI_SKIP_REASON" \
   "$ARTIFACT_STATUS" "$HOST_NOTARY_ID" "$HOST_NOTARY_STATUS" \

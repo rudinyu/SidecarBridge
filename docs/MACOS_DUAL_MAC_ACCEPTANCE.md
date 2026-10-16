@@ -11,7 +11,8 @@ input methods, or sleep/wake behavior.
 - Both use the release under test and are on the same local network.
 - Record the version, build, Git revision, dirty-tree state, test result bundles,
   notarization submission IDs/status, and ZIP SHA-256 values from
-  `.build/Release<build>/provenance.json`.
+  `dist/releases/Release<build>/provenance.json`. The retained Build 134
+  package workflow continues to use its historical `.build/Release134` path.
 - Grant Screen Recording and Accessibility to the Host when prompted. Grant
   Local Network access to both apps.
 

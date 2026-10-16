@@ -48,6 +48,29 @@ overlay. CI and release builds generate this fork project first and build only
 the macOS apps; the author-owned project and iPad target retain their original
 settings.
 
+For a quick local setup check and the default fork build, run:
+
+```sh
+./scripts/check-environment.sh
+./scripts/build.sh
+```
+
+`build.sh` builds ScreenDock Host and Viewer for macOS. It does not build the
+iPhone or iPad target. Use `scripts/build-upstream.sh` when you intentionally
+need the author-owned SidecarBridge macOS and iOS/iPadOS build. A valid explicit
+`DEVELOPER_DIR` is honored; otherwise the scripts use an installed full Xcode
+from `/Applications`, then the selected full Xcode from `xcode-select`.
+XcodeGen can be supplied with `XCODEGEN_BIN`, found on `PATH`, installed at
+`.tools/xcodegen/bin/xcodegen` or `.tools/xcodegen/xcodegen/bin/xcodegen`, or
+found in the retained legacy `.build/Tools/XcodeGen/` location. New local tools
+should go under `.tools/`.
+
+Build, CI, release, and project-generation commands share a fail-fast lock to
+prevent overlapping changes to generated projects and build state. Release
+archives and provenance are written under `dist/releases/Release<build>`;
+`release-macos.sh --clean` removes only `.build/ReleaseBuildCache<build>`.
+The retained Build 134 package workflow under `.build/Release134` is separate.
+
 The Viewer mirrors the language of its selected macOS input source to the Host.
 While remote input is authorized and the Viewer surface has focus, it observes
 the local source and sends an absolute language request when that source
@@ -123,24 +146,22 @@ geometry and windowed size restoration, and saves screenshots in the xcresult.
 It does not override `toggleFullScreen` or post completion notifications.
 
 ```sh
-./scripts/generate-fork-project.sh
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-xcodebuild -project SidecarBridgeFork.xcodeproj -scheme SidecarBridgeViewerUI \
-  -configuration Debug -destination 'platform=macOS' \
-  -derivedDataPath .build/ViewerUITests -parallel-testing-enabled NO \
-  CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= test
+./.codex/ci.sh
 ```
 
-Before a local run, complete the `macos-ui-test-preflight` check and continue
-only when it reports ready. This is an interactive desktop test: it requires an
-unlocked graphical session and XCTest UI automation access, launches/terminates
-the local test app, and temporarily switches Spaces. Do not run it during an
-active remote session.
+The CI script asks for a fresh interactive confirmation immediately before
+starting the UI runner. Confirm only when the desktop is unlocked, no
+authentication or approval dialog is active, and UI Automation is already
+approved for Xcode/Xcode Helper. A non-interactive or unconfirmed run skips the
+UI suite and marks the full gate incomplete. This is an interactive desktop
+test: it launches and terminates the local test app and temporarily switches
+Spaces. Do not run it during an active remote session.
 It never presses Connect, grants permissions, or runs the iPad target. Its local
 ad-hoc signature is for testing only, not Developer ID distribution.
 
-If the UI-test preflight is not ready, use this command to run CI without
-launching the UI runner:
+If readiness cannot be confirmed, use this explicit non-UI command. It runs
+Host unit tests and both Release builds, reports the Viewer UI suite as skipped,
+and does not count that suite as passed:
 
 ```sh
 ./.codex/ci.sh --skip-viewer-ui-tests
