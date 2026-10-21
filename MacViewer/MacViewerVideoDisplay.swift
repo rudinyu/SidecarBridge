@@ -382,6 +382,16 @@ final class MacViewerVideoView: NSView {
         imageView.frame = bounds
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateBackingScale()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        updateBackingScale()
+    }
+
     func enqueue(_ sampleBuffer: CMSampleBuffer) {
         jpegIsVisible = false
         imageView.isHidden = true
@@ -449,6 +459,13 @@ final class MacViewerVideoView: NSView {
         guard hasPresentedImage != value else { return }
         hasPresentedImage = value
         onPresentationChanged?(value)
+    }
+
+    private func updateBackingScale() {
+        let scale = window?.backingScaleFactor ?? 1
+        layer?.contentsScale = scale
+        displayLayer.contentsScale = scale
+        imageView.layer?.contentsScale = scale
     }
 
     // Render into owned storage instead of indexing decoder-owned buffer memory.

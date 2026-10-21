@@ -305,6 +305,51 @@ struct ControlMessage: Codable, Equatable {
     }
 }
 
+/// Negotiated on the existing authenticated control channel. Older peers
+/// ignore these hello details and continue to capture the Host cursor, which
+/// remains the Viewer fallback until it receives an applied acknowledgement.
+enum ViewerCursorFeedbackCapability {
+    struct Request: Equatable {
+        let id: UUID
+        let enabled: Bool
+    }
+
+    struct Acknowledgement: Equatable {
+        let id: UUID
+        let enabled: Bool
+    }
+
+    private static let requestPrefix = "viewer-cursor-feedback:v1:"
+    private static let acknowledgementPrefix = "viewer-cursor-feedback-applied:v1:"
+
+    static func requestDetail(id: UUID, enabled: Bool) -> String {
+        "\(requestPrefix)\(id.uuidString):\(enabled ? 1 : 0)"
+    }
+
+    static func acknowledgementDetail(id: UUID, enabled: Bool) -> String {
+        "\(acknowledgementPrefix)\(id.uuidString):\(enabled ? 1 : 0)"
+    }
+
+    static func parseRequest(_ detail: String) -> Request? {
+        parse(detail, prefix: requestPrefix).map { Request(id: $0.id, enabled: $0.enabled) }
+    }
+
+    static func parseAcknowledgement(_ detail: String) -> Acknowledgement? {
+        parse(detail, prefix: acknowledgementPrefix).map {
+            Acknowledgement(id: $0.id, enabled: $0.enabled)
+        }
+    }
+
+    private static func parse(_ detail: String, prefix: String) -> (id: UUID, enabled: Bool)? {
+        guard detail.hasPrefix(prefix) else { return nil }
+        let fields = detail.dropFirst(prefix.count).split(separator: ":", omittingEmptySubsequences: false)
+        guard fields.count == 2,
+              let id = UUID(uuidString: String(fields[0])),
+              fields[1] == "0" || fields[1] == "1" else { return nil }
+        return (id, fields[1] == "1")
+    }
+}
+
 /// Clipboard messages stay deliberately small so a copy operation cannot
 /// monopolize the control channel. Larger files should use FileTransferEngine.
 enum ClipboardTransfer {

@@ -296,6 +296,35 @@ final class MacViewerInputTests: XCTestCase {
     }
 
     @MainActor
+    func testInstantCursorAcknowledgementKeepsAspectFittedInputMapping() throws {
+        var events: [RemoteInputEvent] = []
+        let view = MacViewerInputView(
+            contentAspectRatio: 2,
+            isEnabled: true,
+            onInput: { events.append($0) },
+            isStreaming: true,
+            instantCursorEnabled: true,
+            isUsingInstantCursor: false
+        )
+        view.frame = NSRect(x: 0, y: 0, width: 400, height: 400)
+
+        view.mouseMoved(with: try mouse(.mouseMoved, 100, 250))
+        view.update(
+            contentAspectRatio: 2,
+            isEnabled: true,
+            onInput: { events.append($0) },
+            inputSourceManager: NoOpMacViewerInputSourceManager(),
+            onLocalShortcut: { _ in false },
+            isStreaming: true,
+            instantCursorEnabled: true,
+            isUsingInstantCursor: true
+        )
+        view.mouseMoved(with: try mouse(.mouseMoved, 100, 250))
+
+        XCTAssertEqual(events, [.pointer(x: 0.25, y: 0.25), .pointer(x: 0.25, y: 0.25)])
+    }
+
+    @MainActor
     func testPillarboxCoordinatesAndResizeUseCurrentAspectRatio() throws {
         var events: [RemoteInputEvent] = []
         let view = MacViewerInputView(contentAspectRatio: 1, isEnabled: true) { events.append($0) }

@@ -9,6 +9,9 @@ struct MacViewerInputOverlay: View {
     let onInput: (RemoteInputEvent) -> Void
     var inputSourceManager: MacViewerInputSourceManaging = NoOpMacViewerInputSourceManager()
     var onLocalShortcut: (NSEvent) -> Bool = { _ in false }
+    var instantCursorEnabled = true
+    var isUsingInstantCursor = false
+    var onDisplayCapabilitiesChanged: (Int, Int) -> Void = { _, _ in }
 
     var body: some View {
         ZStack {
@@ -31,7 +34,11 @@ struct MacViewerInputOverlay: View {
                     isEnabled: isConnected && isEnabled,
                     onInput: onInput,
                     inputSourceManager: inputSourceManager,
-                    onLocalShortcut: onLocalShortcut
+                    onLocalShortcut: onLocalShortcut,
+                    isStreaming: isStreaming,
+                    instantCursorEnabled: instantCursorEnabled,
+                    isUsingInstantCursor: isUsingInstantCursor,
+                    onDisplayCapabilitiesChanged: onDisplayCapabilitiesChanged
                 )
             }
         }
@@ -45,13 +52,21 @@ struct MacViewerInputSurface: NSViewRepresentable {
     let onInput: (RemoteInputEvent) -> Void
     var inputSourceManager: MacViewerInputSourceManaging = NoOpMacViewerInputSourceManager()
     var onLocalShortcut: (NSEvent) -> Bool = { _ in false }
+    var isStreaming = true
+    var instantCursorEnabled = true
+    var isUsingInstantCursor = false
+    var onDisplayCapabilitiesChanged: (Int, Int) -> Void = { _, _ in }
 
     func makeNSView(context: Context) -> MacViewerInputView {
         let view = MacViewerInputView(
             contentAspectRatio: contentAspectRatio,
             isEnabled: isEnabled,
             onInput: onInput,
-            inputSourceManager: inputSourceManager
+            inputSourceManager: inputSourceManager,
+            isStreaming: isStreaming,
+            instantCursorEnabled: instantCursorEnabled,
+            isUsingInstantCursor: isUsingInstantCursor,
+            onDisplayCapabilitiesChanged: onDisplayCapabilitiesChanged
         )
         view.onLocalShortcut = onLocalShortcut
         return view
@@ -63,7 +78,11 @@ struct MacViewerInputSurface: NSViewRepresentable {
             isEnabled: isEnabled,
             onInput: onInput,
             inputSourceManager: inputSourceManager,
-            onLocalShortcut: onLocalShortcut
+            onLocalShortcut: onLocalShortcut,
+            isStreaming: isStreaming,
+            instantCursorEnabled: instantCursorEnabled,
+            isUsingInstantCursor: isUsingInstantCursor,
+            onDisplayCapabilitiesChanged: onDisplayCapabilitiesChanged
         )
     }
 }
@@ -71,9 +90,13 @@ struct MacViewerInputSurface: NSViewRepresentable {
 final class MacViewerInputView: NSView {
     var contentAspectRatio: CGFloat
     var isEnabled: Bool
+    var isStreaming: Bool
+    var instantCursorEnabled: Bool
+    var isUsingInstantCursor: Bool
     var onInput: (RemoteInputEvent) -> Void
     var inputSourceManager: MacViewerInputSourceManaging
     var onLocalShortcut: (NSEvent) -> Bool = { _ in false }
+    var onDisplayCapabilitiesChanged: (Int, Int) -> Void
 
     private var primaryButtonIsDown = false
     private var inputSourceObservationActive = false
@@ -81,6 +104,29 @@ final class MacViewerInputView: NSView {
     private var lastReportedInputLanguage: String?
     private var windowFocusObservers: [NSObjectProtocol] = []
     private var pendingNativeSourceRefresh: DispatchWorkItem?
+    private var capabilityReportWorkItem: DispatchWorkItem?
+    private var windowDisplayObservers: [NSObjectProtocol] = []
+    private var lastReportedDisplayCapabilities: (pixelWidth: Int, refreshRate: Int)?
+
+    private static let invisibleCursor: NSCursor = {
+        let image = NSImage(size: NSSize(width: 1, height: 1))
+        if let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 1,
+            pixelsHigh: 1,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 4,
+            bitsPerPixel: 32
+        ) {
+            bitmap.setColor(.clear, atX: 0, y: 0)
+            image.addRepresentation(bitmap)
+        }
+        return NSCursor(image: image, hotSpot: .zero)
+    }()
 
     // Invert the Host's supported HID mapping once, rather than deriving a
     // physical key from charactersIgnoringModifiers (which retains Shift).
@@ -94,12 +140,20 @@ final class MacViewerInputView: NSView {
         contentAspectRatio: CGFloat,
         isEnabled: Bool,
         onInput: @escaping (RemoteInputEvent) -> Void,
-        inputSourceManager: MacViewerInputSourceManaging = NoOpMacViewerInputSourceManager()
+        inputSourceManager: MacViewerInputSourceManaging = NoOpMacViewerInputSourceManager(),
+        isStreaming: Bool = true,
+        instantCursorEnabled: Bool = true,
+        isUsingInstantCursor: Bool = false,
+        onDisplayCapabilitiesChanged: @escaping (Int, Int) -> Void = { _, _ in }
     ) {
         self.contentAspectRatio = contentAspectRatio
         self.isEnabled = isEnabled
+        self.isStreaming = isStreaming
+        self.instantCursorEnabled = instantCursorEnabled
+        self.isUsingInstantCursor = isUsingInstantCursor
         self.onInput = onInput
         self.inputSourceManager = inputSourceManager
+        self.onDisplayCapabilitiesChanged = onDisplayCapabilitiesChanged
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
@@ -110,7 +164,9 @@ final class MacViewerInputView: NSView {
     deinit {
         inputSourceManager.stopObservingSelectionChanges()
         pendingNativeSourceRefresh?.cancel()
+        capabilityReportWorkItem?.cancel()
         windowFocusObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        windowDisplayObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -128,8 +184,50 @@ final class MacViewerInputView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true
+        observeWindowDisplayChanges()
+        reportDisplayCapabilities()
+        window?.invalidateCursorRects(for: self)
         observeWindowFocusChanges()
         reconcileInputSourceObservation()
+    }
+
+    override func layout() {
+        super.layout()
+        reportDisplayCapabilities()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        let contentRect = RemoteDisplayGeometry.contentRect(
+            in: bounds.size,
+            aspectRatio: contentAspectRatio
+        )
+        guard contentRect.width > 0, contentRect.height > 0 else { return }
+
+        // Keep the pointer shape inside the actual aspect-fitted remote image.
+        // Until the Host confirms cursor suppression, its captured cursor is
+        // the fallback. Keep the native arrow visible only after that ACK;
+        // when feedback is disabled, this also lets the Host's cursor shapes
+        // show through without hiding the Mac's pointer outside the image.
+        let showLocalCursor = !isStreaming || isUsingInstantCursor
+        addCursorRect(contentRect, cursor: showLocalCursor ? .arrow : Self.invisibleCursor)
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        let local = convert(event.locationInWindow, from: nil)
+        let contentRect = RemoteDisplayGeometry.contentRect(
+            in: bounds.size,
+            aspectRatio: contentAspectRatio
+        )
+        guard contentRect.contains(local) else {
+            NSCursor.arrow.set()
+            return
+        }
+        if isStreaming && !isUsingInstantCursor {
+            Self.invisibleCursor.set()
+        } else {
+            NSCursor.arrow.set()
+        }
     }
 
     func update(
@@ -137,16 +235,31 @@ final class MacViewerInputView: NSView {
         isEnabled: Bool,
         onInput: @escaping (RemoteInputEvent) -> Void,
         inputSourceManager: MacViewerInputSourceManaging,
-        onLocalShortcut: @escaping (NSEvent) -> Bool
+        onLocalShortcut: @escaping (NSEvent) -> Bool,
+        isStreaming: Bool = true,
+        instantCursorEnabled: Bool = true,
+        isUsingInstantCursor: Bool = false,
+        onDisplayCapabilitiesChanged: @escaping (Int, Int) -> Void = { _, _ in }
     ) {
         if self.inputSourceManager !== inputSourceManager {
             stopInputSourceObservation()
             self.inputSourceManager = inputSourceManager
         }
+        let presentationGeometryChanged = self.contentAspectRatio != contentAspectRatio
+        let cursorRectsChanged = presentationGeometryChanged ||
+            self.isStreaming != isStreaming ||
+            self.instantCursorEnabled != instantCursorEnabled ||
+            self.isUsingInstantCursor != isUsingInstantCursor
         self.contentAspectRatio = contentAspectRatio
         self.isEnabled = isEnabled
+        self.isStreaming = isStreaming
+        self.instantCursorEnabled = instantCursorEnabled
+        self.isUsingInstantCursor = isUsingInstantCursor
         self.onInput = onInput
         self.onLocalShortcut = onLocalShortcut
+        self.onDisplayCapabilitiesChanged = onDisplayCapabilitiesChanged
+        if cursorRectsChanged { window?.invalidateCursorRects(for: self) }
+        if presentationGeometryChanged { reportDisplayCapabilities() }
         reconcileInputSourceObservation()
     }
 
@@ -410,6 +523,66 @@ final class MacViewerInputView: NSView {
             in: bounds.size,
             aspectRatio: contentAspectRatio
         )
+    }
+
+    private func observeWindowDisplayChanges() {
+        windowDisplayObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        windowDisplayObservers.removeAll(keepingCapacity: true)
+        guard let window else {
+            lastReportedDisplayCapabilities = nil
+            capabilityReportWorkItem?.cancel()
+            capabilityReportWorkItem = nil
+            return
+        }
+
+        let center = NotificationCenter.default
+        for name in [NSWindow.didChangeScreenNotification, NSWindow.didChangeBackingPropertiesNotification] {
+            windowDisplayObservers.append(center.addObserver(
+                forName: name,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.reportDisplayCapabilities()
+                self.window?.invalidateCursorRects(for: self)
+            })
+        }
+    }
+
+    private func reportDisplayCapabilities() {
+        capabilityReportWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.publishDisplayCapabilities()
+        }
+        capabilityReportWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
+    }
+
+    private func publishDisplayCapabilities() {
+        capabilityReportWorkItem = nil
+        let screen = window?.screen
+        let screenPixelWidth = screen.map { screen -> Int in
+            if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+                let backingWidth = CGDisplayPixelsWide(CGDirectDisplayID(screenNumber.uint32Value))
+                if backingWidth > 0 { return Int(backingWidth) }
+            }
+            return Int((screen.frame.width * screen.backingScaleFactor).rounded())
+        } ?? MacViewerDisplayCapabilities.defaultPixelWidth
+        let pixelWidth = StreamQualityPolicy.presentationPixelWidth(
+            points: bounds.size,
+            backingScale: window?.backingScaleFactor ?? screen?.backingScaleFactor ?? 1,
+            aspectRatio: contentAspectRatio,
+            maximumPixelWidth: screenPixelWidth
+        )
+        let refreshRate = screen?.maximumFramesPerSecond ?? MacViewerDisplayCapabilities.defaultRefreshRate
+        let capabilities = MacViewerDisplayCapabilities(
+            pixelWidth: pixelWidth,
+            refreshRate: refreshRate
+        )
+        guard capabilities.pixelWidth != lastReportedDisplayCapabilities?.pixelWidth ||
+              capabilities.refreshRate != lastReportedDisplayCapabilities?.refreshRate else { return }
+        lastReportedDisplayCapabilities = (capabilities.pixelWidth, capabilities.refreshRate)
+        onDisplayCapabilitiesChanged(capabilities.pixelWidth, capabilities.refreshRate)
     }
 
     private func modifiers(for event: NSEvent) -> [String] {

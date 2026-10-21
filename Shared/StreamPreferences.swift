@@ -23,7 +23,7 @@ enum StreamResolutionPreference: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .adaptive:
-            return "Targets at least 1080p, then uses the highest practical local size; choose 4K to request it explicitly."
+            return "Matches the Viewer presentation width up to the Mac display size; choose a lower cap to reduce link use."
         case .fullHD:
             return "Caps capture at 1920 pixels for a lighter stream."
         case .twoK:
@@ -295,6 +295,14 @@ enum StreamBackpressureLevel: Equatable {
     case constrained
     case severe
 
+    var severityRank: Int {
+        switch self {
+        case .normal: return 0
+        case .constrained: return 1
+        case .severe: return 2
+        }
+    }
+
     var frameRateCeiling: Int {
         switch self {
         case .normal: return 120
@@ -316,6 +324,66 @@ enum StreamBackpressureLevel: Equatable {
         case .normal: return 1.0
         case .constrained: return 0.70
         case .severe: return 0.45
+        }
+    }
+}
+
+/// Converts sender queue occupancy, queue age, and recent Viewer submission
+/// acknowledgements into the existing bounded bitrate/cadence levels. Missing
+/// acknowledgements are deliberately ignored so older peers keep working.
+enum StreamCongestionPolicy {
+    static func level(
+        bufferedBytes: Int,
+        maximumBufferedBytes: Int,
+        pendingFrames: Int,
+        senderWindow: Int,
+        oldestOutstandingAge: TimeInterval,
+        viewerSequenceLag: Int?
+    ) -> StreamBackpressureLevel {
+        let safeMaximumBytes = max(maximumBufferedBytes, 1)
+        let byteRatio = Double(max(bufferedBytes, 0)) / Double(safeMaximumBytes)
+        let safeWindow = max(senderWindow, 1)
+        let highWater = max(8, safeWindow * 2)
+        // Viewer video acknowledgements are batched every 12 submitted frames.
+        // Treat that expected batch plus the sender window as normal lag.
+        let acknowledgementHighWater = max(highWater, 12 + safeWindow * 2)
+        let receiverLag = max(viewerSequenceLag ?? 0, 0)
+
+        if oldestOutstandingAge >= 0.35
+            || byteRatio >= 0.90
+            || receiverLag >= acknowledgementHighWater * 2 {
+            return .severe
+        }
+        if oldestOutstandingAge >= 0.12
+            || byteRatio >= 0.60
+            || pendingFrames >= safeWindow * 2
+            || receiverLag >= acknowledgementHighWater {
+            return .constrained
+        }
+        return .normal
+    }
+
+    static func isHealthyForRecovery(
+        bufferedBytes: Int,
+        maximumBufferedBytes: Int,
+        pendingFrames: Int,
+        senderWindow: Int,
+        oldestOutstandingAge: TimeInterval,
+        viewerSequenceLag: Int?
+    ) -> Bool {
+        let byteRatio = Double(max(bufferedBytes, 0)) / Double(max(maximumBufferedBytes, 1))
+        let expectedAcknowledgementBatch = max(12, 12 + max(senderWindow, 1) * 2)
+        return byteRatio < 0.55
+            && pendingFrames <= 1
+            && oldestOutstandingAge < 0.08
+            && (viewerSequenceLag.map { $0 < expectedAcknowledgementBatch } ?? true)
+    }
+
+    static func recoveryLevel(from level: StreamBackpressureLevel) -> StreamBackpressureLevel {
+        switch level {
+        case .normal: return .normal
+        case .constrained: return .normal
+        case .severe: return .constrained
         }
     }
 }

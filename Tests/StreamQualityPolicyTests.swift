@@ -23,7 +23,38 @@ final class StreamQualityPolicyTests: XCTestCase {
         XCTAssertEqual(StreamQualityPolicy.captureWidth(preferred: 3840, resolution: .adaptive, memory: .normal), 3840)
         XCTAssertEqual(StreamQualityPolicy.captureWidth(preferred: 3840, resolution: .twoK, memory: .warning), 2560)
         XCTAssertEqual(StreamQualityPolicy.captureWidth(preferred: 3840, resolution: .fourK, memory: .critical), 1920)
-        XCTAssertEqual(StreamQualityPolicy.captureWidth(preferred: 1440, resolution: .fourK, memory: .normal), 3840)
+        XCTAssertEqual(StreamQualityPolicy.captureWidth(preferred: 1440, resolution: .fourK, memory: .normal), 1440)
+        XCTAssertEqual(StreamQualityPolicy.captureWidth(preferred: 960, resolution: .adaptive, memory: .normal), 960)
+    }
+    func testCaptureWidthTracksAspectFitPresentationInBackingPixels() {
+        XCTAssertEqual(
+            StreamQualityPolicy.presentationPixelWidth(
+                points: CGSize(width: 1600, height: 800),
+                backingScale: 2,
+                aspectRatio: 16.0 / 9.0,
+                maximumPixelWidth: 3840
+            ),
+            2844
+        )
+        XCTAssertEqual(
+            StreamQualityPolicy.presentationPixelWidth(
+                points: CGSize(width: 1000, height: 1000),
+                backingScale: 2,
+                aspectRatio: 16.0 / 9.0,
+                maximumPixelWidth: 3840
+            ),
+            2000
+        )
+        XCTAssertEqual(StreamQualityPolicy.boundedPresentationWidth(2001), 1984)
+        XCTAssertEqual(StreamQualityPolicy.boundedPresentationWidth(2010), 1984)
+        XCTAssertEqual(
+            StreamQualityPolicy.stablePresentationWidth(proposed: 2048, current: 1984, hysteresis: 128),
+            1984
+        )
+        XCTAssertEqual(
+            StreamQualityPolicy.stablePresentationWidth(proposed: 2112, current: 1984, hysteresis: 128),
+            2112
+        )
     }
     func testHiDPISourceUsesPixelsNotLogicalPoints() {
         XCTAssertEqual(StreamQualityPolicy.sourcePixels(points: CGSize(width: 1920, height: 1080), scale: 2),
@@ -49,6 +80,89 @@ final class StreamQualityPolicyTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(congested, 2_000_000)
         XCTAssertEqual(StreamQualityPolicy.bitrate(width: 3840, height: 2160, frameRate: 240, isNearby: true, memory: .normal, backpressure: .normal), 36_000_000)
         XCTAssertEqual(StreamQualityPolicy.bitrate(width: 3840, height: 2160, frameRate: 240, isNearby: false, memory: .normal, backpressure: .normal), 48_000_000)
+    }
+    func testCongestionUsesEarlyQueueAgeAndIgnoresExpectedAckBatchWithoutAckSupport() {
+        for submissionLag in 0..<12 {
+            XCTAssertEqual(
+                StreamCongestionPolicy.level(
+                    bufferedBytes: 0,
+                    maximumBufferedBytes: 12 * 1024 * 1024,
+                    pendingFrames: 0,
+                    senderWindow: 4,
+                    oldestOutstandingAge: 0,
+                    viewerSequenceLag: submissionLag
+                ),
+                .normal
+            )
+        }
+        XCTAssertEqual(
+            StreamCongestionPolicy.level(
+                bufferedBytes: 0,
+                maximumBufferedBytes: 12 * 1024 * 1024,
+                pendingFrames: 0,
+                senderWindow: 4,
+                oldestOutstandingAge: 0,
+                viewerSequenceLag: 20
+            ),
+            .constrained
+        )
+        XCTAssertEqual(
+            StreamCongestionPolicy.level(
+                bufferedBytes: 0,
+                maximumBufferedBytes: 12 * 1024 * 1024,
+                pendingFrames: 0,
+                senderWindow: 4,
+                oldestOutstandingAge: 0,
+                viewerSequenceLag: 21
+            ),
+            .constrained
+        )
+        XCTAssertEqual(
+            StreamCongestionPolicy.level(
+                bufferedBytes: 0,
+                maximumBufferedBytes: 12 * 1024 * 1024,
+                pendingFrames: 0,
+                senderWindow: 4,
+                oldestOutstandingAge: 0.12,
+                viewerSequenceLag: nil
+            ),
+            .constrained
+        )
+        XCTAssertEqual(
+            StreamCongestionPolicy.level(
+                bufferedBytes: 0,
+                maximumBufferedBytes: 12 * 1024 * 1024,
+                pendingFrames: 0,
+                senderWindow: 4,
+                oldestOutstandingAge: 0.35,
+                viewerSequenceLag: nil
+            ),
+            .severe
+        )
+        XCTAssertTrue(
+            StreamCongestionPolicy.isHealthyForRecovery(
+                bufferedBytes: 0,
+                maximumBufferedBytes: 12 * 1024 * 1024,
+                pendingFrames: 0,
+                senderWindow: 4,
+                oldestOutstandingAge: 0,
+                viewerSequenceLag: 19
+            )
+        )
+        XCTAssertFalse(
+            StreamCongestionPolicy.isHealthyForRecovery(
+                bufferedBytes: 0,
+                maximumBufferedBytes: 12 * 1024 * 1024,
+                pendingFrames: 0,
+                senderWindow: 4,
+                oldestOutstandingAge: 0,
+                viewerSequenceLag: 20
+            )
+        )
+    }
+    func testCongestionRecoveryStepsDownOneLevelAtATime() {
+        XCTAssertEqual(StreamCongestionPolicy.recoveryLevel(from: .severe), .constrained)
+        XCTAssertEqual(StreamCongestionPolicy.recoveryLevel(from: .constrained), .normal)
     }
     func testRecoveryIsSlowAndCriticalPressureIsPrompt() {
         XCTAssertEqual(StreamPressureTransitionPolicy.delay(from: .normal, to: .warning, sinceLastChange: 100), 3)

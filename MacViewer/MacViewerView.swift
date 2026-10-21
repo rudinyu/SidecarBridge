@@ -291,6 +291,14 @@ struct MacViewerView: View {
                     onLocalShortcut: { event in
                         presentation.handleLocalShortcut(event)
                             || model.handleHostDesktopShortcut(event)
+                    },
+                    instantCursorEnabled: model.instantCursorEnabled,
+                    isUsingInstantCursor: model.isUsingInstantCursor,
+                    onDisplayCapabilitiesChanged: { pixelWidth, refreshRate in
+                        model.updateViewerDisplayCapabilities(
+                            pixelWidth: pixelWidth,
+                            refreshRate: refreshRate
+                        )
                     }
                 )
             }
@@ -423,6 +431,12 @@ struct MacViewerView: View {
                     ))
                     .toggleStyle(.switch)
                     .font(.caption)
+                    Toggle("Instant cursor", isOn: Binding(
+                        get: { model.instantCursorEnabled },
+                        set: { model.setInstantCursorEnabled($0) }
+                    ))
+                    .font(.caption)
+                    .help("Use this Mac’s pointer for immediate feedback. Turn off to see Host pointer shapes.")
                 }
 
                 Divider()

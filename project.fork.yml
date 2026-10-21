@@ -5,8 +5,8 @@ name: SidecarBridgeFork
 # This overlay is the only project definition used to build the fork apps.
 settings:
   base:
-    MARKETING_VERSION: "1.5"
-    CURRENT_PROJECT_VERSION: "133"
+    MARKETING_VERSION: "1.6"
+    CURRENT_PROJECT_VERSION: "135"
 
 targets:
   SidecarBridgeMac:
@@ -42,8 +42,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.screendock.host
         PRODUCT_NAME: ScreenDock Host
         ASSETCATALOG_COMPILER_APPICON_NAME: ScreenDockAppIcon
-        MARKETING_VERSION: "1.5"
-        CURRENT_PROJECT_VERSION: "133"
+        MARKETING_VERSION: "1.6"
+        CURRENT_PROJECT_VERSION: "135"
         CODE_SIGN_ENTITLEMENTS: Fork/Resources/Host.entitlements
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SIDECARBRIDGE_FORK"
       configs:
@@ -106,8 +106,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.screendock.viewer
         PRODUCT_NAME: ScreenDock Viewer
-        MARKETING_VERSION: "1.5"
-        CURRENT_PROJECT_VERSION: "133"
+        MARKETING_VERSION: "1.6"
+        CURRENT_PROJECT_VERSION: "135"
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SIDECARBRIDGE_FORK"
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_ENTITLEMENTS: MacViewer/SidecarBridgeViewer.entitlements

@@ -365,6 +365,9 @@ final class MacViewerRegressionTests: XCTestCase {
     @MainActor
     func testSuccessfulACKCannotOverrideExplicitPermissionDenial() async throws {
         let (model, peer, _) = try fixture()
+        await awaitViewerChange(model.$isConnected, matching: { $0 }) {
+            peer.onConnectionChanged?(true, "LAN: Test Mac")
+        }
         let denied = expectation(description: "Explicit permission denial")
         let denialObservation = model.$remoteInputAuthorized.dropFirst().sink { if !$0 { denied.fulfill() } }
         peer.onCommand?(ControlMessage(.status, detail: "accessibility-required"))
@@ -384,5 +387,28 @@ final class MacViewerRegressionTests: XCTestCase {
         await fulfillment(of: [restored], timeout: 2)
         grantObservation.cancel()
         XCTAssertTrue(model.remoteInputAuthorized)
+    }
+
+    @MainActor
+    func testDisconnectedPermissionStatusAndLateInputACKCannotAuthorize() async throws {
+        let (model, peer, _) = try fixture()
+        await awaitViewerChange(model.$isConnected, matching: { $0 }) {
+            peer.onConnectionChanged?(true, "LAN: Test Mac")
+        }
+        await awaitViewerChange(model.$isConnected, matching: { !$0 }) {
+            peer.onConnectionChanged?(false, "Test session ended")
+        }
+
+        await awaitViewerChange(model.$status, matching: { $0 == "Connected to Test Mac" }) {
+            peer.onCommand?(ControlMessage(.status, detail: "accessibility-passed"))
+            peer.onCommand?(ControlMessage(.status, detail: "fallback-active"))
+        }
+        XCTAssertFalse(model.remoteInputAuthorized, "A delayed permission grant cannot authorize a disconnected session")
+
+        model.lastInputAccepted = false
+        await awaitViewerChange(model.$lastInputAccepted, matching: { $0 }) {
+            peer.onCommand?(ControlMessage(.status, detail: "input-ack:1:1"))
+        }
+        XCTAssertFalse(model.remoteInputAuthorized, "A delayed successful input ACK cannot grant Accessibility permission")
     }
 }

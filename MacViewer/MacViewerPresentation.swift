@@ -36,12 +36,21 @@ final class MacViewerPresentation: NSObject, ObservableObject {
     private static let controlsKey = "macViewer.controlsVisible"
     private let defaults: UserDefaults
     private weak var window: NSWindow?
+    private let fullScreenDelegateProxy = MacViewerFullScreenDelegateProxy()
     private var controlsBeforeFullScreen: Bool?
+    private var windowedConfiguration: WindowedConfiguration?
+
+    private struct WindowedConfiguration {
+        let hadFullSizeContentView: Bool
+        let titlebarAppearsTransparent: Bool
+        let titleVisibility: NSWindow.TitleVisibility
+    }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         controlsVisible = defaults.object(forKey: Self.controlsKey) as? Bool ?? true
         super.init()
+        fullScreenDelegateProxy.presentation = self
     }
 
     deinit { NotificationCenter.default.removeObserver(self) }
@@ -50,6 +59,10 @@ final class MacViewerPresentation: NSObject, ObservableObject {
         let changedWindow = self.window !== window
         if changedWindow {
             NotificationCenter.default.removeObserver(self)
+            if let previousWindow = self.window {
+                restoreWindowedConfiguration(on: previousWindow)
+                restoreDelegate(on: previousWindow)
+            }
             self.window = window
         }
         setFullScreen(window?.styleMask.contains(.fullScreen) == true)
@@ -60,8 +73,11 @@ final class MacViewerPresentation: NSObject, ObservableObject {
         window.collectionBehavior.remove([.auxiliary, .canJoinAllApplications,
             .fullScreenAuxiliary, .fullScreenNone])
         window.collectionBehavior.insert([.primary, .fullScreenPrimary])
+        installDelegateProxy(on: window)
         // Let AppKit own the green button, including its Option-click/tiling menu.
         guard changedWindow else { return }
+        NotificationCenter.default.addObserver(self, selector: #selector(willEnterFullScreen),
+            name: NSWindow.willEnterFullScreenNotification, object: window)
         NotificationCenter.default.addObserver(self, selector: #selector(didEnterFullScreen),
             name: NSWindow.didEnterFullScreenNotification, object: window)
         NotificationCenter.default.addObserver(self, selector: #selector(didExitFullScreen),
@@ -69,6 +85,11 @@ final class MacViewerPresentation: NSObject, ObservableObject {
     }
 
     func toggleFullScreen() { window?.toggleFullScreen(nil) }
+
+    func reassertWindowDelegate(for window: NSWindow?) {
+        guard let window, self.window === window else { return }
+        installDelegateProxy(on: window)
+    }
 
     func toggleControls() {
         controlsVisible.toggle()
@@ -92,7 +113,19 @@ final class MacViewerPresentation: NSObject, ObservableObject {
     @objc private func didEnterFullScreen(_ notification: Notification) { setFullScreen(true) }
     @objc private func didExitFullScreen(_ notification: Notification) { setFullScreen(false) }
 
+    @objc private func willEnterFullScreen(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, self.window === window else { return }
+        applyFullScreenConfiguration(to: window)
+    }
+
     private func setFullScreen(_ fullScreen: Bool) {
+        if let window {
+            if fullScreen {
+                applyFullScreenConfiguration(to: window)
+            } else {
+                restoreWindowedConfiguration(on: window)
+            }
+        }
         guard fullScreen != isFullScreen else { return }
         isFullScreen = fullScreen
         if fullScreen {
@@ -102,6 +135,99 @@ final class MacViewerPresentation: NSObject, ObservableObject {
             controlsVisible = previous
             controlsBeforeFullScreen = nil
         }
+    }
+
+    private func applyFullScreenConfiguration(to window: NSWindow) {
+        guard windowedConfiguration == nil else { return }
+        windowedConfiguration = WindowedConfiguration(
+            hadFullSizeContentView: window.styleMask.contains(.fullSizeContentView),
+            titlebarAppearsTransparent: window.titlebarAppearsTransparent,
+            titleVisibility: window.titleVisibility
+        )
+
+        // Extend the window's content view beneath the titlebar while in its
+        // fullscreen Space. This removes the titlebar's reserved content area
+        // without changing the windowed layout or any app-wide presentation
+        // options.
+        window.styleMask.insert(.fullSizeContentView)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+    }
+
+    private func restoreWindowedConfiguration(on window: NSWindow) {
+        guard let previous = windowedConfiguration else { return }
+        var styleMask = window.styleMask
+        if previous.hadFullSizeContentView {
+            styleMask.insert(.fullSizeContentView)
+        } else {
+            styleMask.remove(.fullSizeContentView)
+        }
+        window.styleMask = styleMask
+        window.titlebarAppearsTransparent = previous.titlebarAppearsTransparent
+        window.titleVisibility = previous.titleVisibility
+        windowedConfiguration = nil
+    }
+
+    private func installDelegateProxy(on window: NSWindow) {
+        guard window.delegate !== fullScreenDelegateProxy else { return }
+        fullScreenDelegateProxy.forwardingDelegate = window.delegate
+        window.delegate = fullScreenDelegateProxy
+    }
+
+    private func restoreDelegate(on window: NSWindow) {
+        if window.delegate === fullScreenDelegateProxy {
+            window.delegate = fullScreenDelegateProxy.forwardingDelegate
+        }
+        fullScreenDelegateProxy.forwardingDelegate = nil
+    }
+
+    fileprivate func fullScreenEntryFailed(for window: NSWindow) {
+        guard self.window === window else { return }
+        restoreWindowedConfiguration(on: window)
+        if isFullScreen {
+            isFullScreen = false
+            if let previous = controlsBeforeFullScreen {
+                controlsVisible = previous
+                controlsBeforeFullScreen = nil
+            }
+        }
+    }
+}
+
+/// Adds the per-window fullscreen presentation callback while forwarding every
+/// other NSWindowDelegate message to SwiftUI's existing delegate.
+@MainActor
+private final class MacViewerFullScreenDelegateProxy: NSObject, NSWindowDelegate {
+    weak var presentation: MacViewerPresentation?
+    var forwardingDelegate: NSWindowDelegate?
+
+    func window(
+        _ window: NSWindow,
+        willUseFullScreenPresentationOptions proposedOptions: NSApplication.PresentationOptions
+    ) -> NSApplication.PresentationOptions {
+        var options = forwardingDelegate?.window?(
+            window,
+            willUseFullScreenPresentationOptions: proposedOptions
+        ) ?? proposedOptions
+        options.subtract([.hideMenuBar, .hideDock])
+        options.insert([.autoHideMenuBar, .autoHideDock])
+        return options
+    }
+
+    func windowDidFailToEnterFullScreen(_ window: NSWindow) {
+        forwardingDelegate?.windowDidFailToEnterFullScreen?(window)
+        presentation?.fullScreenEntryFailed(for: window)
+    }
+
+    override func responds(to aSelector: Selector!) -> Bool {
+        super.responds(to: aSelector) || forwardingDelegate?.responds(to: aSelector) == true
+    }
+
+    override func forwardingTarget(for aSelector: Selector!) -> Any? {
+        if let forwardingDelegate, forwardingDelegate.responds(to: aSelector) {
+            return forwardingDelegate
+        }
+        return super.forwardingTarget(for: aSelector)
     }
 }
 
@@ -123,7 +249,9 @@ struct MacViewerWindowBridge: NSViewRepresentable {
         WindowObserverView(presentation: presentation)
     }
 
-    func updateNSView(_ nsView: WindowObserverView, context: Context) {}
+    func updateNSView(_ nsView: WindowObserverView, context: Context) {
+        presentation.reassertWindowDelegate(for: nsView.window)
+    }
 
     final class WindowObserverView: NSView {
         let presentation: MacViewerPresentation

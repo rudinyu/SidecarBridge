@@ -20,7 +20,7 @@ final class MacPeerService: NSObject {
         let data: Data
     }
 
-    var onCommand: ((ControlMessage, @escaping InputAcknowledgementSender) -> Void)?
+    var onCommand: ((ControlMessage, @escaping InputAcknowledgementSender, @escaping () -> Bool) -> Void)?
     var onInput: ((RemoteInputEvent, @escaping InputAcknowledgementSender) -> Void)?
     var onFilePacket: ((FileTransferPacket) -> Void)?
     var onKeyFrameNeeded: (() -> Void)?
@@ -91,8 +91,12 @@ final class MacPeerService: NSObject {
         )
         super.init()
         session.delegate = self
-        lan.onCommand = { [weak self] command, acknowledgementSender in
-            self?.route(command, acknowledgementSender: acknowledgementSender)
+        lan.onCommand = { [weak self] command, acknowledgementSender, originIsCurrent in
+            self?.route(
+                command,
+                acknowledgementSender: acknowledgementSender,
+                originIsCurrent: originIsCurrent
+            )
         }
         lan.onInput = { [weak self] input, acknowledgementSender in
             self?.dispatchInput(input, acknowledgementSender: acknowledgementSender)
@@ -376,14 +380,16 @@ final class MacPeerService: NSObject {
 
     private func route(
         _ command: ControlMessage,
-        acknowledgementSender: @escaping InputAcknowledgementSender
+        acknowledgementSender: @escaping InputAcknowledgementSender,
+        originIsCurrent: @escaping () -> Bool
     ) {
+        guard originIsCurrent() else { return }
         notePeerActivity()
         if command.kind == .hello, command.detail == "video-ack", mcConnected {
             // Only enable this gate for Multipeer. Direct LAN has its own
             // contentProcessed pacing and ignores the acknowledgement.
             mcVideoQueue.async { [weak self] in
-                guard let self, self.mcConnected else { return }
+                guard let self, originIsCurrent(), self.mcConnected else { return }
                 self.mcVideoAcknowledgementsEnabled = true
                 self.sendNextMCVideoIfPossible()
             }
@@ -392,7 +398,7 @@ final class MacPeerService: NSObject {
         guard command.kind == .status,
               let detail = command.detail,
               detail.hasPrefix("heartbeat-") else {
-            onCommand?(command, acknowledgementSender)
+            onCommand?(command, acknowledgementSender, originIsCurrent)
             return
         }
         if detail.hasPrefix("heartbeat-ping:") {
@@ -444,6 +450,25 @@ final class MacPeerService: NSObject {
                     }
                 }
             }
+        }
+    }
+
+    private func isCurrentMultipeerControlOrigin(
+        session originSession: MCSession,
+        peerID originPeerID: MCPeerID,
+        secureSession originSecureSession: SecurePacketSession,
+        authorizationToken: UUID
+    ) -> Bool {
+        MainQueueExecutor.sync {
+            guard AuthorizationGeneration.shared.token == authorizationToken,
+                  originSession === self.session,
+                  self.mcConnected,
+                  self.mcAuthorizationToken == authorizationToken,
+                  let activePeerID = self.mcPeerID,
+                  activePeerID == originPeerID,
+                  originSession.connectedPeers.contains(originPeerID),
+                  self.mcSecureSession === originSecureSession else { return false }
+            return true
         }
     }
 
@@ -935,10 +960,24 @@ extension MacPeerService: MCSessionDelegate {
                     dispatchInput(input, acknowledgementSender: acknowledgementSender)
                 }
             } else {
-                DispatchQueue.main.async {
-                    guard session === self.session else { return }
+                let originIsCurrent: () -> Bool = { [weak self] in
+                    guard let self else { return false }
+                    return self.isCurrentMultipeerControlOrigin(
+                        session: session,
+                        peerID: peerID,
+                        secureSession: originSecureSession,
+                        authorizationToken: generation
+                    )
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, originIsCurrent() else { return }
                     AuthorizationGeneration.shared.perform(ifCurrent: generation) {
-                        self.route(command, acknowledgementSender: acknowledgementSender)
+                        guard originIsCurrent() else { return }
+                        self.route(
+                            command,
+                            acknowledgementSender: acknowledgementSender,
+                            originIsCurrent: originIsCurrent
+                        )
                     }
                 }
             }

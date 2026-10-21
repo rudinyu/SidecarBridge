@@ -422,6 +422,125 @@ final class MacViewerConnectionTests: XCTestCase {
     }
 
     @MainActor
+    func testInstantCursorWaitsForAuthenticatedAppliedAcknowledgementAndResets() async throws {
+        let f = try makeViewerFixture()
+        XCTAssertTrue(f.model.instantCursorEnabled)
+        XCTAssertFalse(f.model.isUsingInstantCursor)
+
+        await awaitViewerChange(f.model.$isConnected, matching: { $0 }) {
+            f.peer.onConnectionChanged?(true, "LAN: Test Mac")
+        }
+        XCTAssertFalse(f.peer.messages.contains {
+            ViewerCursorFeedbackCapability.parseRequest($0.detail ?? "") != nil
+        }, "Cursor negotiation must wait for the Host's remote-input authorization status")
+
+        await awaitViewerChange(f.model.$remoteInputAuthorized, matching: { $0 }) {
+            f.peer.onCommand?(ControlMessage(.status, detail: "accessibility-passed"))
+        }
+        let enableRequest = try XCTUnwrap(f.peer.messages.reversed().compactMap {
+            ViewerCursorFeedbackCapability.parseRequest($0.detail ?? "")
+        }.first)
+        XCTAssertTrue(enableRequest.enabled)
+        XCTAssertFalse(f.model.isUsingInstantCursor, "The Viewer must retain the captured Host pointer until the apply ACK")
+
+        let staleID = UUID()
+        await awaitViewerChange(f.model.$status, matching: { $0 == "Connected to Test Mac" }) {
+            f.peer.onCommand?(ControlMessage(.status, detail: ViewerCursorFeedbackCapability.acknowledgementDetail(
+                id: staleID,
+                enabled: true
+            )))
+            f.peer.onCommand?(ControlMessage(.status, detail: "fallback-active"))
+        }
+        XCTAssertFalse(f.model.isUsingInstantCursor, "An unrelated ACK must not switch cursor modes")
+
+        await awaitViewerChange(f.model.$isUsingInstantCursor, matching: { $0 }) {
+            f.peer.onCommand?(ControlMessage(.status, detail: ViewerCursorFeedbackCapability.acknowledgementDetail(
+                id: enableRequest.id,
+                enabled: true
+            )))
+        }
+
+        f.model.setInstantCursorEnabled(false)
+        XCTAssertEqual(f.defaults.object(forKey: "macViewer.instantCursorEnabled") as? Bool, false)
+        let disableRequest = try XCTUnwrap(f.peer.messages.reversed().compactMap {
+            ViewerCursorFeedbackCapability.parseRequest($0.detail ?? "")
+        }.first)
+        XCTAssertFalse(disableRequest.enabled)
+        XCTAssertTrue(f.model.isUsingInstantCursor, "Keep the native pointer until the Host confirms cursor restoration")
+
+        await awaitViewerChange(f.model.$status, matching: { $0 == "Connected to Test Mac" }) {
+            f.peer.onCommand?(ControlMessage(.status, detail: ViewerCursorFeedbackCapability.acknowledgementDetail(
+                id: staleID,
+                enabled: false
+            )))
+            f.peer.onCommand?(ControlMessage(.status, detail: "fallback-active"))
+        }
+        XCTAssertTrue(f.model.isUsingInstantCursor, "A prior enable ACK must not defeat the pending opt-out")
+
+        await awaitViewerChange(f.model.$isUsingInstantCursor, matching: { !$0 }) {
+            f.peer.onCommand?(ControlMessage(.status, detail: ViewerCursorFeedbackCapability.acknowledgementDetail(
+                id: disableRequest.id,
+                enabled: false
+            )))
+        }
+
+        await awaitViewerChange(f.model.$isConnected, matching: { !$0 }) {
+            f.peer.onConnectionChanged?(false, "Test session ended")
+        }
+        XCTAssertFalse(f.model.isUsingInstantCursor)
+        await awaitViewerChange(f.model.$status, matching: { $0 == "Connected to Test Mac" }) {
+            f.peer.onCommand?(ControlMessage(.status, detail: ViewerCursorFeedbackCapability.acknowledgementDetail(
+                id: enableRequest.id,
+                enabled: true
+            )))
+            f.peer.onCommand?(ControlMessage(.status, detail: "fallback-active"))
+        }
+        XCTAssertFalse(f.model.isUsingInstantCursor, "A closed session must ignore its delayed cursor ACK")
+
+        await awaitViewerChange(f.model.$isConnected, matching: { $0 }) {
+            f.peer.onConnectionChanged?(true, "LAN: Test Mac")
+        }
+        await awaitViewerChange(f.model.$status, matching: { $0 == "Connected to Test Mac" }) {
+            f.peer.onCommand?(ControlMessage(.status, detail: ViewerCursorFeedbackCapability.acknowledgementDetail(
+                id: enableRequest.id,
+                enabled: true
+            )))
+            f.peer.onCommand?(ControlMessage(.status, detail: "fallback-active"))
+        }
+        XCTAssertFalse(f.model.isUsingInstantCursor, "A prior session's ACK must not enable feedback after reconnect")
+
+        let reloaded = MacViewerConnectionModel(
+            peers: ViewerPeerStub(),
+            pasteboard: f.pasteboard,
+            receiveDirectory: f.receiveDirectory,
+            defaults: f.defaults
+        )
+        XCTAssertFalse(reloaded.instantCursorEnabled, "The opt-out preference should persist")
+        XCTAssertFalse(reloaded.isUsingInstantCursor)
+    }
+
+    @MainActor
+    func testViewerDisplayCapabilitiesAreBoundedAndRefreshWhileConnected() async throws {
+        let f = try makeViewerFixture()
+        f.model.updateViewerDisplayCapabilities(pixelWidth: 100, refreshRate: 1)
+        await awaitViewerChange(f.model.$isConnected, matching: { $0 }) {
+            f.peer.onConnectionChanged?(true, "LAN: Test Mac")
+        }
+
+        XCTAssertTrue(f.peer.messages.contains(ControlMessage(.hello, detail: "display-width:960")))
+        XCTAssertTrue(f.peer.messages.contains(ControlMessage(
+            .hello,
+            detail: "viewer-refresh-rate:\(StreamCadencePolicy.minimumLiveFrameRate)"
+        )))
+
+        f.model.updateViewerDisplayCapabilities(pixelWidth: 20_000, refreshRate: 500)
+        XCTAssertEqual(Array(f.peer.messages.suffix(2)), [
+            ControlMessage(.hello, detail: "display-width:7680"),
+            ControlMessage(.hello, detail: "viewer-refresh-rate:240")
+        ])
+    }
+
+    @MainActor
     func testConnectionLossClearsVideoAndLinkMetrics() async throws {
         let f = try makeViewerFixture()
         let view = MacViewerVideoView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))

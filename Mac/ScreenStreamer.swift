@@ -87,7 +87,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             lock.unlock()
         }
 
-        private func beginApply(
+        func reserveApply(
             stream: StreamReference,
             configuration: SCStreamConfiguration
         ) throws -> Task<Bool, Never> {
@@ -120,7 +120,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             stream: StreamReference,
             configuration: SCStreamConfiguration
         ) async throws {
-            let operation = try beginApply(
+            let operation = try reserveApply(
                 stream: stream,
                 configuration: configuration
             )
@@ -182,6 +182,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     var onCaptureRefreshFailed: ((Error) -> Void)?
     var onMemoryPressureChanged: ((StreamMemoryPressureLevel) -> Void)?
     var onCaptureStarted: ((UInt64) -> Void)?
+    var onViewerCursorFeedbackConfigurationApplied: ((UInt64, UInt64?, Bool) -> Void)?
     var onFirstEncodedFrame: ((UInt64) -> Void)?
     var onCaptureSourceStopped: ((UInt64, String, Int) -> Void)?
     var onCaptureSourceUnavailable: ((UInt64, String) -> Void)?
@@ -245,6 +246,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var memoryPressureTransitionWorkItem: DispatchWorkItem?
     private var lastMemoryPressureApplyUptime: TimeInterval = 0
     private let configurationScheduler = StreamConfigurationScheduler()
+    private let cursorVisibilityLock = NSLock()
+    private var capturesHostCursor = true
+    private var cursorVisibilityGeneration: UInt64 = 0
     private var foregroundRefreshTask: Task<Void, Never>?
 #if SIDECARBRIDGE_FORK
     private var foregroundRefreshDeadlineTask: Task<Void, Never>?
@@ -418,6 +422,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private func markCaptureStarted(
         _ stream: SCStream,
         generation: UInt64,
+        cursorModeGeneration: UInt64,
+        cursorModeEnabled: Bool,
         completion: StartCompletionGate
     ) -> Bool {
         let didStart = onCaptureQueueSync {
@@ -436,6 +442,19 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
         guard didStart else { return false }
         captureLogger.notice("capture source started generation=\(generation, privacy: .public)")
+        reportCursorFeedbackConfigurationApplied(
+            modeGeneration: cursorModeGeneration,
+            captureGeneration: generation,
+            cursorModeEnabled: cursorModeEnabled,
+            stream: stream
+        )
+        let currentCursorMode = cursorCaptureModeSnapshot()
+        if currentCursorMode.generation != cursorModeGeneration {
+            // A preference change can arrive while ScreenCaptureKit is
+            // starting or replacing the source. Apply it only after start
+            // completes, then acknowledge that applied configuration.
+            scheduleViewerCursorFeedbackConfiguration(for: stream, generation: generation)
+        }
         onCaptureStarted?(generation)
         return true
     }
@@ -732,8 +751,14 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         onFrame?(frame)
     }
 
-    func setPreferredWidth(_ width: Int) {
-        preferredWidth = min(max(width, 1440), 3840)
+    @discardableResult
+    func setPreferredWidth(_ width: Int) -> Bool {
+        let safeWidth = min(max(width, 960), 3840)
+        return onCaptureQueueSync {
+            guard preferredWidth != safeWidth else { return false }
+            preferredWidth = safeWidth
+            return true
+        }
     }
 
     func setStreamPreferences(_ preferences: StreamPreferences) {
@@ -758,16 +783,41 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             return
         }
 
-        guard let (stream, _) = activeStreamSnapshot() else { return }
-        let configuration = makeConfiguration(
-            width: captureWidth,
-            height: captureHeight,
-            frameRate: activeFrameRate
-        )
-        let reference = StreamReference(stream)
-        try await configurationScheduler.apply(
-            stream: reference,
-            configuration: configuration
+        let reservation = try onCaptureQueueSync { () throws -> (
+            reference: StreamReference,
+            captureGeneration: UInt64,
+            cursorModeGeneration: UInt64,
+            cursorModeEnabled: Bool,
+            operation: Task<Bool, Never>
+        )? in
+            guard let activeSnapshot = activeStreamSnapshot() else { return nil }
+            let configuration = makeConfiguration(
+                width: captureWidth,
+                height: captureHeight,
+                frameRate: activeFrameRate
+            )
+            let reference = StreamReference(activeSnapshot.stream)
+            let operation = try configurationScheduler.reserveApply(
+                stream: reference,
+                configuration: configuration.configuration
+            )
+            return (
+                reference,
+                activeSnapshot.generation,
+                configuration.cursorModeGeneration,
+                configuration.cursorModeEnabled,
+                operation
+            )
+        }
+        guard let reservation else { return }
+        guard await reservation.operation.value else {
+            throw StreamError.configurationUpdateFailed
+        }
+        reportCursorFeedbackConfigurationApplied(
+            modeGeneration: reservation.cursorModeGeneration,
+            captureGeneration: reservation.captureGeneration,
+            cursorModeEnabled: reservation.cursorModeEnabled,
+            stream: reservation.reference.stream
         )
         captureQueue.sync { encoder.requestKeyFrame() }
     }
@@ -810,6 +860,96 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         guard viewerRefreshRate != safeRefreshRate else { return }
         viewerRefreshRate = safeRefreshRate
         updateActiveFrameRate()
+    }
+
+    /// Hides the captured Host cursor only while an authenticated Viewer has
+    /// requested immediate local pointer feedback. The desired value is kept
+    /// for the next capture start; an active stream is acknowledged only once
+    /// ScreenCaptureKit accepts the matching configuration.
+    @discardableResult
+    func setViewerLocalCursorFeedbackEnabled(_ enabled: Bool) -> UInt64 {
+        cursorVisibilityLock.lock()
+        capturesHostCursor = !enabled
+        cursorVisibilityGeneration &+= 1
+        let modeGeneration = cursorVisibilityGeneration
+        cursorVisibilityLock.unlock()
+
+        let captureIsRefreshing = isRefreshingCapture
+        let canAcknowledgeWithoutStream = onCaptureQueueSync { () -> Bool in
+            captureStateLock.lock()
+            let captureIsStarting = captureStartInProgress
+            captureStateLock.unlock()
+
+            guard !captureIsStarting, !captureIsRefreshing else { return false }
+            guard let activeSnapshot = activeStreamSnapshot() else { return true }
+            guard captureWidth > 0, captureHeight > 0 else { return false }
+            let configuration = makeConfiguration(
+                width: captureWidth,
+                height: captureHeight,
+                frameRate: activeFrameRate
+            )
+            scheduleCursorConfiguration(
+                configuration,
+                stream: activeSnapshot.stream,
+                generation: activeSnapshot.generation
+            )
+            return false
+        }
+
+        if canAcknowledgeWithoutStream {
+            reportCursorFeedbackConfigurationApplied(
+                modeGeneration: modeGeneration,
+                captureGeneration: nil,
+                cursorModeEnabled: enabled,
+                stream: nil
+            )
+        }
+        return modeGeneration
+    }
+
+    /// Reserve the ScreenCaptureKit update synchronously on captureQueue so
+    /// concurrent capability and cadence changes cannot submit stale cursor
+    /// configurations out of order.
+    private func scheduleCursorConfiguration(
+        _ configuration: (configuration: SCStreamConfiguration, cursorModeGeneration: UInt64, cursorModeEnabled: Bool),
+        stream: SCStream,
+        generation: UInt64
+    ) {
+        let reference = StreamReference(stream)
+        let modeGeneration = configuration.cursorModeGeneration
+        let modeEnabled = configuration.cursorModeEnabled
+        configurationScheduler.schedule(
+            stream: reference,
+            configuration: configuration.configuration
+        ) { [weak self, reference] in
+            guard let self else { return }
+            self.reportCursorFeedbackConfigurationApplied(
+                modeGeneration: modeGeneration,
+                captureGeneration: generation,
+                cursorModeEnabled: modeEnabled,
+                stream: reference.stream
+            )
+            self.captureQueue.async { [weak self, reference] in
+                guard let self,
+                      self.activeGeneration(for: reference.stream) == generation else { return }
+                self.encoder.requestKeyFrame()
+            }
+        }
+    }
+
+    private func scheduleViewerCursorFeedbackConfiguration(for stream: SCStream, generation: UInt64) {
+        onCaptureQueueSync {
+            guard !captureStartInProgress,
+                  activeGeneration(for: stream) == generation,
+                  captureWidth > 0,
+                  captureHeight > 0 else { return }
+            let configuration = makeConfiguration(
+                width: captureWidth,
+                height: captureHeight,
+                frameRate: activeFrameRate
+            )
+            scheduleCursorConfiguration(configuration, stream: stream, generation: generation)
+        }
     }
 
     /// Lets the sender throttle capture when its bounded network window is
@@ -1079,7 +1219,11 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                                                        scale: CGFloat(filter.pointPixelScale))
         let displayWidth = source.width > 0 ? Int(source.width) : display.width
         let displayHeight = source.height > 0 ? Int(source.height) : display.height
-        let stream = try onCaptureQueueSync { () throws -> SCStream in
+        let captureStart = try onCaptureQueueSync { () throws -> (
+            stream: SCStream,
+            cursorModeGeneration: UInt64,
+            cursorModeEnabled: Bool
+        ) in
             guard isCurrentStart(generation) else { throw CancellationError() }
             captureDisplayID = display.displayID
             displayRefreshRate = Self.refreshRate(for: display.displayID)
@@ -1112,10 +1256,12 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             // makes the viewer look smooth while adding avoidable end-to-end
             // latency when the link is busy.
             configuration.queueDepth = StreamCadencePolicy.captureQueueDepth(for: activeFrameRate)
-            // Capture the real Mac cursor. The iPad viewer deliberately does not
-            // draw a second software cursor, so the pointer users see is the one
-            // that WindowServer actually moved after a remote input event.
-            configuration.showsCursor = true
+            // Stock peers keep the captured Host cursor. A negotiated Mac
+            // Viewer can instead draw its native pointer after this mode is
+            // applied; the authenticated session resets this preference on
+            // disconnect.
+            let cursorMode = cursorCaptureModeSnapshot()
+            configuration.showsCursor = cursorMode.capturesHostCursor
             configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
             configuration.colorSpaceName = CGColorSpace.sRGB
 
@@ -1142,15 +1288,22 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             guard install(stream, generation: generation) else {
                 throw CancellationError()
             }
-            return stream
+            return (stream, cursorMode.generation, !cursorMode.capturesHostCursor)
         }
+        let stream = captureStart.stream
         do {
             try await stream.startCapture()
         } catch {
             throw error
         }
         guard !Task.isCancelled,
-              markCaptureStarted(stream, generation: generation, completion: completion) else {
+              markCaptureStarted(
+                stream,
+                generation: generation,
+                cursorModeGeneration: captureStart.cursorModeGeneration,
+                cursorModeEnabled: captureStart.cursorModeEnabled,
+                completion: completion
+              ) else {
             Task { try? await stream.stopCapture() }
             throw CancellationError()
         }
@@ -1169,16 +1322,25 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         return (width, height)
     }
 
-    private func makeConfiguration(width: Int, height: Int, frameRate: Int) -> SCStreamConfiguration {
+    private func makeConfiguration(
+        width: Int,
+        height: Int,
+        frameRate: Int
+    ) -> (
+        configuration: SCStreamConfiguration,
+        cursorModeGeneration: UInt64,
+        cursorModeEnabled: Bool
+    ) {
         let configuration = SCStreamConfiguration()
         configuration.width = width
         configuration.height = height
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(frameRate))
         configuration.queueDepth = StreamCadencePolicy.captureQueueDepth(for: frameRate)
-        configuration.showsCursor = true
+        let cursorMode = cursorCaptureModeSnapshot()
+        configuration.showsCursor = cursorMode.capturesHostCursor
         configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         configuration.colorSpaceName = CGColorSpace.sRGB
-        return configuration
+        return (configuration, cursorMode.generation, !cursorMode.capturesHostCursor)
     }
 
     func stop() {
@@ -1332,12 +1494,20 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             height: captureHeight,
             frameRate: activeFrameRate
         )
+        let cursorModeGeneration = configuration.cursorModeGeneration
+        let cursorModeEnabled = configuration.cursorModeEnabled
         let reference = StreamReference(activeStream)
         configurationScheduler.schedule(
             stream: reference,
-            configuration: configuration
+            configuration: configuration.configuration
         ) { [weak self, reference] in
             guard let self else { return }
+            self.reportCursorFeedbackConfigurationApplied(
+                modeGeneration: cursorModeGeneration,
+                captureGeneration: generation,
+                cursorModeEnabled: cursorModeEnabled,
+                stream: reference.stream
+            )
             self.captureQueue.async { [weak self, reference] in
                 guard let self,
                       self.activeGeneration(for: reference.stream) == generation else { return }
@@ -1353,6 +1523,47 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             isNearby: transportProfile == .nearbyP2P,
             memory: memoryPressureLevel, backpressure: transportBackpressure
         )
+    }
+
+    private func cursorCaptureModeSnapshot() -> (capturesHostCursor: Bool, generation: UInt64) {
+        cursorVisibilityLock.lock()
+        defer { cursorVisibilityLock.unlock() }
+        return (capturesHostCursor, cursorVisibilityGeneration)
+    }
+
+    private func reportCursorFeedbackConfigurationApplied(
+        modeGeneration: UInt64,
+        captureGeneration: UInt64?,
+        cursorModeEnabled: Bool,
+        stream: SCStream?
+    ) {
+        let mode = cursorCaptureModeSnapshot()
+        guard mode.generation == modeGeneration,
+              mode.capturesHostCursor == !cursorModeEnabled else { return }
+        if let captureGeneration, let stream {
+            guard activeGeneration(for: stream) == captureGeneration else { return }
+            let captureIsStarting = onCaptureQueueSync {
+                captureStateLock.lock()
+                defer { captureStateLock.unlock() }
+                return captureStartInProgress
+            }
+            guard !captureIsStarting else { return }
+        } else {
+            guard !hasActiveStream() else { return }
+            let captureIsStarting = onCaptureQueueSync {
+                captureStateLock.lock()
+                defer { captureStateLock.unlock() }
+                return captureStartInProgress
+            }
+            guard !captureIsStarting else { return }
+        }
+        onViewerCursorFeedbackConfigurationApplied?(modeGeneration, captureGeneration, cursorModeEnabled)
+    }
+
+    private func hasActiveStream() -> Bool {
+        captureStateLock.lock()
+        defer { captureStateLock.unlock() }
+        return stream != nil && activeCaptureGeneration != nil
     }
 
     private static func refreshRate(for displayID: CGDirectDisplayID) -> Int {

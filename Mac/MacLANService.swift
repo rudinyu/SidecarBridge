@@ -23,7 +23,7 @@ struct MacVideoSendTelemetry: Equatable {
 }
 
 final class MacLANService {
-    var onCommand: ((ControlMessage, @escaping InputAcknowledgementSender) -> Void)?
+    var onCommand: ((ControlMessage, @escaping InputAcknowledgementSender, @escaping () -> Bool) -> Void)?
     var onInput: ((RemoteInputEvent, @escaping InputAcknowledgementSender) -> Void)?
     var onFilePacket: ((FileTransferPacket) -> Void)?
     var onKeyFrameNeeded: (() -> Void)?
@@ -101,14 +101,36 @@ final class MacLANService {
             self.remoteHostKey = remoteHostKey
         }
     }
+    private final class ControlOrigin {
+        let candidate: Candidate
+        let peerIdentity: BridgePeerIdentity
+        let connection: NWConnection
+        let secureSession: SecurePacketSession
+        let authorizationToken: UUID
+
+        init(
+            candidate: Candidate,
+            peerIdentity: BridgePeerIdentity,
+            secureSession: SecurePacketSession
+        ) {
+            self.candidate = candidate
+            self.peerIdentity = peerIdentity
+            self.connection = candidate.connection
+            self.secureSession = secureSession
+            self.authorizationToken = candidate.authorizationToken
+        }
+    }
     private var candidates: [ObjectIdentifier: Candidate] = [:]
     private var activeCandidate: Candidate?
+    private let controlOriginLock = NSLock()
+    private var activeControlOrigin: ControlOrigin?
     private let maximumPendingCandidates = 8
     private struct PendingVideo {
         let sequence: UInt64
         let frameRate: Int
         let isKeyFrame: Bool
         let packet: Data
+        let queuedAt: TimeInterval
     }
 
     private var sendingFrame = false
@@ -120,6 +142,7 @@ final class MacLANService {
     // time and old frames cannot accumulate latency.
     private var currentVideoFrameRate = 60
     private var inFlightVideoSequences = Set<UInt64>()
+    private var inFlightVideoSentAt: [UInt64: TimeInterval] = [:]
     private var videoWatchdogs: [UInt64: DispatchWorkItem] = [:]
     private var lastVideoProgressUptime = ProcessInfo.processInfo.systemUptime
     private var videoRecoveryInProgress = false
@@ -133,10 +156,10 @@ final class MacLANService {
     private var inFlightVideoBytes = 0
     // Direct LAN uses Network.framework's send completion for pacing, but
     // that completion only describes the Mac socket. Keep the latest
-    // sequence the iPad actually accepted at the display boundary so a
-    // decoder backlog can lower Ultra cadence before it starts dropping a
-    // whole GOP.
+    // sequence the Viewer submitted to AVFoundation so receiver submission
+    // backlog can lower bitrate before the sender starts dropping a GOP.
     private var lastDisplayedVideoSequence: UInt64?
+    private var lastDisplayedVideoAckUptime: TimeInterval?
     private var latestSubmittedVideoSequence: UInt64?
     // Count and byte limits work together: count keeps the queue responsive
     // at 60/120 FPS, while the byte ceiling prevents a large text-heavy IDR
@@ -150,6 +173,8 @@ final class MacLANService {
     private let maximumVideoBufferedBytes = 12 * 1024 * 1024
     private var videoBackpressureLevel: StreamBackpressureLevel = .normal
     private var videoBackpressureClearWorkItem: DispatchWorkItem?
+    private var videoBackpressureClearToken: UUID?
+    private var videoBackpressureSampleWorkItem: DispatchWorkItem?
     private var videoTelemetryTimer: DispatchSourceTimer?
 
     private var pendingVideoCount: Int {
@@ -275,7 +300,8 @@ final class MacLANService {
                     sequence: frame.sequence,
                     frameRate: frame.frameRate,
                     isKeyFrame: frame.isKeyFrame,
-                    packet: data
+                    packet: data,
+                    queuedAt: ProcessInfo.processInfo.systemUptime
                 ))
             }
         }
@@ -284,36 +310,18 @@ final class MacLANService {
     func acknowledgeVideo(sequence: UInt64) {
         // Direct Network.framework delivery is still paced by
         // `contentProcessed`; this feedback never gates an individual send.
-        // It only reports whether the iPad's decoder/display is falling
-        // behind, allowing Ultra to step down before dependent P-frames are
-        // discarded. This avoids the old stop-and-wait ACK behaviour that
-        // limited otherwise healthy local links to a few FPS.
+        // It only reports cumulative Viewer submission progress, allowing the
+        // sender to step down before dependent P-frames are discarded. This
+        // avoids the old stop-and-wait ACK behaviour that limited otherwise
+        // healthy local links to a few FPS.
         queue.async { [weak self] in
             guard let self, self.isConnected else { return }
             guard self.lastDisplayedVideoSequence == nil
                     || sequence > self.lastDisplayedVideoSequence! else { return }
             self.lastDisplayedVideoSequence = sequence
-            let senderWindow = StreamCadencePolicy.senderInFlightWindow(for: self.currentVideoFrameRate)
-            let unacknowledged = self.inFlightVideoSequences.reduce(into: 0) { count, value in
-                if value > sequence { count += 1 }
-            }
-            let sequenceLag = self.latestSubmittedVideoSequence.map { latest in
-                Int(min(latest > sequence ? latest - sequence : 0, UInt64(Int.max)))
-            } ?? 0
-            // `contentProcessed` may already have removed every frame from
-            // the local in-flight set while the iPad is still decoding. The
-            // cumulative sequence lag is therefore the authoritative remote
-            // display backlog; local pending/in-flight work is added as a
-            // second signal for a congested sender.
-            let outstanding = max(sequenceLag, self.pendingVideoCount + unacknowledged)
-            let highWater = max(8, senderWindow * 2)
-            if outstanding >= highWater {
-                self.videoBackpressureClearWorkItem?.cancel()
-                self.videoBackpressureClearWorkItem = nil
-                self.setVideoBackpressure(.constrained)
-            } else if outstanding <= max(1, senderWindow / 2) {
-                self.scheduleVideoBackpressureClear()
-            }
+            self.lastDisplayedVideoAckUptime = ProcessInfo.processInfo.systemUptime
+            self.updateVideoBackpressureFromQueue()
+            self.scheduleVideoBackpressureSampleIfNeeded()
         }
     }
 
@@ -621,15 +629,24 @@ final class MacLANService {
         case .control(let command):
             guard candidate.isAuthenticated,
                   connection === candidate.connection else { return }
+            guard let origin = currentControlOrigin(),
+                  origin.candidate === candidate,
+                  origin.connection === candidate.connection,
+                  origin.secureSession === secureSession else { return }
             let acknowledgementSender = inputAcknowledgementSender(for: candidate)
             if let input = command.remoteInputEvent {
                 AuthorizationGeneration.shared.perform(ifCurrent: candidate.authorizationToken) {
                     onInput?(input, acknowledgementSender)
                 }
             } else {
-                DispatchQueue.main.async {
-                    AuthorizationGeneration.shared.perform(ifCurrent: candidate.authorizationToken) {
-                        self.onCommand?(command, acknowledgementSender)
+                let originIsCurrent: () -> Bool = { [weak self] in
+                    self?.isCurrentControlOrigin(origin) ?? false
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    AuthorizationGeneration.shared.perform(ifCurrent: origin.authorizationToken) {
+                        guard originIsCurrent() else { return }
+                        self.onCommand?(command, acknowledgementSender, originIsCurrent)
                     }
                 }
             }
@@ -749,6 +766,12 @@ final class MacLANService {
                         return
                     }
                     guard result.accepted else { return }
+                    guard let secureSession = candidate.secureSession,
+                          let peerIdentity = candidate.pendingIdentity else {
+                        candidate.connection.cancel()
+                        self.clear(candidate, error: "Authenticated LAN session is incomplete.")
+                        return
+                    }
                     candidate.timeoutWorkItem?.cancel()
                     candidate.timeoutWorkItem = nil
                     self.cancelAllCandidates(except: candidate)
@@ -757,6 +780,11 @@ final class MacLANService {
                     self.secureSession = candidate.secureSession
                     self.activeCandidate = candidate
                     self.isConnected = true
+                    self.setActiveControlOrigin(ControlOrigin(
+                        candidate: candidate,
+                        peerIdentity: peerIdentity,
+                        secureSession: secureSession
+                    ))
                     self.startVideoTelemetryTimer()
                     self.notify(connected: true, value: "LAN:\(identity.deviceName)")
                 }
@@ -878,8 +906,9 @@ final class MacLANService {
             let highWaterBytes = maximumVideoBufferedBytes * 3 / 4
             let highWaterFrames = StreamCadencePolicy.senderPendingWindow(for: currentVideoFrameRate) * 2
             if projectedBytes >= highWaterBytes || pendingVideoCount >= highWaterFrames {
-                setVideoBackpressure(.constrained)
+                updateVideoBackpressureFromQueue()
             }
+            scheduleVideoBackpressureSampleIfNeeded()
             sendNextVideoIfPossible()
         } else {
             // Keep the already-ordered burst and stop admitting new P-frames
@@ -934,6 +963,7 @@ final class MacLANService {
                     videoRecoveryInProgress = false
                 }
                 inFlightVideoSequences.insert(video.sequence)
+                inFlightVideoSentAt[video.sequence] = ProcessInfo.processInfo.systemUptime
                 latestSubmittedVideoSequence = video.sequence
                 inFlightVideoBytes += data.count
                 videoTelemetrySubmittedFrames += 1
@@ -947,6 +977,7 @@ final class MacLANService {
                         } else {
                             self.videoWatchdogs.removeValue(forKey: video.sequence)?.cancel()
                             self.inFlightVideoSequences.remove(video.sequence)
+                            self.inFlightVideoSentAt.removeValue(forKey: video.sequence)
                             self.inFlightVideoBytes = max(0, self.inFlightVideoBytes - data.count)
                             self.videoTelemetryCompletedFrames += 1
                             // A successful contentProcessed callback proves
@@ -958,7 +989,8 @@ final class MacLANService {
                             self.lastVideoProgressUptime = ProcessInfo.processInfo.systemUptime
                             self.videoRecoveryInProgress = false
                             self.sendingFrame = !self.inFlightVideoSequences.isEmpty
-                            self.scheduleVideoBackpressureClear()
+                            self.updateVideoBackpressureFromQueue()
+                            self.scheduleVideoBackpressureSampleIfNeeded()
                             self.sendNextVideoIfPossible()
                         }
                     }
@@ -1071,6 +1103,7 @@ final class MacLANService {
 
     private func clearConnection(notify shouldNotify: Bool, error: String? = nil) {
         let wasConnected = isConnected
+        setActiveControlOrigin(nil)
         if let connection,
            let candidate = candidates[ObjectIdentifier(connection)] {
             candidate.timeoutWorkItem?.cancel()
@@ -1085,11 +1118,16 @@ final class MacLANService {
         videoWatchdogs.values.forEach { $0.cancel() }
         videoWatchdogs.removeAll(keepingCapacity: true)
         inFlightVideoSequences.removeAll(keepingCapacity: true)
+        inFlightVideoSentAt.removeAll(keepingCapacity: true)
         inFlightVideoBytes = 0
         lastDisplayedVideoSequence = nil
+        lastDisplayedVideoAckUptime = nil
         latestSubmittedVideoSequence = nil
         videoBackpressureClearWorkItem?.cancel()
         videoBackpressureClearWorkItem = nil
+        videoBackpressureClearToken = nil
+        videoBackpressureSampleWorkItem?.cancel()
+        videoBackpressureSampleWorkItem = nil
         lastVideoProgressUptime = ProcessInfo.processInfo.systemUptime
         videoRecoveryInProgress = false
         resetPendingVideo()
@@ -1100,27 +1138,135 @@ final class MacLANService {
         if shouldNotify && (wasConnected || error != nil) { notify(connected: false, value: error) }
     }
 
+    private func currentControlOrigin() -> ControlOrigin? {
+        controlOriginLock.lock()
+        defer { controlOriginLock.unlock() }
+        return activeControlOrigin
+    }
+
+    private func setActiveControlOrigin(_ origin: ControlOrigin?) {
+        controlOriginLock.lock()
+        activeControlOrigin = origin
+        controlOriginLock.unlock()
+    }
+
+    private func isCurrentControlOrigin(_ origin: ControlOrigin) -> Bool {
+        guard AuthorizationGeneration.shared.token == origin.authorizationToken else { return false }
+        controlOriginLock.lock()
+        defer { controlOriginLock.unlock() }
+        return activeControlOrigin === origin
+            && origin.candidate.isAuthenticated
+            && origin.candidate.authorizationToken == origin.authorizationToken
+            && origin.candidate.connection === origin.connection
+            && origin.candidate.secureSession === origin.secureSession
+            && origin.candidate.pendingIdentity == origin.peerIdentity
+    }
+
     private func setVideoBackpressure(_ level: StreamBackpressureLevel) {
         guard videoBackpressureLevel != level else { return }
+        if level.severityRank > videoBackpressureLevel.severityRank {
+            videoBackpressureClearWorkItem?.cancel()
+            videoBackpressureClearWorkItem = nil
+            videoBackpressureClearToken = nil
+        }
         videoBackpressureLevel = level
         onVideoBackpressureChanged?(level)
     }
 
+    private func updateVideoBackpressureFromQueue() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let oldestQueuedAt = [firstPendingVideo?.queuedAt, inFlightVideoSentAt.values.min()]
+            .compactMap { $0 }
+            .min()
+        let oldestAge = oldestQueuedAt.map { max(0, now - $0) } ?? 0
+        let viewerSequenceLag: Int? = {
+            guard let ackUptime = lastDisplayedVideoAckUptime,
+                  now - ackUptime <= 1.25,
+                  let latest = latestSubmittedVideoSequence,
+                  let displayed = lastDisplayedVideoSequence else { return nil }
+            return Int(min(latest > displayed ? latest - displayed : 0, UInt64(Int.max)))
+        }()
+        let senderWindow = StreamCadencePolicy.senderInFlightWindow(for: currentVideoFrameRate)
+        let proposedLevel = StreamCongestionPolicy.level(
+            bufferedBytes: pendingVideoBytes + inFlightVideoBytes,
+            maximumBufferedBytes: maximumVideoBufferedBytes,
+            pendingFrames: pendingVideoCount,
+            senderWindow: senderWindow,
+            oldestOutstandingAge: oldestAge,
+            viewerSequenceLag: viewerSequenceLag
+        )
+
+        if proposedLevel.severityRank > videoBackpressureLevel.severityRank {
+            setVideoBackpressure(proposedLevel)
+        } else if proposedLevel.severityRank < videoBackpressureLevel.severityRank {
+            scheduleVideoBackpressureClear()
+        }
+    }
+
+    private func scheduleVideoBackpressureSampleIfNeeded() {
+        let hasRecentViewerAcknowledgement = videoBackpressureLevel != .normal
+            && lastDisplayedVideoAckUptime.map {
+                ProcessInfo.processInfo.systemUptime - $0 <= 1.25
+            } == true
+        guard isConnected,
+              pendingVideoCount > 0 || !inFlightVideoSequences.isEmpty || hasRecentViewerAcknowledgement,
+              videoBackpressureSampleWorkItem == nil else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.videoBackpressureSampleWorkItem = nil
+            guard self.isConnected else { return }
+            self.updateVideoBackpressureFromQueue()
+            self.scheduleVideoBackpressureSampleIfNeeded()
+        }
+        videoBackpressureSampleWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + 0.1, execute: workItem)
+    }
+
     private func scheduleVideoBackpressureClear() {
-        videoBackpressureClearWorkItem?.cancel()
-        guard videoBackpressureLevel != .normal else { return }
+        guard videoBackpressureLevel != .normal,
+              videoBackpressureClearWorkItem == nil,
+              !waitingForKeyFrame else { return }
+        let scheduledLevel = videoBackpressureLevel
+        let token = UUID()
+        videoBackpressureClearToken = token
         let workItem = DispatchWorkItem { [weak self] in
             guard let self,
-                  self.pendingVideoCount == 0,
-                  self.inFlightVideoSequences.count <= 1,
-                  !self.waitingForKeyFrame else { return }
+                  self.videoBackpressureClearToken == token else { return }
             self.videoBackpressureClearWorkItem = nil
-            self.setVideoBackpressure(.normal)
+            self.videoBackpressureClearToken = nil
+            guard self.videoBackpressureLevel == scheduledLevel,
+                  !self.waitingForKeyFrame else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            let oldestQueuedAt = [self.firstPendingVideo?.queuedAt, self.inFlightVideoSentAt.values.min()]
+                .compactMap { $0 }
+                .min()
+            let oldestAge = oldestQueuedAt.map { max(0, now - $0) } ?? 0
+            let viewerSequenceLag: Int? = {
+                guard let ackUptime = self.lastDisplayedVideoAckUptime,
+                      now - ackUptime <= 1.25,
+                      let latest = self.latestSubmittedVideoSequence,
+                      let displayed = self.lastDisplayedVideoSequence else { return nil }
+                return Int(min(latest > displayed ? latest - displayed : 0, UInt64(Int.max)))
+            }()
+            let senderWindow = StreamCadencePolicy.senderInFlightWindow(for: self.currentVideoFrameRate)
+            guard StreamCongestionPolicy.isHealthyForRecovery(
+                bufferedBytes: self.pendingVideoBytes + self.inFlightVideoBytes,
+                maximumBufferedBytes: self.maximumVideoBufferedBytes,
+                pendingFrames: self.pendingVideoCount,
+                senderWindow: senderWindow,
+                oldestOutstandingAge: oldestAge,
+                viewerSequenceLag: viewerSequenceLag
+            ) else {
+                self.scheduleVideoBackpressureSampleIfNeeded()
+                return
+            }
+
+            self.setVideoBackpressure(StreamCongestionPolicy.recoveryLevel(from: scheduledLevel))
+            self.scheduleVideoBackpressureClear()
         }
         videoBackpressureClearWorkItem = workItem
-        // Keep the reduced cadence in place long enough for the ordered
-        // encoder/transport window to drain. A short 750-ms dwell caused
-        // normal <-> constrained oscillation on busy Macs.
+        // Start one dwell per recovery step. Do not move this deadline on each
+        // successful send: steady healthy traffic must be able to recover.
         queue.asyncAfter(deadline: .now() + 2.0, execute: workItem)
     }
 

@@ -89,6 +89,80 @@ final class MacViewerPresentationTests: XCTestCase {
     }
 
     @MainActor
+    func testFullScreenDelegatePreservesExistingOptionsAndAddsWindowLocalAutoHide() throws {
+        let f = try makeViewerFixture()
+        let presentation = MacViewerPresentation(defaults: f.defaults)
+        let window = window()
+        defer { window.close() }
+        let applicationOptions = NSApplication.shared.presentationOptions
+        let proposed: NSApplication.PresentationOptions = [.disableAppleMenu]
+        let delegateOptions: NSApplication.PresentationOptions = [
+            .disableAppleMenu, .hideMenuBar, .hideDock
+        ]
+        let delegate = FullScreenDelegateSpy(options: delegateOptions)
+        window.delegate = delegate
+        presentation.attach(window)
+
+        let result = try XCTUnwrap(window.delegate?.window?(
+            window,
+            willUseFullScreenPresentationOptions: proposed
+        ))
+
+        XCTAssertEqual(delegate.receivedProposedOptions, proposed)
+        XCTAssertEqual(result, [.disableAppleMenu, .autoHideMenuBar, .autoHideDock])
+        XCTAssertEqual(NSApplication.shared.presentationOptions, applicationOptions,
+            "Fullscreen chrome policy must stay on this window, not the app")
+    }
+
+    @MainActor
+    func testWindowedChromeIsRestoredAfterFullscreenExitOrFailedEntry() throws {
+        let f = try makeViewerFixture()
+        let presentation = MacViewerPresentation(defaults: f.defaults)
+        let window = window()
+        defer { window.close() }
+        let originalHadFullSizeContentView = window.styleMask.contains(.fullSizeContentView)
+        let originalTitlebarTransparency = window.titlebarAppearsTransparent
+        let originalTitleVisibility = window.titleVisibility
+        let delegate = FullScreenDelegateSpy(options: [])
+        window.delegate = delegate
+        presentation.attach(window)
+
+        NotificationCenter.default.post(name: NSWindow.willEnterFullScreenNotification, object: window)
+        XCTAssertTrue(window.styleMask.contains(.fullSizeContentView))
+        XCTAssertTrue(window.titlebarAppearsTransparent)
+        XCTAssertEqual(window.titleVisibility, .hidden)
+        window.delegate?.windowDidFailToEnterFullScreen?(window)
+
+        XCTAssertEqual(delegate.fullScreenFailureCount, 1)
+        XCTAssertFalse(presentation.isFullScreen)
+        XCTAssertEqual(window.styleMask.contains(.fullSizeContentView), originalHadFullSizeContentView)
+        XCTAssertEqual(window.titlebarAppearsTransparent, originalTitlebarTransparency)
+        XCTAssertEqual(window.titleVisibility, originalTitleVisibility)
+
+        NotificationCenter.default.post(name: NSWindow.willEnterFullScreenNotification, object: window)
+        NotificationCenter.default.post(name: NSWindow.didEnterFullScreenNotification, object: window)
+        XCTAssertTrue(presentation.isFullScreen)
+        NotificationCenter.default.post(name: NSWindow.didExitFullScreenNotification, object: window)
+
+        XCTAssertFalse(presentation.isFullScreen)
+        XCTAssertEqual(window.styleMask.contains(.fullSizeContentView), originalHadFullSizeContentView)
+        XCTAssertEqual(window.titlebarAppearsTransparent, originalTitlebarTransparency)
+        XCTAssertEqual(window.titleVisibility, originalTitleVisibility)
+    }
+
+    @MainActor
+    func testVideoDisplayLayerTracksWindowBackingScale() throws {
+        let window = window()
+        defer { window.close() }
+        let video = MacViewerVideoView(frame: NSRect(x: 0, y: 0, width: 640, height: 360))
+        window.contentView?.addSubview(video)
+        video.viewDidChangeBackingProperties()
+
+        XCTAssertEqual(video.layer?.contentsScale, window.backingScaleFactor)
+        XCTAssertEqual(video.displayLayer.contentsScale, window.backingScaleFactor)
+    }
+
+    @MainActor
     func testWindowBridgeAttachesAndIgnoresOtherWindows() throws {
         let f = try makeViewerFixture()
         let presentation = MacViewerPresentation(defaults: f.defaults)
@@ -312,4 +386,28 @@ private final class FullScreenTestWindow: NSWindow {
     var fullScreenRequests = 0
     override var isKeyWindow: Bool { simulatedKeyWindow }
     override func toggleFullScreen(_ sender: Any?) { fullScreenRequests += 1 }
+}
+
+@MainActor
+private final class FullScreenDelegateSpy: NSObject, NSWindowDelegate {
+    let options: NSApplication.PresentationOptions
+    private(set) var receivedProposedOptions: NSApplication.PresentationOptions?
+    private(set) var fullScreenFailureCount = 0
+
+    init(options: NSApplication.PresentationOptions) {
+        self.options = options
+        super.init()
+    }
+
+    func window(
+        _ window: NSWindow,
+        willUseFullScreenPresentationOptions proposedOptions: NSApplication.PresentationOptions
+    ) -> NSApplication.PresentationOptions {
+        receivedProposedOptions = proposedOptions
+        return options
+    }
+
+    func windowDidFailToEnterFullScreen(_ window: NSWindow) {
+        fullScreenFailureCount += 1
+    }
 }

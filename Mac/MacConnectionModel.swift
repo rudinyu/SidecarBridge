@@ -154,6 +154,16 @@ final class MacConnectionModel: ObservableObject {
     private var lastPublishedHostInputSourceStatus: HostInputSourceStatus?
 #endif
     private var remoteViewerIsBackgrounded = false
+    private struct PendingViewerCursorFeedbackRequest {
+        let id: UUID
+        let sessionToken: UUID
+        let modeGeneration: UInt64
+        let enabled: Bool
+        let acknowledgementSender: InputAcknowledgementSender
+        let originIsCurrent: () -> Bool
+    }
+    private var pendingViewerCursorFeedbackRequest: PendingViewerCursorFeedbackRequest?
+    private var viewerCursorFeedbackEnabledForSession = false
     private var pendingFileURLs: [URL] = []
     private var clipboardMonitorTask: Task<Void, Never>?
     private var lastObservedClipboardChangeCount: Int?
@@ -263,6 +273,15 @@ final class MacConnectionModel: ObservableObject {
 #endif
             }
         }
+        streamer.onViewerCursorFeedbackConfigurationApplied = { [weak self] modeGeneration, captureGeneration, enabled in
+            Task { @MainActor [weak self] in
+                self?.acknowledgeViewerCursorFeedbackConfiguration(
+                    modeGeneration: modeGeneration,
+                    captureGeneration: captureGeneration,
+                    enabled: enabled
+                )
+            }
+        }
 #if SIDECARBRIDGE_FORK
         streamer.onCaptureStarted = { [weak self] generation in
             Task { @MainActor [weak self] in
@@ -351,6 +370,7 @@ final class MacConnectionModel: ObservableObject {
         peers.onConnectionChanged = { [weak self] connected, peerOrError in
             guard let self else { return }
             self.remoteInput.resetInputSourceState()
+            self.resetViewerCursorFeedbackForSession()
             if !connected {
 #if SIDECARBRIDGE_FORK
                 self.screenDockHostWindowBehavior.viewerDisconnected()
@@ -490,8 +510,12 @@ final class MacConnectionModel: ObservableObject {
                 }
             }
         }
-        peers.onCommand = { [weak self] command, acknowledgementSender in
-            self?.handle(command, acknowledgementSender: acknowledgementSender)
+        peers.onCommand = { [weak self] command, acknowledgementSender, originIsCurrent in
+            self?.handle(
+                command,
+                acknowledgementSender: acknowledgementSender,
+                originIsCurrent: originIsCurrent
+            )
         }
         peers.onFilePacket = { [weak self] transfer in self?.fileTransfer.handle(transfer) }
         streamer.onFrame = { [weak peers] frame in peers?.sendVideoFrame(frame) }
@@ -1072,6 +1096,7 @@ final class MacConnectionModel: ObservableObject {
         queuedFileCount = 0
         fileTransfer.cancelAll(reason: "\(BridgeConstants.applicationName) is quitting.")
         remoteInput.releaseButtons()
+        resetViewerCursorFeedbackForSession()
         streamer.stop()
         peers.stop()
         isStreaming = false
@@ -1393,6 +1418,7 @@ final class MacConnectionModel: ObservableObject {
 
     func forgetPairing() {
         AuthorizationGeneration.shared.invalidate()
+        resetViewerCursorFeedbackForSession()
         peers.stop()
         stopFallback()
         stopClipboardMonitoring()
@@ -1827,20 +1853,33 @@ final class MacConnectionModel: ObservableObject {
 
     private func handle(
         _ command: ControlMessage,
-        acknowledgementSender: InputAcknowledgementSender? = nil
+        acknowledgementSender: InputAcknowledgementSender? = nil,
+        originIsCurrent: (() -> Bool)? = nil
     ) {
         switch command.kind {
         case .hello:
             if let detail = command.detail {
                 if detail == "viewer-foreground-live-support" {
                     peers.send(ControlMessage(.status, detail: "viewer-foreground-live-supported"))
+                } else if let request = ViewerCursorFeedbackCapability.parseRequest(detail) {
+                    guard hasPadPeer,
+                          let acknowledgementSender,
+                          let originIsCurrent,
+                          originIsCurrent() else { return }
+                    handleViewerCursorFeedbackRequest(
+                        request,
+                        acknowledgementSender: acknowledgementSender,
+                        originIsCurrent: originIsCurrent
+                    )
                 } else if detail.hasPrefix("display-width:") {
                     let widthPart = detail
                         .dropFirst("display-width:".count)
                         .split(separator: ";", maxSplits: 1)
                         .first
                     if let widthPart, let width = Int(widthPart) {
-                        streamer.setPreferredWidth(width)
+                        if streamer.setPreferredWidth(width) {
+                            scheduleStreamPreferenceRestartIfNeeded()
+                        }
                     }
                 } else if detail.hasPrefix("viewer-refresh-rate:") {
                     let ratePart = detail
@@ -2016,9 +2055,78 @@ final class MacConnectionModel: ObservableObject {
     }
 
     private func sendRemoteInputPermissionStatus() {
+        if !remoteInputAuthorized, viewerCursorFeedbackEnabledForSession {
+            viewerCursorFeedbackEnabledForSession = false
+            pendingViewerCursorFeedbackRequest = nil
+            _ = streamer.setViewerLocalCursorFeedbackEnabled(false)
+        }
         peers.send(ControlMessage(
             .status,
             detail: remoteInputAuthorized ? "accessibility-passed" : "accessibility-required"
+        ))
+    }
+
+    private func resetViewerCursorFeedbackForSession() {
+        pendingViewerCursorFeedbackRequest = nil
+        viewerCursorFeedbackEnabledForSession = false
+        _ = streamer.setViewerLocalCursorFeedbackEnabled(false)
+    }
+
+    private func handleViewerCursorFeedbackRequest(
+        _ request: ViewerCursorFeedbackCapability.Request,
+        acknowledgementSender: @escaping InputAcknowledgementSender,
+        originIsCurrent: @escaping () -> Bool
+    ) {
+        guard hasPadPeer, originIsCurrent() else { return }
+        let sessionToken = remoteInput.sessionToken
+        let effectiveEnabled = request.enabled && remoteInputAuthorized && remoteInput.isAuthorized
+        viewerCursorFeedbackEnabledForSession = effectiveEnabled
+        let modeGeneration = streamer.setViewerLocalCursorFeedbackEnabled(effectiveEnabled)
+        pendingViewerCursorFeedbackRequest = PendingViewerCursorFeedbackRequest(
+            id: request.id,
+            sessionToken: sessionToken,
+            modeGeneration: modeGeneration,
+            enabled: effectiveEnabled,
+            acknowledgementSender: acknowledgementSender,
+            originIsCurrent: originIsCurrent
+        )
+    }
+
+    private func acknowledgeViewerCursorFeedbackConfiguration(
+        modeGeneration: UInt64,
+        captureGeneration: UInt64?,
+        enabled: Bool
+    ) {
+        guard let request = pendingViewerCursorFeedbackRequest,
+              request.modeGeneration == modeGeneration,
+              request.enabled == enabled,
+              hasPadPeer,
+              remoteInput.isCurrent(sessionToken: request.sessionToken),
+              request.originIsCurrent() else { return }
+
+        if let captureGeneration {
+            guard streamer.currentCaptureGeneration == captureGeneration else { return }
+        } else {
+            guard streamer.currentCaptureGeneration == nil,
+                  !streamer.isRefreshingCapture else { return }
+        }
+        let currentEffectiveMode = request.enabled && remoteInputAuthorized && remoteInput.isAuthorized
+        guard currentEffectiveMode == enabled else {
+            pendingViewerCursorFeedbackRequest = nil
+            if !currentEffectiveMode {
+                viewerCursorFeedbackEnabledForSession = false
+                _ = streamer.setViewerLocalCursorFeedbackEnabled(false)
+            }
+            return
+        }
+
+        pendingViewerCursorFeedbackRequest = nil
+        request.acknowledgementSender(ControlMessage(
+            .status,
+            detail: ViewerCursorFeedbackCapability.acknowledgementDetail(
+                id: request.id,
+                enabled: enabled
+            )
         ))
     }
 

@@ -119,6 +119,20 @@ enum MacViewerDeviceCatalog {
     }
 }
 
+struct MacViewerDisplayCapabilities: Equatable {
+    static let defaultPixelWidth = 1_920
+    static let defaultRefreshRate = 60
+    static let pixelWidthHysteresis = 128
+
+    let pixelWidth: Int
+    let refreshRate: Int
+
+    init(pixelWidth: Int, refreshRate: Int) {
+        self.pixelWidth = StreamQualityPolicy.boundedPresentationWidth(pixelWidth)
+        self.refreshRate = min(max(refreshRate, StreamCadencePolicy.minimumLiveFrameRate), 240)
+    }
+}
+
 @MainActor
 final class MacViewerConnectionModel: ObservableObject {
     struct ReceivedFile: Identifiable, Equatable {
@@ -140,6 +154,14 @@ final class MacViewerConnectionModel: ObservableObject {
     @Published var connectionHealthDetail = "Waiting for encrypted link"
     @Published var connectionLatencyMS: Int?
     @Published var remoteInputAuthorized = false
+    @Published var instantCursorEnabled: Bool {
+        didSet {
+            guard oldValue != instantCursorEnabled else { return }
+            defaults.set(instantCursorEnabled, forKey: Self.instantCursorDefaultsKey)
+            reconcileInstantCursorFeedback()
+        }
+    }
+    @Published private(set) var isUsingInstantCursor = false
     @Published var lastInputAccepted = true
     @Published private(set) var inputSourceFailure: String?
     @Published private(set) var hostInputSource: HostInputSourceStatus?
@@ -230,8 +252,15 @@ final class MacViewerConnectionModel: ObservableObject {
     private var suppressedMacIDs = Set<String>()
     private var suppressedMacNames: [String: String] = [:]
     private var selectedDeviceID: String?
+    private var viewerDisplayCapabilities = MacViewerDisplayCapabilities(
+        pixelWidth: MacViewerDisplayCapabilities.defaultPixelWidth,
+        refreshRate: MacViewerDisplayCapabilities.defaultRefreshRate
+    )
+    private var pendingCursorFeedbackRequestID: UUID?
+    private var pendingCursorFeedbackTarget: Bool?
 
     private static let rememberedMacNamesKey = "macViewer.rememberedMacNames"
+    private static let instantCursorDefaultsKey = "macViewer.instantCursorEnabled"
     static let defaultDefaults: UserDefaults = {
         #if SIDECARBRIDGE_FORK
         return ForkRuntimeProfile.userDefaults(for: .viewer)
@@ -261,6 +290,7 @@ final class MacViewerConnectionModel: ObservableObject {
         self.defaults = resolvedDefaults
         self.removeCredential = removeCredential
         self.removeAllCredentials = removeAllCredentials
+        instantCursorEnabled = resolvedDefaults.object(forKey: Self.instantCursorDefaultsKey) as? Bool ?? true
         streamResolution = resolvedDefaults.string(forKey: StreamPreferenceStore.resolutionKey)
             .flatMap(StreamResolutionPreference.init(rawValue:)) ?? .adaptive
         streamFrameRate = StreamPreferenceStore.loadFrameRate(defaults: resolvedDefaults)
@@ -647,6 +677,7 @@ final class MacViewerConnectionModel: ObservableObject {
 
     func disconnect() {
         resetInputSourceFeedback()
+        resetInstantCursorFeedback()
         peers.restart()
         userRequestedConnection = false
         isConnecting = false
@@ -846,6 +877,27 @@ final class MacViewerConnectionModel: ObservableObject {
         sendStreamPreferences()
     }
 
+    func setInstantCursorEnabled(_ enabled: Bool) {
+        instantCursorEnabled = enabled
+    }
+
+    func updateViewerDisplayCapabilities(pixelWidth: Int, refreshRate: Int) {
+        let proposed = MacViewerDisplayCapabilities(pixelWidth: pixelWidth, refreshRate: refreshRate)
+        let stableWidth = StreamQualityPolicy.stablePresentationWidth(
+            proposed: proposed.pixelWidth,
+            current: viewerDisplayCapabilities.pixelWidth,
+            hysteresis: MacViewerDisplayCapabilities.pixelWidthHysteresis
+        )
+        let capabilities = MacViewerDisplayCapabilities(
+            pixelWidth: stableWidth,
+            refreshRate: proposed.refreshRate
+        )
+        guard capabilities != viewerDisplayCapabilities else { return }
+        viewerDisplayCapabilities = capabilities
+        guard isConnected else { return }
+        sendViewerDisplayCapabilities()
+    }
+
     func setStreamFrameRate(_ value: StreamFrameRatePreference) {
         streamFrameRate = value.permitted(ultra: ultraModeEnabled)
         StreamPreferenceStore.saveFrameRate(streamFrameRate, defaults: defaults)
@@ -952,9 +1004,11 @@ final class MacViewerConnectionModel: ObservableObject {
     }
 
     private func handleConnectionChanged(_ connected: Bool, peerOrError: String?) {
+        resetInstantCursorFeedback()
         if connected {
             resetInputSourceFeedback()
             isConnected = true
+            remoteInputAuthorized = false
             isConnecting = false
             pairingRequired = false
             pairingError = nil
@@ -1027,14 +1081,20 @@ final class MacViewerConnectionModel: ObservableObject {
             guard let value = command.detail else { return }
             if value == "accessibility-required" {
                 remoteInputAuthorized = false
+                reconcileInstantCursorFeedback()
             } else if value == "accessibility-passed" {
+                guard isConnected else { return }
                 remoteInputAuthorized = true
+                reconcileInstantCursorFeedback()
             } else if value == "remote-input-unavailable-store-build" {
                 remoteInputAuthorized = false
+                reconcileInstantCursorFeedback()
                 status = "Remote input unavailable"
                 detail = "Enable SidecarBridge under macOS Privacy & Security → Accessibility, then reconnect."
             } else if value.hasPrefix("input-ack:") {
                 handleInputAcknowledgement(value)
+            } else if let acknowledgement = ViewerCursorFeedbackCapability.parseAcknowledgement(value) {
+                handleInstantCursorFeedbackAcknowledgement(acknowledgement)
             } else if let inputSource = HostInputSourceStatus.parse(detail: value) {
                 // Control messages reach this handler through the currently
                 // authenticated peer session. Ignore metadata while that
@@ -1083,13 +1143,59 @@ final class MacViewerConnectionModel: ObservableObject {
         hostInputSource = nil
     }
 
+    private func resetInstantCursorFeedback() {
+        pendingCursorFeedbackRequestID = nil
+        pendingCursorFeedbackTarget = nil
+        isUsingInstantCursor = false
+    }
+
+    private func reconcileInstantCursorFeedback() {
+        guard isConnected else {
+            resetInstantCursorFeedback()
+            return
+        }
+        let target = instantCursorEnabled && remoteInputAuthorized
+        if pendingCursorFeedbackTarget == target { return }
+        guard isUsingInstantCursor != target || pendingCursorFeedbackRequestID != nil else { return }
+
+        let requestID = UUID()
+        pendingCursorFeedbackRequestID = requestID
+        pendingCursorFeedbackTarget = target
+        peers.send(ControlMessage(
+            .hello,
+            detail: ViewerCursorFeedbackCapability.requestDetail(id: requestID, enabled: target)
+        ))
+    }
+
+    private func handleInstantCursorFeedbackAcknowledgement(
+        _ acknowledgement: ViewerCursorFeedbackCapability.Acknowledgement
+    ) {
+        guard isConnected,
+              pendingCursorFeedbackRequestID == acknowledgement.id else { return }
+        let requestedTarget = pendingCursorFeedbackTarget
+        pendingCursorFeedbackRequestID = nil
+        pendingCursorFeedbackTarget = nil
+        isUsingInstantCursor = acknowledgement.enabled
+
+        // A Host may safely decline an enable request if its Accessibility
+        // permission changed between the Viewer status and this hello. Wait
+        // for the next permission status before retrying. An unexpected true
+        // result for an opt-out is corrected with a fresh, fenced request.
+        if acknowledgement.enabled, requestedTarget == false {
+            reconcileInstantCursorFeedback()
+        }
+    }
+
     private func sendViewerCapabilities() {
         peers.send(ControlMessage(.hello, detail: "video-ack"))
         peers.send(ControlMessage(.hello, detail: "viewer-foreground-live-support"))
-        let width = Int(max(NSScreen.main?.frame.width ?? 1_920, 1_920))
-        peers.send(ControlMessage(.hello, detail: "display-width:\(width)"))
-        peers.send(ControlMessage(.hello, detail: "viewer-refresh-rate:60"))
+        sendViewerDisplayCapabilities()
         sendStreamPreferences()
+    }
+
+    private func sendViewerDisplayCapabilities() {
+        peers.send(ControlMessage(.hello, detail: "display-width:\(viewerDisplayCapabilities.pixelWidth)"))
+        peers.send(ControlMessage(.hello, detail: "viewer-refresh-rate:\(viewerDisplayCapabilities.refreshRate)"))
     }
 
     private func sendStreamPreferences() {
