@@ -5,7 +5,9 @@ import Foundation
 enum StreamQualityPolicy {
     static func captureWidth(preferred: Int, resolution: StreamResolutionPreference, memory: StreamMemoryPressureLevel) -> Int {
         let presentationWidth = min(max(preferred, 960), 3840)
-        let requested = min(resolution.maximumWidth ?? presentationWidth, presentationWidth)
+        // Explicit choices are capture caps, independent of the Viewer window.
+        // Adaptive follows the presenter's backing-pixel width.
+        let requested = resolution.maximumWidth ?? presentationWidth
         return min(requested, memory.captureWidthCeiling ?? 3840)
     }
 
@@ -21,17 +23,20 @@ enum StreamQualityPolicy {
         let contentRect = RemoteDisplayGeometry.contentRect(in: points, aspectRatio: aspectRatio)
         guard contentRect.width.isFinite, contentRect.width > 0 else { return 1920 }
         let maximum = min(max(maximumPixelWidth, 960), 7680)
-        let width = Int(min(7680, (contentRect.width * backingScale).rounded(.down)))
+        let width = Int(min(7680, (contentRect.width * backingScale).rounded(.up)))
         return min(max(width, 960), maximum)
     }
 
     static func boundedPresentationWidth(_ width: Int) -> Int {
         let bounded = min(max(width, 960), 7680)
-        return max(960, bounded / 64 * 64)
+        return min(7680, (bounded + 63) / 64 * 64)
     }
 
     static func stablePresentationWidth(proposed: Int, current: Int, hysteresis: Int) -> Int {
-        abs(proposed - current) < max(hysteresis, 0) ? current : proposed
+        let proposed = boundedPresentationWidth(proposed)
+        let current = boundedPresentationWidth(current)
+        guard proposed < current else { return proposed }
+        return current - proposed < max(hysteresis, 0) ? current : proposed
     }
 
     static func sourcePixels(points: CGSize, scale: CGFloat) -> CGSize {

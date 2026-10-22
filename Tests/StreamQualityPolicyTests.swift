@@ -23,7 +23,8 @@ final class StreamQualityPolicyTests: XCTestCase {
         XCTAssertEqual(StreamQualityPolicy.captureWidth(preferred: 3840, resolution: .adaptive, memory: .normal), 3840)
         XCTAssertEqual(StreamQualityPolicy.captureWidth(preferred: 3840, resolution: .twoK, memory: .warning), 2560)
         XCTAssertEqual(StreamQualityPolicy.captureWidth(preferred: 3840, resolution: .fourK, memory: .critical), 1920)
-        XCTAssertEqual(StreamQualityPolicy.captureWidth(preferred: 1440, resolution: .fourK, memory: .normal), 1440)
+        XCTAssertEqual(StreamQualityPolicy.captureWidth(preferred: 1440, resolution: .adaptive, memory: .normal), 1440)
+        XCTAssertEqual(StreamQualityPolicy.captureWidth(preferred: 1440, resolution: .fourK, memory: .normal), 3840)
         XCTAssertEqual(StreamQualityPolicy.captureWidth(preferred: 960, resolution: .adaptive, memory: .normal), 960)
     }
     func testCaptureWidthTracksAspectFitPresentationInBackingPixels() {
@@ -34,7 +35,7 @@ final class StreamQualityPolicyTests: XCTestCase {
                 aspectRatio: 16.0 / 9.0,
                 maximumPixelWidth: 3840
             ),
-            2844
+            2845
         )
         XCTAssertEqual(
             StreamQualityPolicy.presentationPixelWidth(
@@ -45,16 +46,35 @@ final class StreamQualityPolicyTests: XCTestCase {
             ),
             2000
         )
-        XCTAssertEqual(StreamQualityPolicy.boundedPresentationWidth(2001), 1984)
-        XCTAssertEqual(StreamQualityPolicy.boundedPresentationWidth(2010), 1984)
+        XCTAssertEqual(StreamQualityPolicy.boundedPresentationWidth(2001), 2048)
+        XCTAssertEqual(StreamQualityPolicy.boundedPresentationWidth(2010), 2048)
+        XCTAssertEqual(StreamQualityPolicy.boundedPresentationWidth(2048), 2048)
+        XCTAssertEqual(StreamQualityPolicy.boundedPresentationWidth(7679), 7680)
+        XCTAssertEqual(StreamQualityPolicy.boundedPresentationWidth(Int.max), 7680)
         XCTAssertEqual(
             StreamQualityPolicy.stablePresentationWidth(proposed: 2048, current: 1984, hysteresis: 128),
-            1984
+            2048
         )
         XCTAssertEqual(
-            StreamQualityPolicy.stablePresentationWidth(proposed: 2112, current: 1984, hysteresis: 128),
-            2112
+            StreamQualityPolicy.stablePresentationWidth(proposed: 1984, current: 2048, hysteresis: 128),
+            2048
         )
+        XCTAssertEqual(
+            StreamQualityPolicy.stablePresentationWidth(proposed: 1920, current: 2048, hysteresis: 128),
+            1920
+        )
+    }
+
+    func testFractionalBackingWidthRoundsUpAcrossPresentationBucket() {
+        let pixelWidth = StreamQualityPolicy.presentationPixelWidth(
+            points: CGSize(width: 1984.25, height: 1984.25),
+            backingScale: 1,
+            aspectRatio: 1,
+            maximumPixelWidth: 7680
+        )
+
+        XCTAssertEqual(pixelWidth, 1985)
+        XCTAssertEqual(StreamQualityPolicy.boundedPresentationWidth(pixelWidth), 2048)
     }
     func testHiDPISourceUsesPixelsNotLogicalPoints() {
         XCTAssertEqual(StreamQualityPolicy.sourcePixels(points: CGSize(width: 1920, height: 1080), scale: 2),

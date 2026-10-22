@@ -533,6 +533,23 @@ final class MacViewerConnectionTests: XCTestCase {
             detail: "viewer-refresh-rate:\(StreamCadencePolicy.minimumLiveFrameRate)"
         )))
 
+        f.peer.messages.removeAll()
+        f.model.updateViewerDisplayCapabilities(
+            pixelWidth: 1024,
+            refreshRate: StreamCadencePolicy.minimumLiveFrameRate
+        )
+        XCTAssertEqual(f.peer.messages, [
+            ControlMessage(.hello, detail: "display-width:1024"),
+            ControlMessage(.hello, detail: "viewer-refresh-rate:\(StreamCadencePolicy.minimumLiveFrameRate)")
+        ], "A small viewport increase must update the capture target immediately")
+
+        f.peer.messages.removeAll()
+        f.model.updateViewerDisplayCapabilities(
+            pixelWidth: 960,
+            refreshRate: StreamCadencePolicy.minimumLiveFrameRate
+        )
+        XCTAssertTrue(f.peer.messages.isEmpty, "Small viewport reductions should stay within the 128-pixel hysteresis")
+
         f.model.updateViewerDisplayCapabilities(pixelWidth: 20_000, refreshRate: 500)
         XCTAssertEqual(Array(f.peer.messages.suffix(2)), [
             ControlMessage(.hello, detail: "display-width:7680"),

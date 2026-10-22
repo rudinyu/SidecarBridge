@@ -25,11 +25,11 @@ enum StreamResolutionPreference: String, CaseIterable, Identifiable {
         case .adaptive:
             return "Matches the Viewer presentation width up to the Mac display size; choose a lower cap to reduce link use."
         case .fullHD:
-            return "Caps capture at 1920 pixels for a lighter stream."
+            return "Lighter stream with capture up to 1920 pixels."
         case .twoK:
-            return "Captures up to 2560 pixels when the Mac display supports it."
+            return "More text detail with capture up to 2560 pixels."
         case .fourK:
-            return "Captures up to 3840 pixels when the display, link, and memory allow it."
+            return "Maximum detail up to 3840 pixels; uses more bandwidth and memory."
         }
     }
 
