@@ -21,6 +21,19 @@ For the full architecture, protocol, permission, distribution, testing, and trou
 This fork preserves SidecarBridge iPhone/iPad compatibility and adds encrypted
 Mac-to-Mac viewing through ScreenDock Host and ScreenDock Viewer.
 
+### License and copyright
+
+Original ScreenDock fork contributions are copyright (c) 2026 rudinyu and
+licensed under the [MIT License](LICENSE).
+
+Upstream SidecarBridge code and third-party components retain their respective
+ownership and licensing terms. The upstream source included in this checkout
+does not provide a standalone project license; this fork's MIT grant does not
+relicense that source. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for
+upstream attribution and the existing third-party license notice.
+The [dependency license review](docs/DEPENDENCY_LICENSES.md) records the checked
+libraries, build tools, and remaining upstream, asset, and packaging gaps.
+
 ### ScreenDock Host and Viewer
 
 The fork builds two macOS products: **ScreenDock Host** and **ScreenDock Viewer**. ScreenDock Viewer connects to a Mac running ScreenDock Host. Select the discovered Mac and tap **Connect**. For first-time pairing, enter the Mac's current 16-digit code; an optional private IPv4 address can be supplied with that code when Bonjour discovery is unavailable. The encrypted session carries the Mac screen, mouse and keyboard input, clipboard text, and verified file transfers. Both Macs need Local Network access, and the Mac being viewed still needs Screen Recording and Accessibility permission for capture and remote input. This is an in-app remote display stream; it does not create Apple's native extended Sidecar display.

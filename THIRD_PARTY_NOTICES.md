@@ -1,5 +1,35 @@
 # Third-party notice
 
+Dependency and binary inspection results, scope, and unresolved permissions are
+recorded in [docs/DEPENDENCY_LICENSES.md](docs/DEPENDENCY_LICENSES.md).
+
+## Upstream SidecarBridge
+
+ScreenDock is a fork of SidecarBridge by yu314-coder:
+https://github.com/yu314-coder/SidecarBridge
+
+Upstream SidecarBridge code remains the work of its respective copyright
+holders. The upstream source included in this checkout does not contain a
+standalone project license. The MIT license in this fork's LICENSE file applies
+only to original ScreenDock fork contributions by rudinyu and does not grant
+rights to relicense upstream code.
+
+## Platform frameworks and build tools
+
+Apple frameworks and platform runtimes retain their own licensing terms and are
+not covered by the ScreenDock fork's MIT license. The reviewed macOS Build 136
+apps link platform-provided libraries; no external bundled library was found.
+
+XcodeGen 2.46.0 is a build-time project generator, not an app dependency:
+copyright (c) 2018 Yonas Kolb, licensed under MIT. Its installed distribution
+includes its LICENSE. The original license is available at:
+https://github.com/yonaskolb/XcodeGen/blob/2.46.0/LICENSE
+
+XcodeGen and its dependencies are not bundled in the reviewed app binaries.
+Redistributing build tools requires checking their own dependency notices.
+
+## SidecarLauncher
+
 The private Sidecar connection technique and selector names were informed by:
 
 SidecarLauncher, copyright (c) 2023 Jovany Ocasio
