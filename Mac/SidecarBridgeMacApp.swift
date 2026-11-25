@@ -25,6 +25,7 @@ enum MacProductBrand {
 final class MacAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         MacShutdownCoordinator.shared.startObserving()
+        MacReceivedFileNotification.installDelegate()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

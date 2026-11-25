@@ -1,7 +1,15 @@
 import SwiftUI
+import AppKit
+
+final class MacViewerAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        MacReceivedFileNotification.installDelegate()
+    }
+}
 
 @main
 struct SidecarBridgeViewerMacApp: App {
+    @NSApplicationDelegateAdaptor(MacViewerAppDelegate.self) private var appDelegate
     @StateObject private var model = MacViewerConnectionModel()
     @StateObject private var presentation = MacViewerPresentation()
     @State private var inputSourceManager = MacViewerSystemInputSourceManager()

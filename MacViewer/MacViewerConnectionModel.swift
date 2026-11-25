@@ -508,6 +508,7 @@ final class MacViewerConnectionModel: ObservableObject {
             self.lastReceivedFile = url
             self.refreshReceivedFiles()
             self.clipboardTransferStatus = "Received \(url.lastPathComponent)."
+            MacReceivedFileNotification.post(for: url)
         }
         fileTransfer.onError = { [weak self] message in
             guard let self else { return }

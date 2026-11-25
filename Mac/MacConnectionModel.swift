@@ -968,6 +968,7 @@ final class MacConnectionModel: ObservableObject {
             self.lastReceivedFile = url
             self.fileTransferError = nil
             self.placeReceivedFileOnClipboard(url)
+            MacReceivedFileNotification.post(for: url)
         }
         fileTransfer.onError = { [weak self] message in
             self?.pendingFileURLs.removeAll(keepingCapacity: false)
