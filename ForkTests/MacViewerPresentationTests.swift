@@ -286,6 +286,92 @@ final class MacViewerPresentationTests: XCTestCase {
     }
 
     @MainActor
+    func testTransferLauncherExpandsBesideItAndSendButtonOpensChooser() throws {
+        let suiteName = "SidecarBridge-ViewerChooserTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.setPersistentDomain([:], forName: suiteName)
+        let pasteboard = NSPasteboard(name: .init(suiteName))
+        pasteboard.clearContents()
+        let receiveDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(suiteName, isDirectory: true)
+        try FileManager.default.createDirectory(at: receiveDirectory, withIntermediateDirectories: true)
+        let peer = ViewerPeerStub()
+        var chooserWindows: [NSWindow?] = []
+        let model = MacViewerConnectionModel(
+            peers: peer,
+            pasteboard: pasteboard,
+            receiveDirectory: receiveDirectory,
+            defaults: defaults,
+            removeCredential: { _ in true },
+            removeAllCredentials: { true },
+            fileChooserPresenter: { window, _ in chooserWindows.append(window) }
+        )
+        model.isConnected = true
+        model.isStreaming = true
+        let presentation = MacViewerPresentation(defaults: defaults)
+        let window = window()
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+
+        addTeardownBlock {
+            await MainActor.run {
+                NSPasteboard(name: .init(suiteName)).releaseGlobally()
+                UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
+            }
+            try? FileManager.default.removeItem(at: receiveDirectory)
+        }
+
+        let hosting = NSHostingView(rootView: MacViewerView(model: model, presentation: presentation))
+        window.contentView = hosting
+        window.setContentSize(NSSize(width: 1120, height: 820))
+        hosting.layoutSubtreeIfNeeded()
+
+        let launcher = try XCTUnwrap(descendants(NSButton.self, in: hosting).first {
+            $0.accessibilityIdentifier() == "macViewer.transfer.launcher"
+        })
+        XCTAssertTrue(descendants(NSButton.self, in: hosting).allSatisfy {
+            $0.accessibilityIdentifier() != "macViewer.transfer.send"
+        }, "Idle transfer actions should start collapsed")
+        let collapsedLauncherFrame = launcher.convert(launcher.bounds, to: hosting)
+        let launcherTarget = try XCTUnwrap(hitTest(
+            NSPoint(x: collapsedLauncherFrame.midX, y: collapsedLauncherFrame.midY),
+            in: hosting
+        ))
+        XCTAssertTrue(launcherTarget === launcher || isDescendant(launcherTarget, of: launcher),
+            "The collapsed transfer launcher must receive its own local click")
+
+        launcher.performClick(nil)
+        hosting.layoutSubtreeIfNeeded()
+
+        let sendButton = try XCTUnwrap(descendants(NSButton.self, in: hosting).first {
+            $0.accessibilityIdentifier() == "macViewer.transfer.send"
+        })
+        let expandedLauncher = try XCTUnwrap(descendants(NSButton.self, in: hosting).first {
+            $0.accessibilityIdentifier() == "macViewer.transfer.launcher"
+        })
+        let expandedLauncherFrame = expandedLauncher.convert(expandedLauncher.bounds, to: hosting)
+        let sendFrame = sendButton.convert(sendButton.bounds, to: hosting)
+        let expandedLauncherTarget = try XCTUnwrap(hitTest(
+            NSPoint(x: expandedLauncherFrame.midX, y: expandedLauncherFrame.midY),
+            in: hosting
+        ))
+        XCTAssertTrue(expandedLauncherTarget === expandedLauncher || isDescendant(expandedLauncherTarget, of: expandedLauncher),
+            "The retained launcher must keep receiving clicks after controls expand")
+        XCTAssertEqual(expandedLauncherFrame.maxX, collapsedLauncherFrame.maxX, accuracy: 1,
+            "The corner launcher must stay at the same position when controls expand")
+        XCTAssertLessThan(sendFrame.maxX, expandedLauncherFrame.minX,
+            "Expanded actions must appear beside the launcher, away from the pointer that opened it")
+        XCTAssertTrue(chooserWindows.isEmpty,
+            "Opening the compact dock must not invoke Send Files")
+
+        sendButton.performClick(nil)
+        XCTAssertEqual(chooserWindows.count, 1,
+            "The native Send Files button action must reach the file chooser presenter")
+        XCTAssertTrue(chooserWindows[0] === window,
+            "Present the chooser as a sheet on the window containing the clicked button")
+    }
+
+    @MainActor
     func testTransferDockShowsActiveQueuedAndErrorStateAtCompactSize() throws {
         let f = try makeViewerFixture()
         f.model.isConnected = true
@@ -388,6 +474,18 @@ final class MacViewerPresentationTests: XCTestCase {
         XCTAssertFalse(presentation.controlsVisible)
         XCTAssertTrue(descendant(MacViewerVideoView.self, in: hosting) === video)
         XCTAssertTrue(descendant(MacViewerInputView.self, in: hosting) === input)
+        let transferLauncher = try XCTUnwrap(descendants(NSButton.self, in: hosting).first {
+            $0.accessibilityIdentifier() == "macViewer.transfer.launcher"
+        })
+        let transferLauncherFrame = transferLauncher.convert(transferLauncher.bounds, to: hosting)
+        let launcherTarget = try XCTUnwrap(hitTest(
+            NSPoint(x: transferLauncherFrame.midX, y: transferLauncherFrame.midY),
+            in: hosting
+        ))
+        XCTAssertTrue(launcherTarget === transferLauncher || isDescendant(launcherTarget, of: transferLauncher),
+            "The compact fullscreen launcher must receive its own local click")
+        transferLauncher.performClick(nil)
+        hosting.layoutSubtreeIfNeeded()
         let expectedTransferButtonIDs: Set<String> = [
             "macViewer.transfer.send",
             "macViewer.transfer.received"

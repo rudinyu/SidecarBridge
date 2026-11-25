@@ -46,7 +46,7 @@ The fork builds two macOS products: **ScreenDock Host** and **ScreenDock Viewer*
 
 ScreenDock Host remains compatible with the existing SidecarBridge iPhone and iPad apps. It advertises both the original SidecarBridge Bonjour services and ScreenDock's fork-specific services; the Viewer searches only for ScreenDock services. ScreenDock uses TCP port `45454` by default, the same port as the author app. It selects `45455` only when the original SidecarBridge Host is already running or port `45454` is occupied. ScreenDock has its own pairing-trust namespace, so pair each Viewer with a Mac once; that first pairing does not replace the SidecarBridge apps' saved trust.
 
-The fork products are version `1.7.0` build `137`, with bundle identifiers `com.screendock.host` and `com.screendock.viewer` (Debug builds add `.debug`). The author-owned iPad target remains version `1.4` build `6` with its existing identity. Build ScreenDock Host with the `SidecarBridgeMac` scheme and ScreenDock Viewer with `SidecarBridgeViewerMac`; `SidecarBridgePad` remains the original iPad app target.
+The fork products are version `1.7.1` build `138`, with bundle identifiers `com.screendock.host` and `com.screendock.viewer` (Debug builds add `.debug`). The author-owned iPad target remains version `1.4` build `6` with its existing identity. Build ScreenDock Host with the `SidecarBridgeMac` scheme and ScreenDock Viewer with `SidecarBridgeViewerMac`; `SidecarBridgePad` remains the original iPad app target.
 
 For safe removal of the ScreenDock apps and their current-user data, see [the uninstall guide](docs/UNINSTALL.md) and `scripts/uninstall-screendock.sh` (dry-run by default).
 

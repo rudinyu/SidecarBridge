@@ -14,6 +14,8 @@ struct MacViewerView: View {
     private let inputSourceManager: MacViewerInputSourceManaging
     @State private var pendingForgetTarget: ForgetTarget?
     @State private var isReceivedFilesPresented = false
+    @State private var isTransferDockHovered = false
+    @State private var isTransferDockPinnedOpen = false
 
     init(
         model: MacViewerConnectionModel,
@@ -85,7 +87,11 @@ struct MacViewerView: View {
         }
         .task { model.start() }
         .onChange(of: model.isConnected) { _, isConnected in
-            if !isConnected { isReceivedFilesPresented = false }
+            if !isConnected {
+                isReceivedFilesPresented = false
+                isTransferDockHovered = false
+                isTransferDockPinnedOpen = false
+            }
         }
     }
 
@@ -326,11 +332,49 @@ struct MacViewerView: View {
     }
 
     private var fileTransferControls: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            if isTransferDockExpanded {
+                expandedFileTransferControls
+                    .transition(.opacity)
+            }
+
+            MacViewerNativeTransferButton(kind: .launcher(isPinned: isTransferDockPinnedOpen)) { _ in
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    isTransferDockPinnedOpen.toggle()
+                }
+            }
+        }
+        .fixedSize(horizontal: true, vertical: false)
+        .padding(8)
+        .background {
+            MacViewerTransferInputShield()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityHidden(true)
+                .allowsHitTesting(true)
+        }
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.16)))
+        .accessibilityElement(children: .contain)
+        .onHover { hovering in
+            guard hovering != isTransferDockHovered else { return }
+            withAnimation(.easeInOut(duration: 0.16)) {
+                isTransferDockHovered = hovering
+            }
+        }
+        .animation(.easeInOut(duration: 0.16), value: isTransferDockExpanded)
+    }
+
+    private var isTransferDockExpanded: Bool {
+        model.isFileTransferring || model.hasQueuedFiles || model.fileTransferError != nil ||
+            isReceivedFilesPresented || isTransferDockHovered || isTransferDockPinnedOpen
+    }
+
+    private var expandedFileTransferControls: some View {
         VStack(alignment: .trailing, spacing: 8) {
             MacViewerTransferActionButtons(
                 receivedFileCount: model.receivedFiles.count,
                 showsCancel: model.isFileTransferring || model.hasQueuedFiles,
-                onSend: { model.chooseFileToSend() },
+                onSend: { window in model.chooseFileToSend(from: window) },
                 onReceived: {
                     model.refreshReceivedFiles()
                     isReceivedFilesPresented = true
@@ -385,16 +429,6 @@ struct MacViewerView: View {
             }
         }
         .fixedSize(horizontal: true, vertical: false)
-        .padding(10)
-        .background {
-            MacViewerTransferInputShield()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .accessibilityHidden(true)
-                .allowsHitTesting(true)
-        }
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.16)))
-        .accessibilityElement(children: .contain)
     }
 
     private var streamStatus: some View {
@@ -577,16 +611,16 @@ struct MacViewerView: View {
 private struct MacViewerTransferActionButtons: View {
     let receivedFileCount: Int
     let showsCancel: Bool
-    let onSend: () -> Void
+    let onSend: (NSWindow?) -> Void
     let onReceived: () -> Void
     let onCancel: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
             MacViewerNativeTransferButton(kind: .send, action: onSend)
-            MacViewerNativeTransferButton(kind: .received(receivedFileCount), action: onReceived)
+            MacViewerNativeTransferButton(kind: .received(receivedFileCount), action: { _ in onReceived() })
             if showsCancel {
-                MacViewerNativeTransferButton(kind: .cancel, action: onCancel)
+                MacViewerNativeTransferButton(kind: .cancel, action: { _ in onCancel() })
             }
         }
         .fixedSize()
@@ -599,12 +633,14 @@ private struct MacViewerNativeTransferButton: NSViewRepresentable {
         case send
         case received(Int)
         case cancel
+        case launcher(isPinned: Bool)
 
         var title: String {
             switch self {
             case .send: return "Send Files…"
             case .received(let count): return count > 0 ? "Received Files (\(count))" : "Received Files"
             case .cancel: return "Cancel"
+            case .launcher: return ""
             }
         }
 
@@ -613,6 +649,7 @@ private struct MacViewerNativeTransferButton: NSViewRepresentable {
             case .send: return "arrow.up.doc"
             case .received: return "folder"
             case .cancel: return "xmark"
+            case .launcher(let isPinned): return isPinned ? "pin.fill" : "arrow.up.doc"
             }
         }
 
@@ -621,6 +658,7 @@ private struct MacViewerNativeTransferButton: NSViewRepresentable {
             case .send: return "macViewer.transfer.send"
             case .received: return "macViewer.transfer.received"
             case .cancel: return "macViewer.transfer.cancel"
+            case .launcher: return "macViewer.transfer.launcher"
             }
         }
 
@@ -629,6 +667,8 @@ private struct MacViewerNativeTransferButton: NSViewRepresentable {
             case .send: return "Send Files…"
             case .received: return title
             case .cancel: return "Cancel file transfer"
+            case .launcher(let isPinned):
+                return isPinned ? "Unpin file transfer controls" : "Show file transfer controls"
             }
         }
 
@@ -637,12 +677,16 @@ private struct MacViewerNativeTransferButton: NSViewRepresentable {
             case .send: return "Choose files on this Mac to send to the connected Mac"
             case .received: return "Browse files already received on this Mac"
             case .cancel: return "Cancel the current and queued file transfers"
+            case .launcher(let isPinned):
+                return isPinned
+                    ? "Unpin the file transfer controls; they will close when the pointer leaves"
+                    : "Show file transfer controls; click to keep them open"
             }
         }
 
         var controlSize: NSControl.ControlSize {
             switch self {
-            case .cancel: return .small
+            case .cancel, .launcher: return .small
             case .send, .received: return .large
             }
         }
@@ -651,17 +695,22 @@ private struct MacViewerNativeTransferButton: NSViewRepresentable {
             if case .send = self { return true }
             return false
         }
+
+        var isLauncher: Bool {
+            if case .launcher = self { return true }
+            return false
+        }
     }
 
     let kind: Kind
-    let action: () -> Void
+    let action: (NSWindow?) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(action: action)
     }
 
     func makeNSView(context: Context) -> NSButton {
-        let button = NSButton(title: kind.title, target: context.coordinator, action: #selector(Coordinator.perform(_:)))
+        let button = NSButton(title: kind.title, target: context.coordinator, action: #selector(Coordinator.buttonPressed(_:)))
         configure(button)
         return button
     }
@@ -681,7 +730,7 @@ private struct MacViewerNativeTransferButton: NSViewRepresentable {
         button.controlSize = kind.controlSize
         button.isBordered = true
         button.image = NSImage(systemSymbolName: kind.symbolName, accessibilityDescription: kind.accessibilityLabel)
-        button.imagePosition = .imageLeading
+        button.imagePosition = kind.isLauncher ? .imageOnly : .imageLeading
         button.toolTip = kind.help
         button.identifier = NSUserInterfaceItemIdentifier(kind.accessibilityIdentifier)
         button.setAccessibilityIdentifier(kind.accessibilityIdentifier)
@@ -696,14 +745,14 @@ private struct MacViewerNativeTransferButton: NSViewRepresentable {
 
     @MainActor
     final class Coordinator: NSObject {
-        var action: () -> Void
+        var action: (NSWindow?) -> Void
 
-        init(action: @escaping () -> Void) {
+        init(action: @escaping (NSWindow?) -> Void) {
             self.action = action
         }
 
-        @objc func perform(_ sender: NSButton) {
-            action()
+        @objc func buttonPressed(_ sender: NSButton) {
+            action(sender.window)
         }
     }
 }

@@ -135,6 +135,8 @@ struct MacViewerDisplayCapabilities: Equatable {
 
 @MainActor
 final class MacViewerConnectionModel: ObservableObject {
+    typealias FileChooserPresenter = @MainActor (NSWindow?, @escaping @MainActor ([URL]?) -> Void) -> Void
+
     struct ReceivedFile: Identifiable, Equatable {
         let url: URL
         let size: Int64
@@ -225,6 +227,7 @@ final class MacViewerConnectionModel: ObservableObject {
     private let defaults: UserDefaults
     private let receiveDirectory: URL
     private let fileTransfer: FileTransferEngine
+    private let fileChooserPresenter: FileChooserPresenter
     private let removeCredential: (String) -> Bool
     private let removeAllCredentials: () -> Bool
     private var started = false
@@ -282,7 +285,8 @@ final class MacViewerConnectionModel: ObservableObject {
         receiveDirectory: URL? = nil,
         defaults: UserDefaults? = nil,
         removeCredential: @escaping (String) -> Bool = { SecureCredentialStore.remove(account: $0) },
-        removeAllCredentials: @escaping () -> Bool = { SecureCredentialStore.removeAll(accountPrefix: "pad.mac.") }
+        removeAllCredentials: @escaping () -> Bool = { SecureCredentialStore.removeAll(accountPrefix: "pad.mac.") },
+        fileChooserPresenter: FileChooserPresenter? = nil
     ) {
         let resolvedDefaults = defaults ?? Self.defaultDefaults
         self.peers = peers
@@ -290,6 +294,9 @@ final class MacViewerConnectionModel: ObservableObject {
         self.defaults = resolvedDefaults
         self.removeCredential = removeCredential
         self.removeAllCredentials = removeAllCredentials
+        self.fileChooserPresenter = fileChooserPresenter ?? { window, completion in
+            Self.presentFileChooser(from: window, completion: completion)
+        }
         instantCursorEnabled = resolvedDefaults.object(forKey: Self.instantCursorDefaultsKey) as? Bool ?? true
         streamResolution = resolvedDefaults.string(forKey: StreamPreferenceStore.resolutionKey)
             .flatMap(StreamResolutionPreference.init(rawValue:)) ?? .adaptive
@@ -802,19 +809,37 @@ final class MacViewerConnectionModel: ObservableObject {
         clipboardTransferStatus = "Sent the clipboard and requested paste."
     }
 
-    func chooseFileToSend() {
+    func chooseFileToSend(from window: NSWindow? = nil) {
         guard isConnected else {
             fileTransferError = "Connect to the other Mac before sending a file."
             return
         }
+
+        fileChooserPresenter(window) { [weak self] urls in
+            guard let self, let urls else { return }
+            self.sendFiles(at: urls)
+        }
+    }
+
+    private static func presentFileChooser(
+        from window: NSWindow?,
+        completion: @escaping @MainActor ([URL]?) -> Void
+    ) {
         let panel = NSOpenPanel()
         panel.title = "Send Files to Mac"
         panel.prompt = "Send"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
-        guard panel.runModal() == .OK else { return }
-        sendFiles(at: panel.urls)
+
+        let handleResponse: (NSApplication.ModalResponse) -> Void = { response in
+            completion(response == .OK ? panel.urls : nil)
+        }
+        if let window {
+            panel.beginSheetModal(for: window, completionHandler: handleResponse)
+        } else {
+            panel.begin(completionHandler: handleResponse)
+        }
     }
 
     func sendFiles(at urls: [URL]) {
