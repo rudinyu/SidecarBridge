@@ -269,6 +269,88 @@ final class MacViewerPresentationTests: XCTestCase {
     }
 
     @MainActor
+    func testReceivedFilesPopoverShowsFilesStoredOnThisViewer() throws {
+        let f = try makeViewerFixture()
+        let receivedURL = f.receiveDirectory.appendingPathComponent("Viewer-received-example.txt")
+        try Data("received on this Viewer".utf8).write(to: receivedURL)
+        f.model.refreshReceivedFiles()
+        XCTAssertEqual(f.model.receivedFiles.map(\.name), [receivedURL.lastPathComponent])
+
+        let window = window()
+        defer { window.close() }
+        let hosting = NSHostingView(rootView: MacViewerReceivedFilesPopover(model: f.model))
+        window.contentView = hosting
+        window.setContentSize(NSSize(width: 360, height: 320))
+        hosting.layoutSubtreeIfNeeded()
+        try attachSnapshot(hosting, name: "Viewer-received-files-popover")
+    }
+
+    @MainActor
+    func testTransferDockShowsActiveQueuedAndErrorStateAtCompactSize() throws {
+        let f = try makeViewerFixture()
+        f.model.isConnected = true
+        let firstURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Viewer-transfer-active-\(UUID().uuidString).txt")
+        let queuedURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Viewer-transfer-queued-\(UUID().uuidString).txt")
+        try Data("active transfer preview".utf8).write(to: firstURL)
+        try Data("queued transfer preview".utf8).write(to: queuedURL)
+        defer {
+            try? FileManager.default.removeItem(at: firstURL)
+            try? FileManager.default.removeItem(at: queuedURL)
+        }
+
+        f.model.sendFiles(at: [firstURL, queuedURL])
+        f.model.fileTransferError = "Example transfer error for layout preview."
+        XCTAssertTrue(f.model.isFileTransferring)
+        XCTAssertEqual(f.model.queuedFileCount, 1)
+
+        let presentation = MacViewerPresentation(defaults: f.defaults)
+        presentation.toggleControls()
+        let window = window()
+        defer {
+            f.model.cancelFileTransfer()
+            window.close()
+        }
+        let hosting = NSHostingView(rootView: MacViewerView(model: f.model, presentation: presentation))
+        window.contentView = hosting
+        window.setContentSize(NSSize(width: 640, height: 360))
+        hosting.layoutSubtreeIfNeeded()
+        let input = try XCTUnwrap(descendant(MacViewerInputView.self, in: hosting))
+        let expectedTransferButtonIDs: Set<String> = [
+            "macViewer.transfer.send",
+            "macViewer.transfer.received",
+            "macViewer.transfer.cancel"
+        ]
+        let transferButtons = descendants(NSButton.self, in: hosting).filter {
+            expectedTransferButtonIDs.contains($0.accessibilityIdentifier())
+        }
+        XCTAssertEqual(Set(transferButtons.compactMap { $0.accessibilityIdentifier() }), expectedTransferButtonIDs,
+            "Send, Received, and Cancel actions must all be native buttons during a transfer")
+        for button in transferButtons {
+            let frame = button.convert(button.bounds, to: hosting)
+            XCTAssertTrue(hosting.bounds.contains(frame), "Transfer actions must fit at the compact Viewer size")
+            let target = try XCTUnwrap(hitTest(NSPoint(x: frame.midX, y: frame.midY), in: hosting))
+            XCTAssertTrue(target === button || isDescendant(target, of: button),
+                "Button \(button.accessibilityIdentifier()) at \(frame) hit \(type(of: target)); native action must receive its click")
+        }
+
+        let shield = try XCTUnwrap(descendant(MacViewerTransferInputShieldView.self, in: hosting))
+        let shieldFrame = shield.convert(shield.bounds, to: hosting)
+        XCTAssertFalse(shieldFrame.isEmpty)
+        XCTAssertLessThan(shieldFrame.width, hosting.bounds.width, "The input shield must stay within the dock bounds")
+        XCTAssertLessThan(shieldFrame.height, hosting.bounds.height, "The input shield must stay within the dock bounds")
+        let blankProgressPoint = NSPoint(x: shieldFrame.minX + 3, y: shieldFrame.midY)
+        let blankProgressTarget = try XCTUnwrap(hitTest(blankProgressPoint, in: hosting))
+        XCTAssertFalse(blankProgressTarget === input || isDescendant(blankProgressTarget, of: input),
+            "The transfer status area must not forward pointer events to the remote Mac")
+        let videoCenterTarget = try XCTUnwrap(hitTest(NSPoint(x: hosting.bounds.midX, y: hosting.bounds.midY), in: hosting))
+        XCTAssertTrue(videoCenterTarget === input || isDescendant(videoCenterTarget, of: input),
+            "The dock input shield must leave the uncovered video interactive")
+        try attachSnapshot(hosting, name: "Viewer-fullscreen-transfer-active-error-640x360")
+    }
+
+    @MainActor
     func testHostedViewerLayoutRespondsToSimulatedFullScreenNotifications() throws {
         let f = try makeViewerFixture()
         f.model.isConnected = true
@@ -306,10 +388,49 @@ final class MacViewerPresentationTests: XCTestCase {
         XCTAssertFalse(presentation.controlsVisible)
         XCTAssertTrue(descendant(MacViewerVideoView.self, in: hosting) === video)
         XCTAssertTrue(descendant(MacViewerInputView.self, in: hosting) === input)
-        XCTAssertTrue(descendants(NSButton.self, in: hosting).isEmpty,
-            "Hidden full-screen chrome must not leave buttons over remote input")
+        let expectedTransferButtonIDs: Set<String> = [
+            "macViewer.transfer.send",
+            "macViewer.transfer.received"
+        ]
+        let fullscreenTransferButtons = descendants(NSButton.self, in: hosting).filter {
+            expectedTransferButtonIDs.contains($0.accessibilityIdentifier())
+        }
+        XCTAssertEqual(Set(fullscreenTransferButtons.compactMap { $0.accessibilityIdentifier() }), expectedTransferButtonIDs,
+            "Both native transfer actions must remain visible in full screen")
+        for button in fullscreenTransferButtons {
+            let frame = button.convert(button.bounds, to: hosting)
+            let target = try XCTUnwrap(hitTest(NSPoint(x: frame.midX, y: frame.midY), in: hosting))
+            XCTAssertTrue(target === button || isDescendant(target, of: button),
+                "A native transfer button must receive its own local click")
+        }
+        try attachSnapshot(hosting, name: "Viewer-fullscreen-transfer-controls")
         XCTAssertEqual(video.bounds.height, hosting.bounds.height, accuracy: 1,
             "Full screen should hide the header and control panel to maximize video")
+
+        window.setContentSize(NSSize(width: 640, height: 360))
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertEqual(hosting.bounds.width, 640, accuracy: 1)
+        XCTAssertEqual(hosting.bounds.height, 360, accuracy: 1)
+        let compactTransferButtons = descendants(NSButton.self, in: hosting).filter {
+            expectedTransferButtonIDs.contains($0.accessibilityIdentifier())
+        }
+        XCTAssertEqual(Set(compactTransferButtons.compactMap { $0.accessibilityIdentifier() }), expectedTransferButtonIDs,
+            "Both native transfer actions must fit at the compact Viewer size")
+        for button in compactTransferButtons {
+            let frame = button.convert(button.bounds, to: hosting)
+            XCTAssertFalse(frame.isEmpty)
+            XCTAssertTrue(hosting.bounds.contains(frame), "Transfer actions must stay inside the Viewer bounds")
+            let target = try XCTUnwrap(hitTest(NSPoint(x: frame.midX, y: frame.midY), in: hosting))
+            XCTAssertTrue(target === button || isDescendant(target, of: button),
+                "A native transfer button must receive its own local click")
+        }
+        let centerTarget = try XCTUnwrap(hitTest(NSPoint(
+            x: hosting.bounds.midX,
+            y: hosting.bounds.midY
+        ), in: hosting))
+        XCTAssertTrue(centerTarget === input || isDescendant(centerTarget, of: input),
+            "The transfer dock must leave the remote video center interactive")
+        try attachSnapshot(hosting, name: "Viewer-fullscreen-transfer-640x360")
 
         XCTAssertTrue(window.makeFirstResponder(input))
         XCTAssertTrue(input.performKeyEquivalent(with: try key(123, "\u{F702}")),
@@ -367,6 +488,23 @@ final class MacViewerPresentationTests: XCTestCase {
             matches.append(contentsOf: descendants(type, in: child))
         }
         return matches
+    }
+
+    @MainActor
+    private func isDescendant(_ view: NSView, of ancestor: NSView) -> Bool {
+        var candidate: NSView? = view
+        while let current = candidate {
+            if current === ancestor { return true }
+            candidate = current.superview
+        }
+        return false
+    }
+
+    @MainActor
+    private func hitTest(_ point: NSPoint, in view: NSView) -> NSView? {
+        let pointInSuperview = view.superview.map { view.convert(point, to: $0) }
+            ?? view.convert(point, to: nil)
+        return view.hitTest(pointInSuperview)
     }
 
     @MainActor

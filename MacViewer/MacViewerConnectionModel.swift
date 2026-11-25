@@ -187,6 +187,7 @@ final class MacViewerConnectionModel: ObservableObject {
     @Published var fileTransferSnapshot: FileTransferSnapshot?
     @Published var lastReceivedFile: URL?
     @Published private(set) var receivedFiles: [ReceivedFile] = []
+    @Published private(set) var queuedFileCount = 0
     @Published var fileTransferError: String?
     @Published var clipboardTransferStatus = "Clipboard transfer ready."
     @Published var remoteSystemInformation: SystemInformation?
@@ -246,7 +247,6 @@ final class MacViewerConnectionModel: ObservableObject {
     private var videoAckBatchCount = 0
     private var didReportVisibleImageForSession = false
     private var pendingFileURLs: [URL] = []
-    private var queuedFileCount = 0
     private var lastRemoteMacName: String?
     private var discoveryRecords: [MacDiscoveryRecord] = []
     private var suppressedMacIDs = Set<String>()
@@ -860,6 +860,18 @@ final class MacViewerConnectionModel: ObservableObject {
 
     func revealReceivedFile(_ file: ReceivedFile) {
         NSWorkspace.shared.activateFileViewerSelecting([file.url])
+    }
+
+    func openReceivedFilesFolder() {
+        do {
+            try FileManager.default.createDirectory(at: receiveDirectory, withIntermediateDirectories: true)
+            guard NSWorkspace.shared.open(receiveDirectory) else {
+                fileTransferError = "Could not open the received files folder."
+                return
+            }
+        } catch {
+            fileTransferError = error.localizedDescription
+        }
     }
 
     func deleteReceivedFile(_ file: ReceivedFile) {

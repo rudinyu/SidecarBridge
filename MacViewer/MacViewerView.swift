@@ -13,6 +13,7 @@ struct MacViewerView: View {
     @StateObject private var presentation: MacViewerPresentation
     private let inputSourceManager: MacViewerInputSourceManaging
     @State private var pendingForgetTarget: ForgetTarget?
+    @State private var isReceivedFilesPresented = false
 
     init(
         model: MacViewerConnectionModel,
@@ -83,6 +84,9 @@ struct MacViewerView: View {
             }
         }
         .task { model.start() }
+        .onChange(of: model.isConnected) { _, isConnected in
+            if !isConnected { isReceivedFilesPresented = false }
+        }
     }
 
     private var header: some View {
@@ -305,6 +309,13 @@ struct MacViewerView: View {
             .frame(minHeight: showsChrome ? 300 : 0, maxHeight: .infinity)
             .background(.black)
             .clipShape(RoundedRectangle(cornerRadius: showsChrome ? 14 : 0))
+            .overlay(alignment: .bottomTrailing) {
+                if model.isConnected {
+                    fileTransferControls
+                        .padding(16)
+                        .zIndex(1)
+                }
+            }
 
             if showsChrome {
                 streamStatus
@@ -312,6 +323,78 @@ struct MacViewerView: View {
                     .padding(.top, 12)
             }
         }
+    }
+
+    private var fileTransferControls: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            MacViewerTransferActionButtons(
+                receivedFileCount: model.receivedFiles.count,
+                showsCancel: model.isFileTransferring || model.hasQueuedFiles,
+                onSend: { model.chooseFileToSend() },
+                onReceived: {
+                    model.refreshReceivedFiles()
+                    isReceivedFilesPresented = true
+                },
+                onCancel: { model.cancelFileTransfer() }
+            )
+            .popover(isPresented: $isReceivedFilesPresented, arrowEdge: .bottom) {
+                MacViewerReceivedFilesPopover(model: model)
+            }
+
+            if model.isFileTransferring || model.hasQueuedFiles {
+                HStack(spacing: 10) {
+                    if let transfer = model.fileTransferSnapshot {
+                        ProgressView(value: transfer.progress)
+                            .frame(width: 72)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(transfer.fileName)
+                                .font(.caption.weight(.medium))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Text(transfer.byteProgressDescription)
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.white.opacity(0.62))
+                        }
+                        .frame(maxWidth: 210, alignment: .leading)
+                    } else {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Preparing file transfer…")
+                            .font(.caption)
+                    }
+
+                    if model.queuedFileCount > 0 {
+                        Text("\(model.queuedFileCount) queued")
+                            .font(.caption2)
+                            .foregroundStyle(.white.opacity(0.62))
+                    }
+
+                }
+                .font(.caption)
+                .accessibilityIdentifier("macViewer.transfer.progress")
+            }
+
+            if let error = model.fileTransferError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: 360, alignment: .trailing)
+                    .accessibilityIdentifier("macViewer.transfer.error")
+            }
+        }
+        .fixedSize(horizontal: true, vertical: false)
+        .padding(10)
+        .background {
+            MacViewerTransferInputShield()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityHidden(true)
+                .allowsHitTesting(true)
+        }
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.16)))
+        .accessibilityElement(children: .contain)
     }
 
     private var streamStatus: some View {
@@ -442,12 +525,11 @@ struct MacViewerView: View {
                 Divider()
 
                 VStack(alignment: .leading, spacing: 9) {
-                    Text("Clipboard and files")
+                    Text("Clipboard")
                         .font(.headline)
                     HStack(spacing: 8) {
                         Button("Receive Clipboard") { model.requestRemoteClipboard() }
                         Button("Send Clipboard") { model.sendLocalClipboard() }
-                        Button("Send Files…") { model.chooseFileToSend() }
                     }
                     .buttonStyle(.bordered)
                     Text(model.clipboardTransferStatus)
@@ -456,41 +538,6 @@ struct MacViewerView: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
-            }
-
-            if let transfer = model.fileTransferSnapshot {
-                HStack(spacing: 10) {
-                    ProgressView(value: transfer.progress)
-                        .frame(maxWidth: 220)
-                    Text("\(transfer.fileName) • \(transfer.byteProgressDescription)")
-                        .font(.caption)
-                        .lineLimit(1)
-                    Spacer()
-                    Button("Cancel") { model.cancelFileTransfer() }
-                }
-                .font(.caption)
-            } else if model.hasReceivedFiles {
-                HStack(spacing: 8) {
-                    Label("Received files: \(model.receivedFiles.count)", systemImage: "folder")
-                    if let received = model.lastReceivedFile {
-                        Button("Reveal \(received.lastPathComponent)") {
-                            model.revealReceivedFile(.init(
-                                url: received,
-                                size: 0,
-                                modifiedAt: nil
-                            ))
-                        }
-                    }
-                    Spacer()
-                }
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.6))
-            }
-
-            if let error = model.fileTransferError {
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.orange)
             }
         }
         .padding(16)
@@ -523,6 +570,276 @@ struct MacViewerView: View {
             get: { pendingForgetTarget != nil },
             set: { if !$0 { pendingForgetTarget = nil } }
         )
+    }
+}
+
+@MainActor
+private struct MacViewerTransferActionButtons: View {
+    let receivedFileCount: Int
+    let showsCancel: Bool
+    let onSend: () -> Void
+    let onReceived: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            MacViewerNativeTransferButton(kind: .send, action: onSend)
+            MacViewerNativeTransferButton(kind: .received(receivedFileCount), action: onReceived)
+            if showsCancel {
+                MacViewerNativeTransferButton(kind: .cancel, action: onCancel)
+            }
+        }
+        .fixedSize()
+    }
+}
+
+@MainActor
+private struct MacViewerNativeTransferButton: NSViewRepresentable {
+    enum Kind {
+        case send
+        case received(Int)
+        case cancel
+
+        var title: String {
+            switch self {
+            case .send: return "Send Files…"
+            case .received(let count): return count > 0 ? "Received Files (\(count))" : "Received Files"
+            case .cancel: return "Cancel"
+            }
+        }
+
+        var symbolName: String {
+            switch self {
+            case .send: return "arrow.up.doc"
+            case .received: return "folder"
+            case .cancel: return "xmark"
+            }
+        }
+
+        var accessibilityIdentifier: String {
+            switch self {
+            case .send: return "macViewer.transfer.send"
+            case .received: return "macViewer.transfer.received"
+            case .cancel: return "macViewer.transfer.cancel"
+            }
+        }
+
+        var accessibilityLabel: String {
+            switch self {
+            case .send: return "Send Files…"
+            case .received: return title
+            case .cancel: return "Cancel file transfer"
+            }
+        }
+
+        var help: String {
+            switch self {
+            case .send: return "Choose files on this Mac to send to the connected Mac"
+            case .received: return "Browse files already received on this Mac"
+            case .cancel: return "Cancel the current and queued file transfers"
+            }
+        }
+
+        var controlSize: NSControl.ControlSize {
+            switch self {
+            case .cancel: return .small
+            case .send, .received: return .large
+            }
+        }
+
+        var isPrimary: Bool {
+            if case .send = self { return true }
+            return false
+        }
+    }
+
+    let kind: Kind
+    let action: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(action: action)
+    }
+
+    func makeNSView(context: Context) -> NSButton {
+        let button = NSButton(title: kind.title, target: context.coordinator, action: #selector(Coordinator.perform(_:)))
+        configure(button)
+        return button
+    }
+
+    func updateNSView(_ nsView: NSButton, context: Context) {
+        context.coordinator.action = action
+        configure(nsView)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSButton) -> CGSize? {
+        nsView.fittingSize
+    }
+
+    private func configure(_ button: NSButton) {
+        button.title = kind.title
+        button.bezelStyle = .rounded
+        button.controlSize = kind.controlSize
+        button.isBordered = true
+        button.image = NSImage(systemSymbolName: kind.symbolName, accessibilityDescription: kind.accessibilityLabel)
+        button.imagePosition = .imageLeading
+        button.toolTip = kind.help
+        button.identifier = NSUserInterfaceItemIdentifier(kind.accessibilityIdentifier)
+        button.setAccessibilityIdentifier(kind.accessibilityIdentifier)
+        button.setAccessibilityLabel(kind.accessibilityLabel)
+        if kind.isPrimary {
+            button.bezelColor = NSColor(calibratedRed: 0.31, green: 0.59, blue: 1, alpha: 1)
+            button.contentTintColor = .white
+        } else {
+            button.contentTintColor = NSColor(calibratedRed: 0.31, green: 0.59, blue: 1, alpha: 1)
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var action: () -> Void
+
+        init(action: @escaping () -> Void) {
+            self.action = action
+        }
+
+        @objc func perform(_ sender: NSButton) {
+            action()
+        }
+    }
+}
+
+private struct MacViewerTransferInputShield: NSViewRepresentable {
+    func makeNSView(context: Context) -> MacViewerTransferInputShieldView {
+        MacViewerTransferInputShieldView()
+    }
+
+    func updateNSView(_ nsView: MacViewerTransferInputShieldView, context: Context) {}
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: MacViewerTransferInputShieldView) -> CGSize? {
+        guard let width = proposal.width, let height = proposal.height else { return nil }
+        return CGSize(width: width, height: height)
+    }
+}
+
+@MainActor
+final class MacViewerTransferInputShieldView: NSView {
+    override var isFlipped: Bool { true }
+    override var isOpaque: Bool { false }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        alphaValue = 1
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let localPoint = superview.map { convert(point, from: $0) } ?? point
+        guard bounds.contains(localPoint) else { return nil }
+        return self
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .arrow)
+    }
+
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {}
+    override func mouseDragged(with event: NSEvent) {}
+    override func rightMouseDown(with event: NSEvent) {}
+    override func rightMouseUp(with event: NSEvent) {}
+    override func rightMouseDragged(with event: NSEvent) {}
+    override func otherMouseDown(with event: NSEvent) {}
+    override func otherMouseUp(with event: NSEvent) {}
+    override func otherMouseDragged(with event: NSEvent) {}
+    override func scrollWheel(with event: NSEvent) {}
+    override func mouseMoved(with event: NSEvent) {}
+}
+
+@MainActor
+struct MacViewerReceivedFilesPopover: View {
+    @ObservedObject var model: MacViewerConnectionModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Image(systemName: "folder.fill")
+                    .font(.title3)
+                    .foregroundStyle(ScreenDockPalette.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Received Files")
+                        .font(.headline)
+                    Text("Files received on this Mac")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.58))
+                }
+                Spacer(minLength: 0)
+            }
+
+            if model.receivedFiles.isEmpty {
+                Label("No files received yet", systemImage: "tray")
+                    .font(.callout)
+                    .foregroundStyle(.white.opacity(0.62))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 5) {
+                        ForEach(model.receivedFiles) { file in
+                            Button {
+                                model.revealReceivedFile(file)
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: "doc")
+                                        .foregroundStyle(ScreenDockPalette.blue)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(file.name)
+                                            .font(.callout.weight(.medium))
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Text(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))
+                                            .font(.caption)
+                                            .foregroundStyle(.white.opacity(0.55))
+                                    }
+                                    Spacer(minLength: 0)
+                                    Image(systemName: "arrow.up.right.square")
+                                        .font(.caption)
+                                        .foregroundStyle(.white.opacity(0.5))
+                                }
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 8)
+                                .contentShape(RoundedRectangle(cornerRadius: 8))
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("macViewer.transfer.receivedFile.\(file.name)")
+                        }
+                    }
+                }
+                .frame(maxHeight: .infinity)
+            }
+
+            HStack {
+                Text("\(model.receivedFiles.count) items")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.58))
+                Spacer()
+                Button {
+                    model.openReceivedFilesFolder()
+                } label: {
+                    Label("Open Folder", systemImage: "folder")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("macViewer.transfer.openFolder")
+            }
+        }
+        .padding(14)
+        .frame(width: 340, height: 300)
+        .background(ScreenDockPalette.panel)
+        .preferredColorScheme(.dark)
+        .onAppear { model.refreshReceivedFiles() }
     }
 }
 
